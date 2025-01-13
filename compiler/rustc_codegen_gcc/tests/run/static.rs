@@ -34,6 +34,7 @@ trait Copy {
 }
 
 impl Copy for isize {}
+impl<T: ?Sized> Copy for *mut T {}
 
 #[lang = "receiver"]
 trait Receiver {
@@ -45,9 +46,11 @@ pub(crate) unsafe auto trait Freeze {}
 mod intrinsics {
     use super::Sized;
 
-    extern "rust-intrinsic" {
-        #[rustc_safe_intrinsic]
-        pub fn abort() -> !;
+    #[rustc_nounwind]
+    #[rustc_intrinsic]
+    #[rustc_intrinsic_must_be_overridden]
+    pub fn abort() -> ! {
+        loop {}
     }
 }
 

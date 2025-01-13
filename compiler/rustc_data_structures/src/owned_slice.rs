@@ -1,10 +1,11 @@
-use std::{borrow::Borrow, ops::Deref};
+use std::borrow::Borrow;
+use std::ops::Deref;
 
-use crate::sync::Lrc;
 // Use our fake Send/Sync traits when on not parallel compiler,
 // so that `OwnedSlice` only implements/requires Send/Sync
 // for parallel compiler builds.
 use crate::sync;
+use crate::sync::Lrc;
 
 /// An owned slice.
 ///
@@ -138,11 +139,9 @@ impl Borrow<[u8]> for OwnedSlice {
 }
 
 // Safety: `OwnedSlice` is conceptually `(&'self.1 [u8], Arc<dyn Send + Sync>)`, which is `Send`
-#[cfg(parallel_compiler)]
 unsafe impl sync::Send for OwnedSlice {}
 
 // Safety: `OwnedSlice` is conceptually `(&'self.1 [u8], Arc<dyn Send + Sync>)`, which is `Sync`
-#[cfg(parallel_compiler)]
 unsafe impl sync::Sync for OwnedSlice {}
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
-use std::fmt;
+use std::path::{Path, PathBuf};
+use std::{fmt, io};
 
-use rustc_errors::{codes::*, DiagArgName, DiagArgValue, DiagMessage};
-use rustc_macros::Diagnostic;
+use rustc_errors::codes::*;
+use rustc_errors::{DiagArgName, DiagArgValue, DiagMessage};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 
 use crate::ty::Ty;
@@ -14,6 +16,13 @@ pub struct DropCheckOverflow<'tcx> {
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub overflow_ty: Ty<'tcx>,
+}
+
+#[derive(Diagnostic)]
+#[diag(middle_failed_writing_file)]
+pub struct FailedWritingFile<'a> {
+    pub path: &'a Path,
+    pub error: io::Error,
 }
 
 #[derive(Diagnostic)]
@@ -149,3 +158,16 @@ pub struct ErroneousConstant {
 
 /// Used by `rustc_const_eval`
 pub use crate::fluent_generated::middle_adjust_for_foreign_abi_error;
+
+#[derive(Diagnostic)]
+#[diag(middle_type_length_limit)]
+#[help(middle_consider_type_length_limit)]
+pub struct TypeLengthLimit {
+    #[primary_span]
+    pub span: Span,
+    pub shrunk: String,
+    #[note(middle_written_to_path)]
+    pub was_written: bool,
+    pub path: PathBuf,
+    pub type_length: usize,
+}

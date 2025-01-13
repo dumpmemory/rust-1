@@ -1,18 +1,20 @@
-use clippy_config::msrvs::{self, Msrv};
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::is_from_proc_macro;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::ty::same_type_and_consts;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit::{walk_inf, walk_ty, Visitor};
+use rustc_hir::intravisit::{Visitor, walk_inf, walk_ty};
 use rustc_hir::{
-    self as hir, Expr, ExprKind, FnRetTy, FnSig, GenericArg, GenericArgsParentheses, GenericParam, GenericParamKind,
-    HirId, Impl, ImplItemKind, Item, ItemKind, Pat, PatKind, Path, QPath, Ty, TyKind,
+    self as hir, Expr, ExprKind, FnRetTy, FnSig, GenericArgsParentheses, GenericParam, GenericParamKind, HirId, Impl,
+    ImplItemKind, Item, ItemKind, Pat, PatKind, Path, QPath, Ty, TyKind,
 };
-use rustc_hir_analysis::hir_ty_to_ty;
+use rustc_hir_analysis::lower_ty;
 use rustc_lint::{LateContext, LateLintPass};
+use rustc_middle::ty::Ty as MiddleTy;
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 
@@ -59,10 +61,9 @@ pub struct UseSelf {
 }
 
 impl UseSelf {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            msrv,
+            msrv: conf.msrv.clone(),
             stack: Vec::new(),
         }
     }
@@ -84,10 +85,6 @@ const SEGMENTS_MSG: &str = "segments should be composed of at least 1 element";
 
 impl<'tcx> LateLintPass<'tcx> for UseSelf {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &Item<'tcx>) {
-        if matches!(item.kind, ItemKind::OpaqueTy(_)) {
-            // skip over `ItemKind::OpaqueTy` in order to lint `foo() -> impl <..>`
-            return;
-        }
         // We push the self types of `impl`s on a stack here. Only the top type on the stack is
         // relevant for linting, since this is the self type of the `impl` we're currently in. To
         // avoid linting on nested items, we push `StackItem::NoCheck` on the stack to signal, that
@@ -95,10 +92,9 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
         let stack_item = if let ItemKind::Impl(Impl { self_ty, generics, .. }) = item.kind
             && let TyKind::Path(QPath::Resolved(_, item_path)) = self_ty.kind
             && let parameters = &item_path.segments.last().expect(SEGMENTS_MSG).args
-            && parameters.as_ref().map_or(true, |params| {
-                params.parenthesized == GenericArgsParentheses::No
-                    && !params.args.iter().any(|arg| matches!(arg, GenericArg::Lifetime(_)))
-            })
+            && parameters
+                .as_ref()
+                .is_none_or(|params| params.parenthesized == GenericArgsParentheses::No)
             && !item.span.from_expansion()
             && !is_from_proc_macro(cx, item)
         // expensive, should be last check
@@ -130,10 +126,8 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
         self.stack.push(stack_item);
     }
 
-    fn check_item_post(&mut self, _: &LateContext<'_>, item: &Item<'_>) {
-        if !matches!(item.kind, ItemKind::OpaqueTy(_)) {
-            self.stack.pop();
-        }
+    fn check_item_post(&mut self, _: &LateContext<'_>, _: &Item<'_>) {
+        self.stack.pop();
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &hir::ImplItem<'_>) {
@@ -193,7 +187,7 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
     }
 
     fn check_body(&mut self, _: &LateContext<'_>, _: &hir::Body<'_>) {
-        // `hir_ty_to_ty` cannot be called in `Body`s or it will panic (sometimes). But in bodies
+        // `lower_ty` cannot be called in `Body`s or it will panic (sometimes). But in bodies
         // we can use `cx.typeck_results.node_type(..)` to get the `ty::Ty` from a `hir::Ty`.
         // However the `node_type()` method can *only* be called in bodies.
         if let Some(&mut StackItem::Check { ref mut in_body, .. }) = self.stack.last_mut() {
@@ -207,7 +201,7 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
         }
     }
 
-    fn check_ty(&mut self, cx: &LateContext<'tcx>, hir_ty: &hir::Ty<'tcx>) {
+    fn check_ty(&mut self, cx: &LateContext<'tcx>, hir_ty: &Ty<'tcx>) {
         if !hir_ty.span.from_expansion()
             && self.msrv.meets(msrvs::TYPE_ALIAS_ENUM_VARIANTS)
             && let Some(&StackItem::Check {
@@ -224,9 +218,14 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
             && let ty = if in_body > 0 {
                 cx.typeck_results().node_type(hir_ty.hir_id)
             } else {
-                hir_ty_to_ty(cx.tcx, hir_ty)
+                lower_ty(cx.tcx, hir_ty)
             }
-            && same_type_and_consts(ty, cx.tcx.type_of(impl_id).instantiate_identity())
+            && let impl_ty = cx.tcx.type_of(impl_id).instantiate_identity()
+            && same_type_and_consts(ty, impl_ty)
+            // Ensure the type we encounter and the one from the impl have the same lifetime parameters. It may be that
+            // the lifetime parameters of `ty` are elided (`impl<'a> Foo<'a> { fn new() -> Self { Foo{..} } }`, in
+            // which case we must still trigger the lint.
+            && (has_no_lifetime(ty) || same_lifetimes(ty, impl_ty))
         {
             span_lint(cx, hir_ty.span);
         }
@@ -275,13 +274,13 @@ struct SkipTyCollector {
     types_to_skip: Vec<HirId>,
 }
 
-impl<'tcx> Visitor<'tcx> for SkipTyCollector {
+impl Visitor<'_> for SkipTyCollector {
     fn visit_infer(&mut self, inf: &hir::InferArg) {
         self.types_to_skip.push(inf.hir_id);
 
         walk_inf(self, inf);
     }
-    fn visit_ty(&mut self, hir_ty: &hir::Ty<'_>) {
+    fn visit_ty(&mut self, hir_ty: &Ty<'_>) {
         self.types_to_skip.push(hir_ty.hir_id);
 
         walk_ty(self, hir_ty);
@@ -316,5 +315,39 @@ fn lint_path_to_variant(cx: &LateContext<'_>, path: &Path<'_>) {
             .span
             .with_hi(self_seg.args().span_ext().unwrap_or(self_seg.ident.span).hi());
         span_lint(cx, span);
+    }
+}
+
+/// Returns `true` if types `a` and `b` have the same lifetime parameters, otherwise returns
+/// `false`.
+///
+/// This function does not check that types `a` and `b` are the same types.
+fn same_lifetimes<'tcx>(a: MiddleTy<'tcx>, b: MiddleTy<'tcx>) -> bool {
+    use rustc_middle::ty::{Adt, GenericArgKind};
+    match (&a.kind(), &b.kind()) {
+        (&Adt(_, args_a), &Adt(_, args_b)) => {
+            args_a
+                .iter()
+                .zip(args_b.iter())
+                .all(|(arg_a, arg_b)| match (arg_a.unpack(), arg_b.unpack()) {
+                    // TODO: Handle inferred lifetimes
+                    (GenericArgKind::Lifetime(inner_a), GenericArgKind::Lifetime(inner_b)) => inner_a == inner_b,
+                    (GenericArgKind::Type(type_a), GenericArgKind::Type(type_b)) => same_lifetimes(type_a, type_b),
+                    _ => true,
+                })
+        },
+        _ => a == b,
+    }
+}
+
+/// Returns `true` if `ty` has no lifetime parameter, otherwise returns `false`.
+fn has_no_lifetime(ty: MiddleTy<'_>) -> bool {
+    use rustc_middle::ty::{Adt, GenericArgKind};
+    match ty.kind() {
+        &Adt(_, args) => !args
+            .iter()
+            // TODO: Handle inferred lifetimes
+            .any(|arg| matches!(arg.unpack(), GenericArgKind::Lifetime(..))),
+        _ => true,
     }
 }

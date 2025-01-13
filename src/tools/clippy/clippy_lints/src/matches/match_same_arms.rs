@@ -1,17 +1,17 @@
 use clippy_utils::diagnostics::span_lint_hir_and_then;
-use clippy_utils::source::snippet;
-use clippy_utils::{is_lint_allowed, path_to_local, search_same, SpanlessEq, SpanlessHash};
+use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::{SpanlessEq, SpanlessHash, is_lint_allowed, path_to_local, search_same};
 use core::cmp::Ordering;
 use core::{iter, slice};
 use rustc_arena::DroplessArena;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{Arm, Expr, ExprKind, HirId, HirIdMap, HirIdMapEntry, HirIdSet, Pat, PatKind, RangeEnd};
+use rustc_hir::{Arm, Expr, HirId, HirIdMap, HirIdMapEntry, HirIdSet, Pat, PatExprKind, PatKind, RangeEnd};
 use rustc_lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
-use rustc_lint::LateContext;
+use rustc_lint::{LateContext, LintContext};
 use rustc_middle::ty;
-use rustc_span::{ErrorGuaranteed, Symbol};
+use rustc_span::{ErrorGuaranteed, Span, Symbol};
 
 use super::MATCH_SAME_ARMS;
 
@@ -74,8 +74,8 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                         // check if using the same bindings as before
                         HirIdMapEntry::Occupied(entry) => return *entry.get() == b_id,
                     }
-                // the names technically don't have to match; this makes the lint more conservative
-                && cx.tcx.hir().name(a_id) == cx.tcx.hir().name(b_id)
+                    // the names technically don't have to match; this makes the lint more conservative
+                    && cx.tcx.hir().name(a_id) == cx.tcx.hir().name(b_id)
                     && cx.typeck_results().expr_ty(a) == cx.typeck_results().expr_ty(b)
                     && pat_contains_local(lhs.pat, a_id)
                     && pat_contains_local(rhs.pat, b_id)
@@ -110,20 +110,22 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
             && check_same_body()
     };
 
+    let mut appl = Applicability::MaybeIncorrect;
     let indexed_arms: Vec<(usize, &Arm<'_>)> = arms.iter().enumerate().collect();
     for (&(i, arm1), &(j, arm2)) in search_same(&indexed_arms, hash, eq) {
         if matches!(arm2.pat.kind, PatKind::Wild) {
-            if !cx.tcx.features().non_exhaustive_omitted_patterns_lint
+            if !cx.tcx.features().non_exhaustive_omitted_patterns_lint()
                 || is_lint_allowed(cx, NON_EXHAUSTIVE_OMITTED_PATTERNS, arm2.hir_id)
             {
+                let arm_span = adjusted_arm_span(cx, arm1.span);
                 span_lint_hir_and_then(
                     cx,
                     MATCH_SAME_ARMS,
                     arm1.hir_id,
-                    arm1.span,
+                    arm_span,
                     "this match arm has an identical body to the `_` wildcard arm",
                     |diag| {
-                        diag.span_suggestion(arm1.span, "try removing the arm", "", Applicability::MaybeIncorrect)
+                        diag.span_suggestion(arm_span, "try removing the arm", "", appl)
                             .help("or try changing either arm body")
                             .span_note(arm2.span, "`_` wildcard arm here");
                     },
@@ -144,21 +146,30 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                 keep_arm.span,
                 "this match arm has an identical body to another arm",
                 |diag| {
-                    let move_pat_snip = snippet(cx, move_arm.pat.span, "<pat2>");
-                    let keep_pat_snip = snippet(cx, keep_arm.pat.span, "<pat1>");
+                    let move_pat_snip = snippet_with_applicability(cx, move_arm.pat.span, "<pat2>", &mut appl);
+                    let keep_pat_snip = snippet_with_applicability(cx, keep_arm.pat.span, "<pat1>", &mut appl);
 
-                    diag.span_suggestion(
-                        keep_arm.pat.span,
-                        "try merging the arm patterns",
-                        format!("{keep_pat_snip} | {move_pat_snip}"),
-                        Applicability::MaybeIncorrect,
+                    diag.multipart_suggestion(
+                        "or try merging the arm patterns and removing the obsolete arm",
+                        vec![
+                            (keep_arm.pat.span, format!("{keep_pat_snip} | {move_pat_snip}")),
+                            (adjusted_arm_span(cx, move_arm.span), String::new()),
+                        ],
+                        appl,
                     )
-                    .help("or try changing either arm body")
-                    .span_note(move_arm.span, "other arm here");
+                    .help("try changing either arm body");
                 },
             );
         }
     }
+}
+
+/// Extend arm's span to include the comma and whitespaces after it.
+fn adjusted_arm_span(cx: &LateContext<'_>, span: Span) -> Span {
+    let source_map = cx.sess().source_map();
+    source_map
+        .span_extend_while(span, |c| c == ',' || c.is_ascii_whitespace())
+        .unwrap_or(span)
 }
 
 #[derive(Clone, Copy)]
@@ -243,9 +254,11 @@ impl<'a> NormalizedPat<'a> {
     fn from_pat(cx: &LateContext<'_>, arena: &'a DroplessArena, pat: &'a Pat<'_>) -> Self {
         match pat.kind {
             PatKind::Wild | PatKind::Binding(.., None) => Self::Wild,
-            PatKind::Binding(.., Some(pat)) | PatKind::Box(pat) | PatKind::Ref(pat, _) => {
-                Self::from_pat(cx, arena, pat)
-            },
+            PatKind::Binding(.., Some(pat))
+            | PatKind::Box(pat)
+            | PatKind::Deref(pat)
+            | PatKind::Ref(pat, _)
+            | PatKind::Guard(pat, _) => Self::from_pat(cx, arena, pat),
             PatKind::Never => Self::Never,
             PatKind::Struct(ref path, fields, _) => {
                 let fields =
@@ -298,9 +311,9 @@ impl<'a> NormalizedPat<'a> {
                 );
                 Self::Tuple(None, pats)
             },
-            PatKind::Lit(e) => match &e.kind {
+            PatKind::Expr(e) => match &e.kind {
                 // TODO: Handle negative integers. They're currently treated as a wild match.
-                ExprKind::Lit(lit) => match lit.node {
+                PatExprKind::Lit { lit, negated: false } => match lit.node {
                     LitKind::Str(sym, _) => Self::LitStr(sym),
                     LitKind::ByteStr(ref bytes, _) | LitKind::CStr(ref bytes, _) => Self::LitBytes(bytes),
                     LitKind::Byte(val) => Self::LitInt(val.into()),
@@ -317,7 +330,7 @@ impl<'a> NormalizedPat<'a> {
                 let start = match start {
                     None => 0,
                     Some(e) => match &e.kind {
-                        ExprKind::Lit(lit) => match lit.node {
+                        PatExprKind::Lit { lit, negated: false } => match lit.node {
                             LitKind::Int(val, _) => val.get(),
                             LitKind::Char(val) => val.into(),
                             LitKind::Byte(val) => val.into(),
@@ -329,7 +342,7 @@ impl<'a> NormalizedPat<'a> {
                 let (end, bounds) = match end {
                     None => (u128::MAX, RangeEnd::Included),
                     Some(e) => match &e.kind {
-                        ExprKind::Lit(lit) => match lit.node {
+                        PatExprKind::Lit { lit, negated: false } => match lit.node {
                             LitKind::Int(val, _) => (val.get(), bounds),
                             LitKind::Char(val) => (val.into(), bounds),
                             LitKind::Byte(val) => (val.into(), bounds),

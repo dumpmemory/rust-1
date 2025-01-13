@@ -1,4 +1,4 @@
-//@ ignore-emscripten default visibility is hidden
+//@ ignore-wasm32 custom sections work differently on wasm
 //@ compile-flags: -C no-prepopulate-passes
 
 #![crate_type = "lib"]
@@ -16,7 +16,7 @@ pub static VAR1: u32 = 0x01000000;
 
 pub enum E {
     A(u32),
-    B(f32)
+    B(f32),
 }
 
 // CHECK: @VAR2 = {{(dso_local )?}}constant {{.*}}, section ".test_two"

@@ -1,28 +1,28 @@
 //! Lexical region resolution.
 
-use crate::infer::region_constraints::Constraint;
-use crate::infer::region_constraints::GenericKind;
-use crate::infer::region_constraints::RegionConstraintData;
-use crate::infer::region_constraints::VarInfos;
-use crate::infer::region_constraints::VerifyBound;
-use crate::infer::RegionRelations;
-use crate::infer::RegionVariableOrigin;
-use crate::infer::SubregionOrigin;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::graph::implementation::{
-    Direction, Graph, NodeIndex, INCOMING, OUTGOING,
-};
-use rustc_data_structures::intern::Interned;
-use rustc_index::{IndexSlice, IndexVec};
-use rustc_middle::ty::fold::TypeFoldable;
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::ty::{ReBound, RePlaceholder, ReVar};
-use rustc_middle::ty::{ReEarlyParam, ReErased, ReError, ReLateParam, ReStatic};
-use rustc_middle::ty::{Region, RegionVid};
-use rustc_span::Span;
 use std::fmt;
 
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::graph::implementation::{
+    Direction, Graph, INCOMING, NodeIndex, OUTGOING,
+};
+use rustc_data_structures::intern::Interned;
+use rustc_data_structures::unord::UnordSet;
+use rustc_index::{IndexSlice, IndexVec};
+use rustc_middle::ty::fold::{TypeFoldable, fold_regions};
+use rustc_middle::ty::{
+    self, ReBound, ReEarlyParam, ReErased, ReError, ReLateParam, RePlaceholder, ReStatic, ReVar,
+    Region, RegionVid, Ty, TyCtxt,
+};
+use rustc_middle::{bug, span_bug};
+use rustc_span::Span;
+use tracing::{debug, instrument};
+
 use super::outlives::test_type_match;
+use crate::infer::region_constraints::{
+    Constraint, GenericKind, RegionConstraintData, VarInfos, VerifyBound,
+};
+use crate::infer::{RegionRelations, RegionVariableOrigin, SubregionOrigin};
 
 /// This function performs lexical region resolution given a complete
 /// set of constraints and variable origins. It performs a fixed-point
@@ -44,7 +44,7 @@ pub(crate) fn resolve<'tcx>(
 /// Contains the result of lexical region resolution. Offers methods
 /// to lookup up the final value of a region variable.
 #[derive(Clone)]
-pub struct LexicalRegionResolutions<'tcx> {
+pub(crate) struct LexicalRegionResolutions<'tcx> {
     pub(crate) values: IndexVec<RegionVid, VarValue<'tcx>>,
 }
 
@@ -139,8 +139,8 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
         let mut var_data = self.construct_var_data();
 
         // Deduplicating constraints is shown to have a positive perf impact.
-        self.data.constraints.sort_by_key(|(constraint, _)| *constraint);
-        self.data.constraints.dedup_by_key(|(constraint, _)| *constraint);
+        let mut seen = UnordSet::default();
+        self.data.constraints.retain(|(constraint, _)| seen.insert(*constraint));
 
         if cfg!(debug_assertions) {
             self.dump_constraints();
@@ -888,12 +888,14 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
                     }
 
                     Constraint::RegSubVar(region, _) | Constraint::VarSubReg(_, region) => {
-                        let constraint_idx =
-                            this.constraints.binary_search_by(|(c, _)| c.cmp(&edge.data)).unwrap();
-                        state.result.push(RegionAndOrigin {
-                            region,
-                            origin: this.constraints[constraint_idx].1.clone(),
-                        });
+                        let origin = this
+                            .constraints
+                            .iter()
+                            .find(|(c, _)| *c == edge.data)
+                            .unwrap()
+                            .1
+                            .clone();
+                        state.result.push(RegionAndOrigin { region, origin });
                     }
 
                     Constraint::RegSubReg(..) => panic!(
@@ -972,7 +974,7 @@ impl<'tcx> LexicalRegionResolutions<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        tcx.fold_regions(value, |r, _db| self.resolve_region(tcx, r))
+        fold_regions(tcx, value, |r, _db| self.resolve_region(tcx, r))
     }
 
     fn value(&self, rid: RegionVid) -> &VarValue<'tcx> {

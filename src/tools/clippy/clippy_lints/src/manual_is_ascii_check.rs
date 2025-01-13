@@ -1,16 +1,17 @@
-use clippy_config::msrvs::{self, Msrv};
-use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::macros::root_macro_call;
+use clippy_config::Conf;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::macros::matching_root_macro_call;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::sugg::Sugg;
-use clippy_utils::{higher, in_constant};
-use rustc_ast::ast::RangeLimits;
+use clippy_utils::{higher, is_in_const_context, path_to_local, peel_ref_operators};
 use rustc_ast::LitKind::{Byte, Char};
+use rustc_ast::ast::RangeLimits;
 use rustc_errors::Applicability;
-use rustc_hir::{BorrowKind, Expr, ExprKind, PatKind, RangeEnd};
+use rustc_hir::{Expr, ExprKind, Node, Param, PatKind, RangeEnd, PatExpr, PatExprKind, Lit};
 use rustc_lint::{LateContext, LateLintPass};
+use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
-use rustc_span::def_id::DefId;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -62,9 +63,10 @@ pub struct ManualIsAsciiCheck {
 }
 
 impl ManualIsAsciiCheck {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
     }
 }
 
@@ -93,60 +95,78 @@ impl<'tcx> LateLintPass<'tcx> for ManualIsAsciiCheck {
             return;
         }
 
-        if in_constant(cx, expr.hir_id) && !self.msrv.meets(msrvs::IS_ASCII_DIGIT_CONST) {
+        if is_in_const_context(cx) && !self.msrv.meets(msrvs::IS_ASCII_DIGIT_CONST) {
             return;
         }
 
-        if let Some(macro_call) = root_macro_call(expr.span)
-            && is_matches_macro(cx, macro_call.def_id)
-        {
+        if let Some(macro_call) = matching_root_macro_call(cx, expr.span, sym::matches_macro) {
             if let ExprKind::Match(recv, [arm, ..], _) = expr.kind {
                 let range = check_pat(&arm.pat.kind);
-                check_is_ascii(cx, macro_call.span, recv, &range);
+                check_is_ascii(cx, macro_call.span, recv, &range, None);
             }
         } else if let ExprKind::MethodCall(path, receiver, [arg], ..) = expr.kind
-            && path.ident.name == sym!(contains)
+            && path.ident.name.as_str() == "contains"
             && let Some(higher::Range {
                 start: Some(start),
                 end: Some(end),
                 limits: RangeLimits::Closed,
             }) = higher::Range::hir(receiver)
+            && !matches!(cx.typeck_results().expr_ty(arg).peel_refs().kind(), ty::Param(_))
         {
-            let range = check_range(start, end);
-            if let ExprKind::AddrOf(BorrowKind::Ref, _, e) = arg.kind {
-                check_is_ascii(cx, expr.span, e, &range);
-            } else {
-                check_is_ascii(cx, expr.span, arg, &range);
-            }
+            let arg = peel_ref_operators(cx, arg);
+            let ty_sugg = get_ty_sugg(cx, arg);
+            let range = check_expr_range(start, end);
+            check_is_ascii(cx, expr.span, arg, &range, ty_sugg);
         }
     }
 
     extract_msrv_attr!(LateContext);
 }
 
-fn check_is_ascii(cx: &LateContext<'_>, span: Span, recv: &Expr<'_>, range: &CharRange) {
-    if let Some(sugg) = match range {
-        CharRange::UpperChar => Some("is_ascii_uppercase"),
-        CharRange::LowerChar => Some("is_ascii_lowercase"),
-        CharRange::FullChar => Some("is_ascii_alphabetic"),
-        CharRange::Digit => Some("is_ascii_digit"),
-        CharRange::HexDigit => Some("is_ascii_hexdigit"),
-        CharRange::Otherwise | CharRange::LowerHexLetter | CharRange::UpperHexLetter => None,
-    } {
-        let default_snip = "..";
-        let mut app = Applicability::MachineApplicable;
-        let recv = Sugg::hir_with_context(cx, recv, span.ctxt(), default_snip, &mut app).maybe_par();
-
-        span_lint_and_sugg(
-            cx,
-            MANUAL_IS_ASCII_CHECK,
-            span,
-            "manual check for common ascii range",
-            "try",
-            format!("{recv}.{sugg}()"),
-            app,
-        );
+fn get_ty_sugg<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'_>) -> Option<(Span, Ty<'tcx>)> {
+    let local_hid = path_to_local(arg)?;
+    if let Node::Param(Param { ty_span, span, .. }) = cx.tcx.parent_hir_node(local_hid)
+        // `ty_span` and `span` are the same for inferred type, thus a type suggestion must be given
+        && ty_span == span
+    {
+        let arg_type = cx.typeck_results().expr_ty(arg);
+        return Some((*ty_span, arg_type));
     }
+    None
+}
+
+fn check_is_ascii(
+    cx: &LateContext<'_>,
+    span: Span,
+    recv: &Expr<'_>,
+    range: &CharRange,
+    ty_sugg: Option<(Span, Ty<'_>)>,
+) {
+    let sugg = match range {
+        CharRange::UpperChar => "is_ascii_uppercase",
+        CharRange::LowerChar => "is_ascii_lowercase",
+        CharRange::FullChar => "is_ascii_alphabetic",
+        CharRange::Digit => "is_ascii_digit",
+        CharRange::HexDigit => "is_ascii_hexdigit",
+        CharRange::Otherwise | CharRange::LowerHexLetter | CharRange::UpperHexLetter => return,
+    };
+    let default_snip = "..";
+    let mut app = Applicability::MachineApplicable;
+    let recv = Sugg::hir_with_context(cx, recv, span.ctxt(), default_snip, &mut app).maybe_par();
+    let mut suggestion = vec![(span, format!("{recv}.{sugg}()"))];
+    if let Some((ty_span, ty)) = ty_sugg {
+        suggestion.push((ty_span, format!("{recv}: {ty}")));
+    }
+
+    span_lint_and_then(
+        cx,
+        MANUAL_IS_ASCII_CHECK,
+        span,
+        "manual check for common ascii range",
+        |diag| {
+            diag.multipart_suggestion("try", suggestion, app);
+        },
+    );
 }
 
 fn check_pat(pat_kind: &PatKind<'_>) -> CharRange {
@@ -171,27 +191,33 @@ fn check_pat(pat_kind: &PatKind<'_>) -> CharRange {
     }
 }
 
-fn check_range(start: &Expr<'_>, end: &Expr<'_>) -> CharRange {
+fn check_expr_range(start: &Expr<'_>, end: &Expr<'_>) -> CharRange {
     if let ExprKind::Lit(start_lit) = &start.kind
         && let ExprKind::Lit(end_lit) = &end.kind
     {
-        match (&start_lit.node, &end_lit.node) {
-            (Char('a'), Char('z')) | (Byte(b'a'), Byte(b'z')) => CharRange::LowerChar,
-            (Char('A'), Char('Z')) | (Byte(b'A'), Byte(b'Z')) => CharRange::UpperChar,
-            (Char('a'), Char('f')) | (Byte(b'a'), Byte(b'f')) => CharRange::LowerHexLetter,
-            (Char('A'), Char('F')) | (Byte(b'A'), Byte(b'F')) => CharRange::UpperHexLetter,
-            (Char('0'), Char('9')) | (Byte(b'0'), Byte(b'9')) => CharRange::Digit,
-            _ => CharRange::Otherwise,
-        }
+        check_lit_range(start_lit, end_lit)
     } else {
         CharRange::Otherwise
     }
 }
 
-fn is_matches_macro(cx: &LateContext<'_>, macro_def_id: DefId) -> bool {
-    if let Some(name) = cx.tcx.get_diagnostic_name(macro_def_id) {
-        return sym::matches_macro == name;
+fn check_range(start: &PatExpr<'_>, end: &PatExpr<'_>) -> CharRange {
+    if let PatExprKind::Lit{ lit: start_lit, negated: false } = &start.kind
+        && let PatExprKind::Lit{ lit: end_lit, negated: false  } = &end.kind
+    {
+        check_lit_range(start_lit, end_lit)
+    } else {
+        CharRange::Otherwise
     }
+}
 
-    false
+fn check_lit_range(start_lit: &Lit, end_lit: &Lit) -> CharRange {
+    match (&start_lit.node, &end_lit.node) {
+        (Char('a'), Char('z')) | (Byte(b'a'), Byte(b'z')) => CharRange::LowerChar,
+        (Char('A'), Char('Z')) | (Byte(b'A'), Byte(b'Z')) => CharRange::UpperChar,
+        (Char('a'), Char('f')) | (Byte(b'a'), Byte(b'f')) => CharRange::LowerHexLetter,
+        (Char('A'), Char('F')) | (Byte(b'A'), Byte(b'F')) => CharRange::UpperHexLetter,
+        (Char('0'), Char('9')) | (Byte(b'0'), Byte(b'9')) => CharRange::Digit,
+        _ => CharRange::Otherwise,
+    }
 }

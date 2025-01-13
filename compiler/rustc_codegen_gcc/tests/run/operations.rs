@@ -64,9 +64,11 @@ mod libc {
 }
 
 mod intrinsics {
-    extern "rust-intrinsic" {
-        #[rustc_safe_intrinsic]
-        pub fn abort() -> !;
+    #[rustc_nounwind]
+    #[rustc_intrinsic]
+    #[rustc_intrinsic_must_be_overridden]
+    pub fn abort() -> ! {
+        loop {}
     }
 }
 
@@ -205,6 +207,24 @@ impl Mul for isize {
     fn mul(self, rhs: Self) -> Self::Output {
         self * rhs
     }
+}
+
+#[track_caller]
+#[lang = "panic_const_add_overflow"]
+pub fn panic_const_add_overflow() -> ! {
+    panic("attempt to add with overflow");
+}
+
+#[track_caller]
+#[lang = "panic_const_sub_overflow"]
+pub fn panic_const_sub_overflow() -> ! {
+    panic("attempt to subtract with overflow");
+}
+
+#[track_caller]
+#[lang = "panic_const_mul_overflow"]
+pub fn panic_const_mul_overflow() -> ! {
+    panic("attempt to multiply with overflow");
 }
 
 /*

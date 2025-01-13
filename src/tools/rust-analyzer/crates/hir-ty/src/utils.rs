@@ -5,25 +5,20 @@ use std::{hash::Hash, iter};
 
 use base_db::CrateId;
 use chalk_ir::{
-    cast::Cast,
     fold::{FallibleTypeFolder, Shift},
-    BoundVar, DebruijnIndex,
+    DebruijnIndex,
 };
-use either::Either;
 use hir_def::{
     db::DefDatabase,
-    generics::{
-        GenericParams, TypeOrConstParamData, TypeParamProvenance, WherePredicate,
-        WherePredicateTypeTarget,
-    },
+    generics::{WherePredicate, WherePredicateTypeTarget},
     lang_item::LangItem,
     resolver::{HasResolver, TypeNs},
     type_ref::{TraitBoundModifier, TypeRef},
-    ConstParamId, EnumId, EnumVariantId, FunctionId, GenericDefId, ItemContainerId, Lookup,
-    OpaqueInternableThing, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId,
+    EnumId, EnumVariantId, FunctionId, Lookup, OpaqueInternableThing, TraitId, TypeAliasId,
+    TypeOrConstParamId,
 };
 use hir_expand::name::Name;
-use intern::Interned;
+use intern::sym;
 use rustc_abi::TargetDataLayout;
 use rustc_hash::FxHashSet;
 use smallvec::{smallvec, SmallVec};
@@ -48,6 +43,17 @@ pub(crate) fn fn_traits(
         .flat_map(|it| it.as_trait())
 }
 
+/// Returns an iterator over the direct super traits (including the trait itself).
+pub fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[TraitId; 4]> {
+    let mut result = smallvec![trait_];
+    direct_super_traits_cb(db, trait_, |tt| {
+        if !result.contains(&tt) {
+            result.push(tt);
+        }
+    });
+    result
+}
+
 /// Returns an iterator over the whole super trait hierarchy (including the
 /// trait itself).
 pub fn all_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[TraitId; 4]> {
@@ -59,7 +65,7 @@ pub fn all_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[Trai
     while let Some(&t) = result.get(i) {
         // yeah this is quadratic, but trait hierarchies should be flat
         // enough that this doesn't matter
-        direct_super_traits(db, t, |tt| {
+        direct_super_traits_cb(db, t, |tt| {
             if !result.contains(&tt) {
                 result.push(tt);
             }
@@ -128,7 +134,7 @@ pub(super) struct ClauseElaborator<'a> {
     seen: FxHashSet<WhereClause>,
 }
 
-impl<'a> ClauseElaborator<'a> {
+impl ClauseElaborator<'_> {
     fn extend_deduped(&mut self, clauses: impl IntoIterator<Item = WhereClause>) {
         self.stack.extend(clauses.into_iter().filter(|c| self.seen.insert(c.clone())))
     }
@@ -158,27 +164,28 @@ impl Iterator for ClauseElaborator<'_> {
     }
 }
 
-fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId, cb: impl FnMut(TraitId)) {
+fn direct_super_traits_cb(db: &dyn DefDatabase, trait_: TraitId, cb: impl FnMut(TraitId)) {
     let resolver = trait_.resolver(db);
     let generic_params = db.generic_params(trait_.into());
-    let trait_self = generic_params.find_trait_self_param();
+    let trait_self = generic_params.trait_self_param();
     generic_params
-        .where_predicates
-        .iter()
+        .where_predicates()
         .filter_map(|pred| match pred {
             WherePredicate::ForLifetime { target, bound, .. }
             | WherePredicate::TypeBound { target, bound } => {
                 let is_trait = match target {
-                    WherePredicateTypeTarget::TypeRef(type_ref) => match &**type_ref {
-                        TypeRef::Path(p) => p.is_self_type(),
-                        _ => false,
-                    },
+                    WherePredicateTypeTarget::TypeRef(type_ref) => {
+                        match &generic_params.types_map[*type_ref] {
+                            TypeRef::Path(p) => p.is_self_type(),
+                            _ => false,
+                        }
+                    }
                     WherePredicateTypeTarget::TypeOrConstParam(local_id) => {
                         Some(*local_id) == trait_self
                     }
                 };
                 match is_trait {
-                    true => bound.as_path(),
+                    true => bound.as_path(&generic_params.types_map),
                     false => None,
                 }
             }
@@ -194,7 +201,7 @@ fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId, cb: impl FnMut(Tra
 
 fn direct_super_trait_refs(db: &dyn HirDatabase, trait_ref: &TraitRef, cb: impl FnMut(TraitRef)) {
     let generic_params = db.generic_params(trait_ref.hir_trait_id().into());
-    let trait_self = match generic_params.find_trait_self_param() {
+    let trait_self = match generic_params.trait_self_param() {
         Some(p) => TypeOrConstParamId { parent: trait_ref.hir_trait_id().into(), local_id: p },
         None => return,
     };
@@ -224,11 +231,6 @@ pub(super) fn associated_type_by_name_including_super_traits(
         let assoc_type = db.trait_data(t.hir_trait_id()).associated_type_by_name(name)?;
         Some((t, assoc_type))
     })
-}
-
-pub(crate) fn generics(db: &dyn DefDatabase, def: GenericDefId) -> Generics {
-    let parent_generics = parent_generic_def(db, def).map(|def| Box::new(generics(db, def)));
-    Generics { def, params: db.generic_params(def), parent_generics }
 }
 
 /// It is a bit different from the rustc equivalent. Currently it stores:
@@ -262,179 +264,26 @@ impl<'a> ClosureSubst<'a> {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct Generics {
-    def: GenericDefId,
-    pub(crate) params: Interned<GenericParams>,
-    parent_generics: Option<Box<Generics>>,
-}
-
-impl Generics {
-    pub(crate) fn iter_id(&self) -> impl Iterator<Item = Either<TypeParamId, ConstParamId>> + '_ {
-        self.iter().map(|(id, data)| match data {
-            TypeOrConstParamData::TypeParamData(_) => Either::Left(TypeParamId::from_unchecked(id)),
-            TypeOrConstParamData::ConstParamData(_) => {
-                Either::Right(ConstParamId::from_unchecked(id))
-            }
-        })
-    }
-
-    /// Iterator over types and const params of self, then parent.
-    pub(crate) fn iter<'a>(
-        &'a self,
-    ) -> impl DoubleEndedIterator<Item = (TypeOrConstParamId, &'a TypeOrConstParamData)> + 'a {
-        let to_toc_id = |it: &'a Generics| {
-            move |(local_id, p)| (TypeOrConstParamId { parent: it.def, local_id }, p)
-        };
-        self.params.iter().map(to_toc_id(self)).chain(self.iter_parent())
-    }
-
-    /// Iterate over types and const params without parent params.
-    pub(crate) fn iter_self<'a>(
-        &'a self,
-    ) -> impl DoubleEndedIterator<Item = (TypeOrConstParamId, &'a TypeOrConstParamData)> + 'a {
-        let to_toc_id = |it: &'a Generics| {
-            move |(local_id, p)| (TypeOrConstParamId { parent: it.def, local_id }, p)
-        };
-        self.params.iter().map(to_toc_id(self))
-    }
-
-    /// Iterator over types and const params of parent.
-    pub(crate) fn iter_parent(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (TypeOrConstParamId, &TypeOrConstParamData)> {
-        self.parent_generics().into_iter().flat_map(|it| {
-            let to_toc_id =
-                move |(local_id, p)| (TypeOrConstParamId { parent: it.def, local_id }, p);
-            it.params.iter().map(to_toc_id)
-        })
-    }
-
-    /// Returns total number of generic parameters in scope, including those from parent.
-    pub(crate) fn len(&self) -> usize {
-        let parent = self.parent_generics().map_or(0, Generics::len);
-        let child = self.params.type_or_consts.len();
-        parent + child
-    }
-
-    /// Returns numbers of generic parameters excluding those from parent.
-    pub(crate) fn len_self(&self) -> usize {
-        self.params.type_or_consts.len()
-    }
-
-    /// (parent total, self param, type param list, const param list, impl trait)
-    pub(crate) fn provenance_split(&self) -> (usize, usize, usize, usize, usize) {
-        let mut self_params = 0;
-        let mut type_params = 0;
-        let mut impl_trait_params = 0;
-        let mut const_params = 0;
-        self.params.iter().for_each(|(_, data)| match data {
-            TypeOrConstParamData::TypeParamData(p) => match p.provenance {
-                TypeParamProvenance::TypeParamList => type_params += 1,
-                TypeParamProvenance::TraitSelf => self_params += 1,
-                TypeParamProvenance::ArgumentImplTrait => impl_trait_params += 1,
-            },
-            TypeOrConstParamData::ConstParamData(_) => const_params += 1,
-        });
-
-        let parent_len = self.parent_generics().map_or(0, Generics::len);
-        (parent_len, self_params, type_params, const_params, impl_trait_params)
-    }
-
-    pub(crate) fn param_idx(&self, param: TypeOrConstParamId) -> Option<usize> {
-        Some(self.find_param(param)?.0)
-    }
-
-    fn find_param(&self, param: TypeOrConstParamId) -> Option<(usize, &TypeOrConstParamData)> {
-        if param.parent == self.def {
-            let (idx, (_local_id, data)) =
-                self.params.iter().enumerate().find(|(_, (idx, _))| *idx == param.local_id)?;
-            Some((idx, data))
-        } else {
-            self.parent_generics()
-                .and_then(|g| g.find_param(param))
-                // Remember that parent parameters come after parameters for self.
-                .map(|(idx, data)| (self.len_self() + idx, data))
-        }
-    }
-
-    pub(crate) fn parent_generics(&self) -> Option<&Generics> {
-        self.parent_generics.as_deref()
-    }
-
-    /// Returns a Substitution that replaces each parameter by a bound variable.
-    pub(crate) fn bound_vars_subst(
-        &self,
-        db: &dyn HirDatabase,
-        debruijn: DebruijnIndex,
-    ) -> Substitution {
-        Substitution::from_iter(
-            Interner,
-            self.iter_id().enumerate().map(|(idx, id)| match id {
-                Either::Left(_) => BoundVar::new(debruijn, idx).to_ty(Interner).cast(Interner),
-                Either::Right(id) => BoundVar::new(debruijn, idx)
-                    .to_const(Interner, db.const_param_ty(id))
-                    .cast(Interner),
-            }),
-        )
-    }
-
-    /// Returns a Substitution that replaces each parameter by itself (i.e. `Ty::Param`).
-    pub(crate) fn placeholder_subst(&self, db: &dyn HirDatabase) -> Substitution {
-        Substitution::from_iter(
-            Interner,
-            self.iter_id().map(|id| match id {
-                Either::Left(id) => {
-                    crate::to_placeholder_idx(db, id.into()).to_ty(Interner).cast(Interner)
-                }
-                Either::Right(id) => crate::to_placeholder_idx(db, id.into())
-                    .to_const(Interner, db.const_param_ty(id))
-                    .cast(Interner),
-            }),
-        )
-    }
-}
-
-fn parent_generic_def(db: &dyn DefDatabase, def: GenericDefId) -> Option<GenericDefId> {
-    let container = match def {
-        GenericDefId::FunctionId(it) => it.lookup(db).container,
-        GenericDefId::TypeAliasId(it) => it.lookup(db).container,
-        GenericDefId::ConstId(it) => it.lookup(db).container,
-        GenericDefId::EnumVariantId(it) => return Some(it.lookup(db).parent.into()),
-        GenericDefId::AdtId(_)
-        | GenericDefId::TraitId(_)
-        | GenericDefId::ImplId(_)
-        | GenericDefId::TraitAliasId(_) => return None,
-    };
-
-    match container {
-        ItemContainerId::ImplId(it) => Some(it.into()),
-        ItemContainerId::TraitId(it) => Some(it.into()),
-        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => None,
-    }
-}
-
 pub fn is_fn_unsafe_to_call(db: &dyn HirDatabase, func: FunctionId) -> bool {
     let data = db.function_data(func);
-    if data.has_unsafe_kw() {
+    if data.is_unsafe() {
         return true;
     }
 
-    match func.lookup(db.upcast()).container {
+    let loc = func.lookup(db.upcast());
+    match loc.container {
         hir_def::ItemContainerId::ExternBlockId(block) => {
-            // Function in an `extern` block are always unsafe to call, except when it has
-            // `"rust-intrinsic"` ABI there are a few exceptions.
             let id = block.lookup(db.upcast()).id;
-
-            let is_intrinsic =
-                id.item_tree(db.upcast())[id.value].abi.as_deref() == Some("rust-intrinsic");
-
-            if is_intrinsic {
-                // Intrinsics are unsafe unless they have the rustc_safe_intrinsic attribute
-                !data.attrs.by_key("rustc_safe_intrinsic").exists()
+            let is_intrinsic_block =
+                id.item_tree(db.upcast())[id.value].abi.as_ref() == Some(&sym::rust_dash_intrinsic);
+            if is_intrinsic_block {
+                // legacy intrinsics
+                // extern "rust-intrinsic" intrinsics are unsafe unless they have the rustc_safe_intrinsic attribute
+                !db.attrs(func.into()).by_key(&sym::rustc_safe_intrinsic).exists()
             } else {
-                // Extern items are always unsafe
-                true
+                // Function in an `extern` block are always unsafe to call, except when
+                // it is marked as `safe`.
+                !data.is_safe()
             }
         }
         _ => false,
@@ -482,6 +331,7 @@ pub(crate) fn detect_variant_from_bytes<'a>(
     e: EnumId,
 ) -> Option<(EnumVariantId, &'a Layout)> {
     let (var_id, var_layout) = match &layout.variants {
+        hir_def::layout::Variants::Empty => unreachable!(),
         hir_def::layout::Variants::Single { index } => {
             (db.enum_data(e).variants[index.0].0, layout)
         }
@@ -523,7 +373,7 @@ impl OpaqueInternableThing for InTypeConstIdMetadata {
     }
 
     fn dyn_eq(&self, other: &dyn OpaqueInternableThing) -> bool {
-        other.as_any().downcast_ref::<Self>().map_or(false, |x| self == x)
+        other.as_any().downcast_ref::<Self>() == Some(self)
     }
 
     fn dyn_clone(&self) -> Box<dyn OpaqueInternableThing> {

@@ -8,6 +8,9 @@ use crate::core::DocContext;
 mod stripper;
 pub(crate) use stripper::*;
 
+mod strip_aliased_non_local;
+pub(crate) use self::strip_aliased_non_local::STRIP_ALIASED_NON_LOCAL;
+
 mod strip_hidden;
 pub(crate) use self::strip_hidden::STRIP_HIDDEN;
 
@@ -19,6 +22,9 @@ pub(crate) use self::strip_priv_imports::STRIP_PRIV_IMPORTS;
 
 mod propagate_doc_cfg;
 pub(crate) use self::propagate_doc_cfg::PROPAGATE_DOC_CFG;
+
+mod propagate_stability;
+pub(crate) use self::propagate_stability::PROPAGATE_STABILITY;
 
 pub(crate) mod collect_intra_doc_links;
 pub(crate) use self::collect_intra_doc_links::COLLECT_INTRA_DOC_LINKS;
@@ -35,16 +41,13 @@ pub(crate) use self::calculate_doc_coverage::CALCULATE_DOC_COVERAGE;
 mod lint;
 pub(crate) use self::lint::RUN_LINTS;
 
-mod check_custom_code_classes;
-pub(crate) use self::check_custom_code_classes::CHECK_CUSTOM_CODE_CLASSES;
-
 /// A single pass over the cleaned documentation.
 ///
 /// Runs in the compiler context, so it has access to types and traits and the like.
 #[derive(Copy, Clone)]
 pub(crate) struct Pass {
     pub(crate) name: &'static str,
-    pub(crate) run: fn(clean::Crate, &mut DocContext<'_>) -> clean::Crate,
+    pub(crate) run: Option<fn(clean::Crate, &mut DocContext<'_>) -> clean::Crate>,
     pub(crate) description: &'static str,
 }
 
@@ -69,12 +72,13 @@ pub(crate) enum Condition {
 
 /// The full list of passes.
 pub(crate) const PASSES: &[Pass] = &[
-    CHECK_CUSTOM_CODE_CLASSES,
     CHECK_DOC_TEST_VISIBILITY,
+    STRIP_ALIASED_NON_LOCAL,
     STRIP_HIDDEN,
     STRIP_PRIVATE,
     STRIP_PRIV_IMPORTS,
     PROPAGATE_DOC_CFG,
+    PROPAGATE_STABILITY,
     COLLECT_INTRA_DOC_LINKS,
     COLLECT_TRAIT_IMPLS,
     CALCULATE_DOC_COVERAGE,
@@ -83,14 +87,15 @@ pub(crate) const PASSES: &[Pass] = &[
 
 /// The list of passes run by default.
 pub(crate) const DEFAULT_PASSES: &[ConditionalPass] = &[
-    ConditionalPass::always(CHECK_CUSTOM_CODE_CLASSES),
     ConditionalPass::always(COLLECT_TRAIT_IMPLS),
     ConditionalPass::always(CHECK_DOC_TEST_VISIBILITY),
+    ConditionalPass::always(STRIP_ALIASED_NON_LOCAL),
     ConditionalPass::new(STRIP_HIDDEN, WhenNotDocumentHidden),
     ConditionalPass::new(STRIP_PRIVATE, WhenNotDocumentPrivate),
     ConditionalPass::new(STRIP_PRIV_IMPORTS, WhenDocumentPrivate),
     ConditionalPass::always(COLLECT_INTRA_DOC_LINKS),
     ConditionalPass::always(PROPAGATE_DOC_CFG),
+    ConditionalPass::always(PROPAGATE_STABILITY),
     ConditionalPass::always(RUN_LINTS),
 ];
 

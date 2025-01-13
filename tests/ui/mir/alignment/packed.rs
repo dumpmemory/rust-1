@@ -1,8 +1,6 @@
 //@ run-pass
 //@ compile-flags: -C debug-assertions
 
-#![feature(strict_provenance, pointer_is_aligned)]
-
 #[repr(packed)]
 struct Misaligner {
     _head: u8,

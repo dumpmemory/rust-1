@@ -6,7 +6,7 @@
 // to process this `'r` region bound. In particular, to be WF, the
 // region bound must meet the requirements of the trait, and hence we
 // got `for<'r> { 'r: 'static }`. This would ICE because the `Binder`
-// constructor we were using was assering that no higher-ranked
+// constructor we were using was asserting that no higher-ranked
 // regions were involved (because the WF code is supposed to skip
 // those). The error (if debug-asserions were disabled) came because
 // we obviously cannot prove that `'r: 'static` for any region `'r`.
@@ -17,7 +17,7 @@
 //
 //@ check-pass
 
-#![feature(coroutines)]
+#![feature(coroutines, stmt_expr_attributes)]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -29,7 +29,7 @@ struct Store<C> {
 }
 
 fn main() {
-    Box::new(static move || {
+    Box::new(#[coroutine] static move || {
         let store = Store::<Box<dyn Trait>> {
             inner: Default::default(),
         };

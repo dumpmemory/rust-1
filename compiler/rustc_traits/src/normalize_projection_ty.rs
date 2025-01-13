@@ -1,15 +1,14 @@
-use rustc_infer::infer::canonical::{Canonical, QueryResponse};
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_infer::infer::canonical::{Canonical, QueryResponse};
+use rustc_infer::traits::PredicateObligations;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{ParamEnvAnd, TyCtxt};
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::infer::InferCtxtBuilderExt;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
-use rustc_trait_selection::traits::query::{
-    normalize::NormalizationResult, CanonicalAliasGoal, NoSolution,
-};
-use rustc_trait_selection::traits::{
-    self, FulfillmentErrorCode, ObligationCause, SelectionContext,
-};
+use rustc_trait_selection::traits::query::normalize::NormalizationResult;
+use rustc_trait_selection::traits::query::{CanonicalAliasGoal, NoSolution};
+use rustc_trait_selection::traits::{self, ObligationCause, ScrubbedTraitError, SelectionContext};
+use tracing::debug;
 
 pub(crate) fn provide(p: &mut Providers) {
     *p = Providers {
@@ -32,15 +31,9 @@ fn normalize_canonicalized_projection_ty<'tcx>(
             debug_assert!(!ocx.infcx.next_trait_solver());
             let selcx = &mut SelectionContext::new(ocx.infcx);
             let cause = ObligationCause::dummy();
-            let mut obligations = vec![];
-            let answer = traits::normalize_projection_type(
-                selcx,
-                param_env,
-                goal,
-                cause,
-                0,
-                &mut obligations,
-            );
+            let mut obligations = PredicateObligations::new();
+            let answer =
+                traits::normalize_projection_ty(selcx, param_env, goal, cause, 0, &mut obligations);
             ocx.register_obligations(obligations);
             // #112047: With projections and opaques, we are able to create opaques that
             // are recursive (given some generic parameters of the opaque's type variables).
@@ -54,7 +47,7 @@ fn normalize_canonicalized_projection_ty<'tcx>(
                 // that impl vars are constrained by the signature, for example).
                 if !tcx.sess.opts.actually_rustdoc {
                     for error in &errors {
-                        if let FulfillmentErrorCode::Cycle(cycle) = &error.code {
+                        if let ScrubbedTraitError::Cycle(cycle) = &error {
                             ocx.infcx.err_ctxt().report_overflow_obligation_cycle(cycle);
                         }
                     }
@@ -65,7 +58,7 @@ fn normalize_canonicalized_projection_ty<'tcx>(
             // FIXME(associated_const_equality): All users of normalize_canonicalized_projection_ty
             // expected a type, but there is the possibility it could've been a const now.
             // Maybe change it to a Term later?
-            Ok(NormalizationResult { normalized_ty: answer.ty().unwrap() })
+            Ok(NormalizationResult { normalized_ty: answer.expect_type() })
         },
     )
 }
@@ -107,7 +100,7 @@ fn normalize_canonicalized_inherent_projection_ty<'tcx>(
         |ocx, ParamEnvAnd { param_env, value: goal }| {
             let selcx = &mut SelectionContext::new(ocx.infcx);
             let cause = ObligationCause::dummy();
-            let mut obligations = vec![];
+            let mut obligations = PredicateObligations::new();
             let answer = traits::normalize_inherent_projection(
                 selcx,
                 param_env,

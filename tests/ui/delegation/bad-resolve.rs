@@ -1,5 +1,5 @@
 #![feature(fn_delegation)]
-//~^ WARN the feature `fn_delegation` is incomplete
+#![allow(incomplete_features)]
 
 trait Trait {
     const C: u32 = 0;
@@ -34,14 +34,13 @@ impl Trait for S {
 
     reuse foo { &self.0 }
     //~^ ERROR cannot find function `foo` in this scope
-    reuse F::foo { &self.0 }
-    //~^ ERROR cannot find function `foo` in `F`
-    //~| ERROR duplicate definitions with name `foo`
+    reuse Trait::foo2 { self.0 }
+    //~^ ERROR cannot find function `foo2` in trait `Trait`
+    //~| ERROR method `foo2` is not a member of trait `Trait`
 }
 
-impl S {
-    reuse F::foo { &self.0 }
-    //~^ ERROR cannot find function `foo` in `F`
-}
+mod prefix {}
+reuse unresolved_prefix::{a, b, c}; //~ ERROR use of undeclared crate or module `unresolved_prefix`
+reuse prefix::{self, super, crate}; //~ ERROR `crate` in paths can only be used in start position
 
 fn main() {}

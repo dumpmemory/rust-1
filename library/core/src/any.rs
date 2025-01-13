@@ -40,10 +40,10 @@
 //!
 //! ## Examples
 //!
-//! Consider a situation where we want to log out a value passed to a function.
-//! We know the value we're working on implements Debug, but we don't know its
+//! Consider a situation where we want to log a value passed to a function.
+//! We know the value we're working on implements `Debug`, but we don't know its
 //! concrete type. We want to give special treatment to certain types: in this
-//! case printing out the length of String values prior to their value.
+//! case printing out the length of `String` values prior to their value.
 //! We don't know the concrete type of our value at compile time, so we need to
 //! use runtime reflection instead.
 //!
@@ -51,7 +51,7 @@
 //! use std::fmt::Debug;
 //! use std::any::Any;
 //!
-//! // Logger function for any type that implements Debug.
+//! // Logger function for any type that implements `Debug`.
 //! fn log<T: Any + Debug>(value: &T) {
 //!     let value_any = value as &dyn Any;
 //!
@@ -86,9 +86,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::fmt;
-use crate::hash;
-use crate::intrinsics;
+use crate::{fmt, hash, intrinsics};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Any trait
@@ -425,7 +423,8 @@ impl dyn Any + Send {
     ///
     /// # Safety
     ///
-    /// Same as the method on the type `dyn Any`.
+    /// The contained value must be of type `T`. Calling this method
+    /// with the incorrect type is *undefined behavior*.
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
     #[inline]
     pub unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
@@ -453,7 +452,8 @@ impl dyn Any + Send {
     ///
     /// # Safety
     ///
-    /// Same as the method on the type `dyn Any`.
+    /// The contained value must be of type `T`. Calling this method
+    /// with the incorrect type is *undefined behavior*.
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
     #[inline]
     pub unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
@@ -554,6 +554,10 @@ impl dyn Any + Send + Sync {
     ///     assert_eq!(*x.downcast_ref_unchecked::<usize>(), 1);
     /// }
     /// ```
+    /// # Safety
+    ///
+    /// The contained value must be of type `T`. Calling this method
+    /// with the incorrect type is *undefined behavior*.
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
     #[inline]
     pub unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
@@ -578,6 +582,10 @@ impl dyn Any + Send + Sync {
     ///
     /// assert_eq!(*x.downcast_ref::<usize>().unwrap(), 2);
     /// ```
+    /// # Safety
+    ///
+    /// The contained value must be of type `T`. Calling this method
+    /// with the incorrect type is *undefined behavior*.
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
     #[inline]
     pub unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
@@ -602,7 +610,7 @@ impl dyn Any + Send + Sync {
 /// While `TypeId` implements `Hash`, `PartialOrd`, and `Ord`, it is worth
 /// noting that the hashes and ordering will vary between Rust releases. Beware
 /// of relying on them inside of your code!
-#[derive(Clone, Copy, Debug, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Eq, PartialOrd, Ord)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct TypeId {
     // We avoid using `u128` because that imposes higher alignment requirements on many platforms.
@@ -644,6 +652,10 @@ impl TypeId {
         let t2 = t as u64;
         TypeId { t: (t1, t2) }
     }
+
+    fn as_u128(self) -> u128 {
+        u128::from(self.t.0) << 64 | u128::from(self.t.1)
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -663,6 +675,13 @@ impl hash::Hash for TypeId {
         //   with an `Eq` implementation that considers the entire value, as
         //   ours does.
         self.t.1.hash(state);
+    }
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl fmt::Debug for TypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "TypeId({:#034x})", self.as_u128())
     }
 }
 

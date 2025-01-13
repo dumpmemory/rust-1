@@ -1,9 +1,8 @@
 //! Tests that unwinding from an asm block is caught and forced to abort
 //! when `-C panic=abort`.
 
-//@ only-x86_64
 //@ compile-flags: -C panic=abort
-//@ no-prefer-dynamic
+//@ needs-asm-support
 
 #![feature(asm_unwind)]
 
@@ -11,7 +10,9 @@
 fn main() {
     // CHECK-LABEL: fn main(
     // CHECK: asm!(
-    // CHECK-SAME: unwind terminate(abi)
+    // CHECK-SAME: unwind: [[unwind:bb.*]]]
+    // CHECK: [[unwind]] (cleanup)
+    // CHECK-NEXT: terminate(abi)
     unsafe {
         std::arch::asm!("", options(may_unwind));
     }

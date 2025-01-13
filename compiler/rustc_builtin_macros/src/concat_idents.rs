@@ -1,31 +1,30 @@
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Token};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
-use rustc_ast::{AttrVec, Expr, ExprKind, Path, Ty, TyKind, DUMMY_NODE_ID};
-use rustc_expand::base::{DummyResult, ExtCtxt, MacResult};
-use rustc_span::symbol::{Ident, Symbol};
-use rustc_span::Span;
+use rustc_ast::{AttrVec, DUMMY_NODE_ID, Expr, ExprKind, Path, Ty, TyKind};
+use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacResult, MacroExpanderResult};
+use rustc_span::{Ident, Span, Symbol};
 
 use crate::errors;
 
-pub fn expand_concat_idents<'cx>(
+pub(crate) fn expand_concat_idents<'cx>(
     cx: &'cx mut ExtCtxt<'_>,
     sp: Span,
     tts: TokenStream,
-) -> Box<dyn MacResult + 'cx> {
+) -> MacroExpanderResult<'cx> {
     if tts.is_empty() {
         let guar = cx.dcx().emit_err(errors::ConcatIdentsMissingArgs { span: sp });
-        return DummyResult::any(sp, guar);
+        return ExpandResult::Ready(DummyResult::any(sp, guar));
     }
 
     let mut res_str = String::new();
-    for (i, e) in tts.trees().enumerate() {
+    for (i, e) in tts.iter().enumerate() {
         if i & 1 == 1 {
             match e {
                 TokenTree::Token(Token { kind: token::Comma, .. }, _) => {}
                 _ => {
                     let guar = cx.dcx().emit_err(errors::ConcatIdentsMissingComma { span: sp });
-                    return DummyResult::any(sp, guar);
+                    return ExpandResult::Ready(DummyResult::any(sp, guar));
                 }
             }
         } else {
@@ -37,7 +36,7 @@ pub fn expand_concat_idents<'cx>(
             }
 
             let guar = cx.dcx().emit_err(errors::ConcatIdentsIdentArgs { span: sp });
-            return DummyResult::any(sp, guar);
+            return ExpandResult::Ready(DummyResult::any(sp, guar));
         }
     }
 
@@ -68,5 +67,5 @@ pub fn expand_concat_idents<'cx>(
         }
     }
 
-    Box::new(ConcatIdentsResult { ident })
+    ExpandResult::Ready(Box::new(ConcatIdentsResult { ident }))
 }

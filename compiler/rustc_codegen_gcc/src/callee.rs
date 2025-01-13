@@ -28,7 +28,7 @@ pub fn get_fn<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, instance: Instance<'tcx>) 
 
     let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
 
-    let func = if let Some(_func) = cx.get_declared_value(&sym) {
+    let func = if let Some(_func) = cx.get_declared_value(sym) {
         // FIXME(antoyo): we never reach this because get_declared_value only returns global variables
         // and here we try to get a function.
         unreachable!();
@@ -68,7 +68,7 @@ pub fn get_fn<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, instance: Instance<'tcx>) 
         }*/
     } else {
         cx.linkage.set(FunctionType::Extern);
-        let func = cx.declare_fn(&sym, &fn_abi);
+        let func = cx.declare_fn(sym, fn_abi);
 
         attributes::from_fn_attrs(cx, func, instance);
 
@@ -98,8 +98,7 @@ pub fn get_fn<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, instance: Instance<'tcx>) 
         // whether we are sharing generics or not. The important thing here is
         // that the visibility we apply to the declaration is the same one that
         // has been applied to the definition (wherever that definition may be).
-        let is_generic =
-            instance.args.non_erasable_generics(tcx, instance.def_id()).next().is_some();
+        let is_generic = instance.args.non_erasable_generics().next().is_some();
 
         if is_generic {
             // This is a monomorphization. Its expected visibility depends

@@ -1,22 +1,17 @@
 //! Thread implementation backed by μITRON tasks. Assumes `acre_tsk` and
 //! `exd_tsk` are available.
-use super::{
-    abi,
-    error::{expect_success, expect_success_aborting, ItronError},
-    task,
-    time::dur2reltims,
-};
-use crate::{
-    cell::UnsafeCell,
-    ffi::{CStr, CString},
-    hint, io,
-    mem::ManuallyDrop,
-    num::NonZero,
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
-    sys::thread_local_dtor::run_dtors,
-    time::Duration,
-};
+
+use super::error::{ItronError, expect_success, expect_success_aborting};
+use super::time::dur2reltims;
+use super::{abi, task};
+use crate::cell::UnsafeCell;
+use crate::ffi::CStr;
+use crate::mem::ManuallyDrop;
+use crate::num::NonZero;
+use crate::ptr::NonNull;
+use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::time::Duration;
+use crate::{hint, io};
 
 pub struct Thread {
     p_inner: NonNull<ThreadInner>,
@@ -98,7 +93,7 @@ impl Thread {
         });
 
         unsafe extern "C" fn trampoline(exinf: isize) {
-            let p_inner: *mut ThreadInner = crate::ptr::from_exposed_addr_mut(exinf as usize);
+            let p_inner: *mut ThreadInner = crate::ptr::with_exposed_provenance_mut(exinf as usize);
             // Safety: `ThreadInner` is alive at this point
             let inner = unsafe { &*p_inner };
 
@@ -116,7 +111,7 @@ impl Thread {
 
             // Run TLS destructors now because they are not
             // called automatically for terminated tasks.
-            unsafe { run_dtors() };
+            unsafe { crate::sys::thread_local::destructors::run() };
 
             let old_lifecycle = inner
                 .lifecycle
@@ -181,7 +176,7 @@ impl Thread {
             abi::acre_tsk(&abi::T_CTSK {
                 // Activate this task immediately
                 tskatr: abi::TA_ACT,
-                exinf: p_inner.as_ptr().expose_addr() as abi::EXINF,
+                exinf: p_inner.as_ptr().expose_provenance() as abi::EXINF,
                 // The entry point
                 task: Some(trampoline),
                 // Inherit the calling task's base priority
@@ -202,10 +197,6 @@ impl Thread {
 
     pub fn set_name(_name: &CStr) {
         // nope
-    }
-
-    pub fn get_name() -> Option<CString> {
-        None
     }
 
     pub fn sleep(dur: Duration) {
@@ -312,17 +303,7 @@ impl Drop for Thread {
     }
 }
 
-pub mod guard {
-    pub type Guard = !;
-    pub unsafe fn current() -> Option<Guard> {
-        None
-    }
-    pub unsafe fn init() -> Option<Guard> {
-        None
-    }
-}
-
-/// Terminate and delete the specified task.
+/// Terminates and deletes the specified task.
 ///
 /// This function will abort if `deleted_task` refers to the calling task.
 ///
@@ -351,7 +332,7 @@ unsafe fn terminate_and_delete_task(deleted_task: abi::ID) {
     expect_success_aborting(unsafe { abi::del_tsk(deleted_task) }, &"del_tsk");
 }
 
-/// Terminate and delete the calling task.
+/// Terminates and deletes the calling task.
 ///
 /// Atomicity is not required - i.e., it can be assumed that other threads won't
 /// `ter_tsk` the calling task while this function is still in progress. (This

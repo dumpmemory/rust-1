@@ -1,12 +1,12 @@
-use clippy_config::msrvs::Msrv;
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::is_in_test_function;
-use rustc_attr::{StabilityLevel, StableSince};
+use clippy_utils::is_in_test;
+use clippy_utils::msrvs::Msrv;
+use rustc_attr_parsing::{RustcVersion, StabilityLevel, StableSince};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::{Expr, ExprKind, HirId};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::TyCtxt;
-use rustc_semver::RustcVersion;
 use rustc_session::impl_lint_pass;
 use rustc_span::def_id::DefId;
 use rustc_span::{ExpnKind, Span};
@@ -33,7 +33,7 @@ declare_clippy_lint! {
     ///
     /// To fix this problem, either increase your MSRV or use another item
     /// available in your current MSRV.
-    #[clippy::version = "1.77.0"]
+    #[clippy::version = "1.78.0"]
     pub INCOMPATIBLE_MSRV,
     suspicious,
     "ensures that all items used in the crate are available for the current MSRV"
@@ -47,14 +47,13 @@ pub struct IncompatibleMsrv {
 impl_lint_pass!(IncompatibleMsrv => [INCOMPATIBLE_MSRV]);
 
 impl IncompatibleMsrv {
-    pub fn new(msrv: Msrv) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            msrv,
+            msrv: conf.msrv.clone(),
             is_above_msrv: FxHashMap::default(),
         }
     }
 
-    #[allow(clippy::cast_lossless)]
     fn get_def_id_version(&mut self, tcx: TyCtxt<'_>, def_id: DefId) -> RustcVersion {
         if let Some(version) = self.is_above_msrv.get(&def_id) {
             return *version;
@@ -65,18 +64,18 @@ impl IncompatibleMsrv {
                 StabilityLevel::Stable {
                     since: StableSince::Version(version),
                     ..
-                } => Some(RustcVersion::new(
-                    version.major as _,
-                    version.minor as _,
-                    version.patch as _,
-                )),
+                } => Some(version),
                 _ => None,
             }) {
             version
         } else if let Some(parent_def_id) = tcx.opt_parent(def_id) {
             self.get_def_id_version(tcx, parent_def_id)
         } else {
-            RustcVersion::new(1, 0, 0)
+            RustcVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            }
         };
         self.is_above_msrv.insert(def_id, version);
         version
@@ -88,7 +87,7 @@ impl IncompatibleMsrv {
             return;
         }
         let version = self.get_def_id_version(cx.tcx, def_id);
-        if self.msrv.meets(version) || is_in_test_function(cx.tcx, node) {
+        if self.msrv.meets(version) || is_in_test(cx.tcx, node) {
             return;
         }
         if let ExpnKind::AstPass(_) | ExpnKind::Desugaring(_) = span.ctxt().outer_expn_data().kind {
@@ -104,7 +103,7 @@ impl IncompatibleMsrv {
             cx,
             INCOMPATIBLE_MSRV,
             span,
-            &format!(
+            format!(
                 "current MSRV (Minimum Supported Rust Version) is `{}` but this item is stable since `{version}`",
                 self.msrv
             ),

@@ -4,9 +4,8 @@ use rustc_ast as ast;
 use rustc_ast::ptr::P;
 use rustc_ast::{GenericArg, MetaItem};
 use rustc_expand::base::{Annotatable, ExpandResult, ExtCtxt, MultiItemModifier};
-use rustc_span::symbol::{sym, Symbol};
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
+use rustc_span::{Span, Symbol, sym};
+use thin_vec::{ThinVec, thin_vec};
 
 macro path_local($x:ident) {
     generic::ty::Path::new_local(sym::$x)
@@ -20,27 +19,28 @@ macro path_std($($x:tt)*) {
     generic::ty::Path::new( pathvec_std!( $($x)* ) )
 }
 
-pub mod bounds;
-pub mod clone;
-pub mod debug;
-pub mod decodable;
-pub mod default;
-pub mod encodable;
-pub mod hash;
+pub(crate) mod bounds;
+pub(crate) mod clone;
+pub(crate) mod coerce_pointee;
+pub(crate) mod debug;
+pub(crate) mod decodable;
+pub(crate) mod default;
+pub(crate) mod encodable;
+pub(crate) mod hash;
 
 #[path = "cmp/eq.rs"]
-pub mod eq;
+pub(crate) mod eq;
 #[path = "cmp/ord.rs"]
-pub mod ord;
+pub(crate) mod ord;
 #[path = "cmp/partial_eq.rs"]
-pub mod partial_eq;
+pub(crate) mod partial_eq;
 #[path = "cmp/partial_ord.rs"]
-pub mod partial_ord;
+pub(crate) mod partial_ord;
 
-pub mod generic;
+pub(crate) mod generic;
 
 pub(crate) type BuiltinDeriveFn =
-    fn(&mut ExtCtxt<'_>, Span, &MetaItem, &Annotatable, &mut dyn FnMut(Annotatable), bool);
+    fn(&ExtCtxt<'_>, Span, &MetaItem, &Annotatable, &mut dyn FnMut(Annotatable), bool);
 
 pub(crate) struct BuiltinDerive(pub(crate) BuiltinDeriveFn);
 
@@ -117,14 +117,12 @@ fn call_unreachable(cx: &ExtCtxt<'_>, span: Span) -> P<ast::Expr> {
 }
 
 fn assert_ty_bounds(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     stmts: &mut ThinVec<ast::Stmt>,
     ty: P<ast::Ty>,
     span: Span,
     assert_path: &[Symbol],
 ) {
-    // Deny anonymous structs or unions to avoid wierd errors.
-    assert!(!ty.kind.is_anon_adt(), "Anonymous structs or unions cannot be type parameters");
     // Generate statement `let _: assert_path<ty>;`.
     let span = cx.with_def_site_ctxt(span);
     let assert_path = cx.path_all(span, true, cx.std_path(assert_path), vec![GenericArg::Type(ty)]);

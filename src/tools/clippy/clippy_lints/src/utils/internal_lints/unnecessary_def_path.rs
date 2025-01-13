@@ -4,17 +4,16 @@ use clippy_utils::{def_path_def_ids, is_lint_allowed, match_any_def_paths, peel_
 use rustc_ast::ast::LitKind;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_errors::Applicability;
-use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{Expr, ExprKind, Local, Mutability, Node};
+use rustc_hir::{Expr, ExprKind, LetStmt, Mutability, Node};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::mir::interpret::{Allocation, GlobalAlloc};
 use rustc_middle::mir::ConstValue;
+use rustc_middle::mir::interpret::{Allocation, GlobalAlloc};
 use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_span::symbol::Symbol;
 
 use std::str;
 
@@ -49,7 +48,7 @@ pub struct UnnecessaryDefPath {
 }
 
 impl<'tcx> LateLintPass<'tcx> for UnnecessaryDefPath {
-    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'_>) {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if is_lint_allowed(cx, UNNECESSARY_DEF_PATH, expr.hir_id) {
             return;
         }
@@ -79,9 +78,9 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryDefPath {
                 cx,
                 UNNECESSARY_DEF_PATH,
                 span,
-                &format!("hardcoded path to a {msg}"),
+                format!("hardcoded path to a {msg}"),
                 None,
-                &format!("convert all references to use `{sugg}`"),
+                format!("convert all references to use `{sugg}`"),
             );
         }
     }
@@ -109,7 +108,7 @@ impl UnnecessaryDefPath {
             // Extract the path to the matched type
             && let Some(segments) = path_to_matched_type(cx, item_arg)
             && let segments = segments.iter().map(|sym| &**sym).collect::<Vec<_>>()
-            && let Some(def_id) = def_path_def_ids(cx, &segments[..]).next()
+            && let Some(def_id) = def_path_def_ids(cx.tcx, &segments[..]).next()
         {
             // Check if the target item is a diagnostic item or LangItem.
             #[rustfmt::skip]
@@ -207,23 +206,23 @@ impl UnnecessaryDefPath {
     fn check_array(&mut self, cx: &LateContext<'_>, elements: &[Expr<'_>], span: Span) {
         let Some(path) = path_from_array(elements) else { return };
 
-        for def_id in def_path_def_ids(cx, &path.iter().map(AsRef::as_ref).collect::<Vec<_>>()) {
+        for def_id in def_path_def_ids(cx.tcx, &path.iter().map(AsRef::as_ref).collect::<Vec<_>>()) {
             self.array_def_ids.insert((def_id, span));
         }
     }
 }
 
-fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Vec<String>> {
+fn path_to_matched_type(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<Vec<String>> {
     match peel_hir_expr_refs(expr).0.kind {
         ExprKind::Path(ref qpath) => match cx.qpath_res(qpath, expr.hir_id) {
             Res::Local(hir_id) => {
-                if let Node::Local(Local { init: Some(init), .. }) = cx.tcx.parent_hir_node(hir_id) {
+                if let Node::LetStmt(LetStmt { init: Some(init), .. }) = cx.tcx.parent_hir_node(hir_id) {
                     path_to_matched_type(cx, init)
                 } else {
                     None
                 }
             },
-            Res::Def(DefKind::Static(_), def_id) => read_mir_alloc_def_path(
+            Res::Def(DefKind::Static { .. }, def_id) => read_mir_alloc_def_path(
                 cx,
                 cx.tcx.eval_static_initializer(def_id).ok()?.inner(),
                 cx.tcx.type_of(def_id).instantiate_identity(),

@@ -13,6 +13,7 @@ impl Database {
     }
 
     fn check_connection(&self) -> impl Coroutine<Yield = (), Return = ()> + '_ {
+        #[coroutine]
         move || {
             let iter = self.get_connection();
             for i in iter {
@@ -23,5 +24,5 @@ impl Database {
 }
 
 fn main() {
-    Database.check_connection();
+    let _ = Database.check_connection();
 }

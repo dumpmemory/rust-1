@@ -1,30 +1,30 @@
 mod context;
 
-use crate::edition_panic::use_panic_2021;
-use crate::errors;
 use rustc_ast::ptr::P;
-use rustc_ast::token;
 use rustc_ast::token::Delimiter;
 use rustc_ast::tokenstream::{DelimSpan, TokenStream};
-use rustc_ast::{DelimArgs, Expr, ExprKind, MacCall, Path, PathSegment, UnOp};
+use rustc_ast::{DelimArgs, Expr, ExprKind, MacCall, Path, PathSegment, UnOp, token};
 use rustc_ast_pretty::pprust;
 use rustc_errors::PResult;
-use rustc_expand::base::{DummyResult, ExtCtxt, MacEager, MacResult};
+use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
+use rustc_parse::exp;
 use rustc_parse::parser::Parser;
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
 use thin_vec::thin_vec;
 
-pub fn expand_assert<'cx>(
+use crate::edition_panic::use_panic_2021;
+use crate::errors;
+
+pub(crate) fn expand_assert<'cx>(
     cx: &'cx mut ExtCtxt<'_>,
     span: Span,
     tts: TokenStream,
-) -> Box<dyn MacResult + 'cx> {
+) -> MacroExpanderResult<'cx> {
     let Assert { cond_expr, custom_message } = match parse_assert(cx, span, tts) {
         Ok(assert) => assert,
         Err(err) => {
             let guar = err.emit();
-            return DummyResult::any(span, guar);
+            return ExpandResult::Ready(DummyResult::any(span, guar));
         }
     };
 
@@ -69,7 +69,7 @@ pub fn expand_assert<'cx>(
     // If `generic_assert` is enabled, generates rich captured outputs
     //
     // FIXME(c410-f3r) See https://github.com/rust-lang/rust/issues/96949
-    else if cx.ecfg.features.generic_assert {
+    else if cx.ecfg.features.generic_assert() {
         context::Context::new(cx, call_site_span).build(cond_expr, panic_path())
     }
     // If `generic_assert` is not enabled, only outputs a literal "assertion failed: ..."
@@ -92,7 +92,7 @@ pub fn expand_assert<'cx>(
         expr_if_not(cx, call_site_span, cond_expr, then, None)
     };
 
-    MacEager::expr(expr)
+    ExpandResult::Ready(MacEager::expr(expr))
 }
 
 struct Assert {
@@ -111,7 +111,7 @@ fn expr_if_not(
     cx.expr_if(span, cx.expr(span, ExprKind::Unary(UnOp::Not, cond)), then, els)
 }
 
-fn parse_assert<'a>(cx: &mut ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PResult<'a, Assert> {
+fn parse_assert<'a>(cx: &ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PResult<'a, Assert> {
     let mut parser = cx.new_parser_from_tts(stream);
 
     if parser.token == token::Eof {
@@ -144,14 +144,14 @@ fn parse_assert<'a>(cx: &mut ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PRes
             cx.dcx().emit_err(errors::AssertMissingComma { span: parser.token.span, comma });
 
             parse_custom_message(&mut parser)
-        } else if parser.eat(&token::Comma) {
+        } else if parser.eat(exp!(Comma)) {
             parse_custom_message(&mut parser)
         } else {
             None
         };
 
     if parser.token != token::Eof {
-        return parser.unexpected();
+        parser.unexpected()?;
     }
 
     Ok(Assert { cond_expr, custom_message })

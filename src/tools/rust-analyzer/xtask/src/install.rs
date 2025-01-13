@@ -5,7 +5,7 @@ use std::{env, path::PathBuf, str};
 use anyhow::{bail, format_err, Context};
 use xshell::{cmd, Shell};
 
-use crate::flags;
+use crate::flags::{self, Malloc};
 
 impl flags::Install {
     pub(crate) fn run(self, sh: &Shell) -> anyhow::Result<()> {
@@ -14,6 +14,9 @@ impl flags::Install {
         }
         if let Some(server) = self.server() {
             install_server(sh, server).context("install server")?;
+        }
+        if let Some(server) = self.proc_macro_server() {
+            install_proc_macro_server(sh, server).context("install proc-macro server")?;
         }
         if let Some(client) = self.client() {
             install_client(sh, client).context("install client")?;
@@ -34,10 +37,8 @@ pub(crate) struct ServerOpt {
     pub(crate) dev_rel: bool,
 }
 
-pub(crate) enum Malloc {
-    System,
-    Mimalloc,
-    Jemalloc,
+pub(crate) struct ProcMacroServerOpt {
+    pub(crate) dev_rel: bool,
 }
 
 fn fix_path_for_mac(sh: &Shell) -> anyhow::Result<()> {
@@ -122,7 +123,7 @@ fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
     if !installed_extensions.contains("rust-analyzer") {
         bail!(
             "Could not install the Visual Studio Code extension. \
-            Please make sure you have at least NodeJS 12.x together with the latest version of VS Code installed and try again. \
+            Please make sure you have at least NodeJS 16.x together with the latest version of VS Code installed and try again. \
             Note that installing via xtask install does not work for VS Code Remote, instead you’ll need to install the .vsix manually."
         );
     }
@@ -131,14 +132,18 @@ fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
 }
 
 fn install_server(sh: &Shell, opts: ServerOpt) -> anyhow::Result<()> {
-    let features = match opts.malloc {
-        Malloc::System => &[][..],
-        Malloc::Mimalloc => &["--features", "mimalloc"],
-        Malloc::Jemalloc => &["--features", "jemalloc"],
-    };
+    let features = opts.malloc.to_features();
     let profile = if opts.dev_rel { "dev-rel" } else { "release" };
 
     let cmd = cmd!(sh, "cargo install --path crates/rust-analyzer --profile={profile} --locked --force --features force-always-assert {features...}");
+    cmd.run()?;
+    Ok(())
+}
+
+fn install_proc_macro_server(sh: &Shell, opts: ProcMacroServerOpt) -> anyhow::Result<()> {
+    let profile = if opts.dev_rel { "dev-rel" } else { "release" };
+
+    let cmd = cmd!(sh, "cargo +nightly install --path crates/proc-macro-srv-cli --profile={profile} --locked --force --features sysroot-abi");
     cmd.run()?;
     Ok(())
 }

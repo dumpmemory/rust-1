@@ -1,11 +1,12 @@
-use super::BackendTypes;
-use crate::mir::operand::OperandRef;
-use crate::mir::place::PlaceRef;
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::Instance;
 use rustc_span::Span;
 use rustc_target::asm::InlineAsmRegOrRegClass;
+
+use super::BackendTypes;
+use crate::mir::operand::OperandRef;
+use crate::mir::place::PlaceRef;
 
 #[derive(Debug)]
 pub enum InlineAsmOperandRef<'tcx, B: BackendTypes + ?Sized> {
@@ -59,7 +60,7 @@ pub trait AsmBuilderMethods<'tcx>: BackendTypes {
     );
 }
 
-pub trait AsmMethods<'tcx> {
+pub trait AsmCodegenMethods<'tcx> {
     fn codegen_global_asm(
         &self,
         template: &[InlineAsmTemplatePiece],
@@ -67,4 +68,11 @@ pub trait AsmMethods<'tcx> {
         options: InlineAsmOptions,
         line_spans: &[Span],
     );
+
+    /// The mangled name of this instance
+    ///
+    /// Additional mangling is used on
+    /// some targets to add a leading underscore (Mach-O)
+    /// or byte count suffixes (x86 Windows).
+    fn mangled_name(&self, instance: Instance<'tcx>) -> String;
 }

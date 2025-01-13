@@ -6,7 +6,7 @@ mod utils;
 
 use diagnostic::{DiagnosticDerive, LintDiagnosticDerive};
 use proc_macro2::TokenStream;
-use subdiagnostic::SubdiagnosticDeriveBuilder;
+use subdiagnostic::SubdiagnosticDerive;
 use synstructure::Structure;
 
 /// Implements `#[derive(Diagnostic)]`, which allows for errors to be specified as a struct,
@@ -16,7 +16,7 @@ use synstructure::Structure;
 /// # extern crate rustc_errors;
 /// # use rustc_errors::Applicability;
 /// # extern crate rustc_span;
-/// # use rustc_span::{symbol::Ident, Span};
+/// # use rustc_span::{Ident, Span};
 /// # extern crate rust_middle;
 /// # use rustc_middle::ty::Ty;
 /// #[derive(Diagnostic)]
@@ -55,7 +55,7 @@ use synstructure::Structure;
 ///
 /// See rustc dev guide for more examples on using the `#[derive(Diagnostic)]`:
 /// <https://rustc-dev-guide.rust-lang.org/diagnostics/diagnostic-structs.html>
-pub fn session_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
+pub(super) fn diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
     s.underscore_const(true);
     DiagnosticDerive::new(s).into_tokens()
 }
@@ -91,7 +91,7 @@ pub fn session_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
 /// Then, later, to emit the error:
 ///
 /// ```ignore (rust)
-/// cx.span_lint(INVALID_ATOMIC_ORDERING, fail_order_arg_span, AtomicOrderingInvalidLint {
+/// cx.emit_span_lint(INVALID_ATOMIC_ORDERING, fail_order_arg_span, AtomicOrderingInvalidLint {
 ///     method,
 ///     success_ordering,
 ///     fail_ordering,
@@ -102,7 +102,7 @@ pub fn session_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
 ///
 /// See rustc dev guide for more examples on using the `#[derive(LintDiagnostic)]`:
 /// <https://rustc-dev-guide.rust-lang.org/diagnostics/diagnostic-structs.html#reference>
-pub fn lint_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
+pub(super) fn lint_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
     s.underscore_const(true);
     LintDiagnosticDerive::new(s).into_tokens()
 }
@@ -153,7 +153,7 @@ pub fn lint_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
 ///
 /// diag.subdiagnostic(RawIdentifierSuggestion { span, applicability, ident });
 /// ```
-pub fn session_subdiagnostic_derive(mut s: Structure<'_>) -> TokenStream {
+pub(super) fn subdiagnostic_derive(mut s: Structure<'_>) -> TokenStream {
     s.underscore_const(true);
-    SubdiagnosticDeriveBuilder::new().into_tokens(s)
+    SubdiagnosticDerive::new().into_tokens(s)
 }

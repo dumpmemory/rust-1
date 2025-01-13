@@ -3,9 +3,9 @@ use clippy_utils::ty::is_type_diagnostic_item;
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
 use rustc_lint::LateContext;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
-use super::{method_call, OPTION_AS_REF_CLONED};
+use super::{OPTION_AS_REF_CLONED, method_call};
 
 pub(super) fn check(cx: &LateContext<'_>, cloned_recv: &Expr<'_>, cloned_ident_span: Span) {
     if let Some((method @ ("as_ref" | "as_mut"), as_ref_recv, [], as_ref_ident_span, _)) = method_call(cloned_recv)
@@ -15,7 +15,7 @@ pub(super) fn check(cx: &LateContext<'_>, cloned_recv: &Expr<'_>, cloned_ident_s
             cx,
             OPTION_AS_REF_CLONED,
             as_ref_ident_span.to(cloned_ident_span),
-            &format!("cloning an `Option<_>` using `.{method}().cloned()`"),
+            format!("cloning an `Option<_>` using `.{method}().cloned()`"),
             "this can be written more concisely by cloning the `Option<_>` directly",
             "clone".into(),
             Applicability::MachineApplicable,

@@ -3,7 +3,8 @@
 // we correctly lint on the `cfg!` macro and `cfg_attr` attribute.
 //
 //@ check-pass
-//@ compile-flags: --cfg feature="bar" --cfg unknown_name -Z unstable-options
+//@ no-auto-check-cfg
+//@ compile-flags: --cfg feature="bar" --cfg unknown_name
 //@ compile-flags: --check-cfg=cfg(feature,values("foo"))
 
 #[cfg(windows)]
@@ -28,7 +29,7 @@ fn use_bar() {}
 //~^ WARNING unexpected `cfg` condition value
 fn use_zebra() {}
 
-#[cfg_attr(uu, test)]
+#[cfg_attr(uu, unix)]
 //~^ WARNING unexpected `cfg` condition name
 fn do_test() {}
 
@@ -74,8 +75,6 @@ fn test_cfg_macro() {
     //~^ WARNING unexpected `cfg` condition value
     //~| WARNING unexpected `cfg` condition value
     //~| WARNING unexpected `cfg` condition value
-    cfg!(target_feature = "zebra");
-    //~^ WARNING unexpected `cfg` condition value
 }
 
 fn main() {}

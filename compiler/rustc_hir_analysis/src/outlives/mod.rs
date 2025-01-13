@@ -1,17 +1,15 @@
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::GenericArgKind;
-use rustc_middle::ty::{self, CratePredicatesMap, ToPredicate, TyCtxt};
+use rustc_middle::ty::{self, CratePredicatesMap, GenericArgKind, TyCtxt, Upcast};
 use rustc_span::Span;
 
+pub(crate) mod dump;
 mod explicit;
 mod implicit_infer;
-/// Code to write unit test for outlives.
-pub mod test;
 mod utils;
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { inferred_outlives_of, inferred_outlives_crate, ..*providers };
 }
 
@@ -25,7 +23,7 @@ fn inferred_outlives_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[(ty::Clau
             let crate_map = tcx.inferred_outlives_crate(());
             crate_map.predicates.get(&item_def_id.to_def_id()).copied().unwrap_or(&[])
         }
-        DefKind::AnonConst if tcx.features().generic_const_exprs => {
+        DefKind::AnonConst if tcx.features().generic_const_exprs() => {
             let id = tcx.local_def_id_to_hir_id(item_def_id);
             if tcx.hir().opt_const_param_default_param_def_id(id).is_some() {
                 // In `generics_of` we set the generics' parent to be our parent's parent which means that
@@ -75,14 +73,14 @@ fn inferred_outlives_crate(tcx: TyCtxt<'_>, (): ()) -> CratePredicatesMap<'_> {
                         match kind1.unpack() {
                             GenericArgKind::Type(ty1) => Some((
                                 ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty1, *region2))
-                                    .to_predicate(tcx),
+                                    .upcast(tcx),
                                 span,
                             )),
                             GenericArgKind::Lifetime(region1) => Some((
                                 ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(
                                     region1, *region2,
                                 ))
-                                .to_predicate(tcx),
+                                .upcast(tcx),
                                 span,
                             )),
                             GenericArgKind::Const(_) => {

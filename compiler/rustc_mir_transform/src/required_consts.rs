@@ -1,27 +1,24 @@
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{Const, ConstOperand, Location};
-use rustc_middle::ty::ConstKind;
+use rustc_middle::mir::{Body, ConstOperand, Location, traversal};
 
-pub struct RequiredConstsVisitor<'a, 'tcx> {
-    required_consts: &'a mut Vec<ConstOperand<'tcx>>,
+pub(super) struct RequiredConstsVisitor<'tcx> {
+    required_consts: Vec<ConstOperand<'tcx>>,
 }
 
-impl<'a, 'tcx> RequiredConstsVisitor<'a, 'tcx> {
-    pub fn new(required_consts: &'a mut Vec<ConstOperand<'tcx>>) -> Self {
-        RequiredConstsVisitor { required_consts }
+impl<'tcx> RequiredConstsVisitor<'tcx> {
+    pub(super) fn compute_required_consts(body: &mut Body<'tcx>) {
+        let mut visitor = RequiredConstsVisitor { required_consts: Vec::new() };
+        for (bb, bb_data) in traversal::reverse_postorder(&body) {
+            visitor.visit_basic_block_data(bb, bb_data);
+        }
+        body.set_required_consts(visitor.required_consts);
     }
 }
 
-impl<'tcx> Visitor<'tcx> for RequiredConstsVisitor<'_, 'tcx> {
-    fn visit_constant(&mut self, constant: &ConstOperand<'tcx>, _: Location) {
-        let const_ = constant.const_;
-        match const_ {
-            Const::Ty(c) => match c.kind() {
-                ConstKind::Param(_) | ConstKind::Error(_) | ConstKind::Value(_) => {}
-                _ => bug!("only ConstKind::Param/Value should be encountered here, got {:#?}", c),
-            },
-            Const::Unevaluated(..) => self.required_consts.push(*constant),
-            Const::Val(..) => {}
+impl<'tcx> Visitor<'tcx> for RequiredConstsVisitor<'tcx> {
+    fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _: Location) {
+        if constant.const_.is_required_const() {
+            self.required_consts.push(*constant);
         }
     }
 }

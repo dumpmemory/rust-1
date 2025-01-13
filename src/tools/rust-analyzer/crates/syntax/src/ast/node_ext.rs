@@ -10,11 +10,14 @@ use parser::SyntaxKind;
 use rowan::{GreenNodeData, GreenTokenData};
 
 use crate::{
-    ast::{self, support, AstNode, AstToken, HasAttrs, HasGenericParams, HasName, SyntaxNode},
+    ast::{
+        self, support, AstNode, AstToken, HasAttrs, HasGenericArgs, HasGenericParams, HasName,
+        SyntaxNode,
+    },
     ted, NodeOrToken, SmolStr, SyntaxElement, SyntaxToken, TokenText, T,
 };
 
-use super::{RangeItem, RangeOp};
+use super::{GenericParam, RangeItem, RangeOp};
 
 impl ast::Lifetime {
     pub fn text(&self) -> TokenText<'_> {
@@ -135,6 +138,17 @@ impl From<ast::AssocItem> for ast::Item {
             ast::AssocItem::Fn(it) => ast::Item::Fn(it),
             ast::AssocItem::MacroCall(it) => ast::Item::MacroCall(it),
             ast::AssocItem::TypeAlias(it) => ast::Item::TypeAlias(it),
+        }
+    }
+}
+
+impl From<ast::ExternItem> for ast::Item {
+    fn from(extern_item: ast::ExternItem) -> Self {
+        match extern_item {
+            ast::ExternItem::Static(it) => ast::Item::Static(it),
+            ast::ExternItem::Fn(it) => ast::Item::Fn(it),
+            ast::ExternItem::MacroCall(it) => ast::Item::MacroCall(it),
+            ast::ExternItem::TypeAlias(it) => ast::Item::TypeAlias(it),
         }
     }
 }
@@ -319,7 +333,7 @@ impl ast::Path {
 
 impl ast::Use {
     pub fn is_simple_glob(&self) -> bool {
-        self.use_tree().map_or(false, |use_tree| {
+        self.use_tree().is_some_and(|use_tree| {
             use_tree.use_tree_list().is_none() && use_tree.star_token().is_some()
         })
     }
@@ -367,9 +381,26 @@ impl ast::UseTreeList {
 
     /// Remove the unnecessary braces in current `UseTreeList`
     pub fn remove_unnecessary_braces(mut self) {
+        // Returns true iff there is a single subtree and it is not the self keyword. The braces in
+        // `use x::{self};` are necessary and so we should not remove them.
+        let has_single_subtree_that_is_not_self = |u: &ast::UseTreeList| {
+            if let Some((single_subtree,)) = u.use_trees().collect_tuple() {
+                // We have a single subtree, check whether it is self.
+
+                let is_self = single_subtree.path().as_ref().is_some_and(|path| {
+                    path.segment().and_then(|seg| seg.self_token()).is_some()
+                        && path.qualifier().is_none()
+                });
+
+                !is_self
+            } else {
+                // Not a single subtree
+                false
+            }
+        };
+
         let remove_brace_in_use_tree_list = |u: &ast::UseTreeList| {
-            let use_tree_count = u.use_trees().count();
-            if use_tree_count == 1 {
+            if has_single_subtree_that_is_not_self(u) {
                 if let Some(a) = u.l_curly_token() {
                     ted::remove(a)
                 }
@@ -763,6 +794,8 @@ pub enum TypeBoundKind {
     PathType(ast::PathType),
     /// for<'a> ...
     ForType(ast::ForType),
+    /// use
+    Use(ast::UseBoundGenericArgs),
     /// 'a
     Lifetime(ast::Lifetime),
 }
@@ -773,6 +806,8 @@ impl ast::TypeBound {
             TypeBoundKind::PathType(path_type)
         } else if let Some(for_type) = support::children(self.syntax()).next() {
             TypeBoundKind::ForType(for_type)
+        } else if let Some(args) = self.use_bound_generic_args() {
+            TypeBoundKind::Use(args)
         } else if let Some(lifetime) = self.lifetime() {
             TypeBoundKind::Lifetime(lifetime)
         } else {
@@ -785,6 +820,15 @@ impl ast::TypeBound {
 pub enum TypeOrConstParam {
     Type(ast::TypeParam),
     Const(ast::ConstParam),
+}
+
+impl From<TypeOrConstParam> for GenericParam {
+    fn from(value: TypeOrConstParam) -> Self {
+        match value {
+            TypeOrConstParam::Type(it) => GenericParam::TypeParam(it),
+            TypeOrConstParam::Const(it) => GenericParam::ConstParam(it),
+        }
+    }
 }
 
 impl TypeOrConstParam {
@@ -1097,20 +1141,12 @@ impl From<ast::AssocItem> for ast::AnyHasAttrs {
     }
 }
 
-impl From<ast::Variant> for ast::AnyHasAttrs {
-    fn from(node: ast::Variant) -> Self {
-        Self::new(node)
-    }
-}
-
-impl From<ast::RecordField> for ast::AnyHasAttrs {
-    fn from(node: ast::RecordField) -> Self {
-        Self::new(node)
-    }
-}
-
-impl From<ast::TupleField> for ast::AnyHasAttrs {
-    fn from(node: ast::TupleField) -> Self {
-        Self::new(node)
+impl ast::OrPat {
+    pub fn leading_pipe(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .find(|it| !it.kind().is_trivia())
+            .and_then(NodeOrToken::into_token)
+            .filter(|it| it.kind() == T![|])
     }
 }

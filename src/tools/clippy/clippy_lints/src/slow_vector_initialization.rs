@@ -1,13 +1,12 @@
-use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::macros::root_macro_call;
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::macros::matching_root_macro_call;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::{
-    get_enclosing_block, is_expr_path_def_path, is_integer_literal, is_path_diagnostic_item, path_to_local,
-    path_to_local_id, paths, SpanlessEq,
+    SpanlessEq, get_enclosing_block, is_integer_literal, is_path_diagnostic_item, path_to_local, path_to_local_id,
 };
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::{walk_block, walk_expr, walk_stmt, Visitor};
-use rustc_hir::{BindingAnnotation, Block, Expr, ExprKind, HirId, PatKind, Stmt, StmtKind};
+use rustc_hir::intravisit::{Visitor, walk_block, walk_expr, walk_stmt};
+use rustc_hir::{BindingMode, Block, Expr, ExprKind, HirId, PatKind, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
 use rustc_span::symbol::sym;
@@ -119,8 +118,8 @@ impl<'tcx> LateLintPass<'tcx> for SlowVectorInit {
     fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'_>) {
         // Matches statements which initializes vectors. For example: `let mut vec = Vec::with_capacity(10)`
         // or `Vec::new()`
-        if let StmtKind::Local(local) = stmt.kind
-            && let PatKind::Binding(BindingAnnotation::MUT, local_id, _, None) = local.pat.kind
+        if let StmtKind::Let(local) = stmt.kind
+            && let PatKind::Binding(BindingMode::MUT, local_id, _, None) = local.pat.kind
             && let Some(init) = local.init
             && let Some(size_expr) = Self::as_vec_initializer(cx, init)
         {
@@ -145,17 +144,15 @@ impl SlowVectorInit {
         // Generally don't warn if the vec initializer comes from an expansion, except for the vec! macro.
         // This lets us still warn on `vec![]`, while ignoring other kinds of macros that may output an
         // empty vec
-        if expr.span.from_expansion()
-            && root_macro_call(expr.span).map(|m| m.def_id) != cx.tcx.get_diagnostic_item(sym::vec_macro)
-        {
+        if expr.span.from_expansion() && matching_root_macro_call(cx, expr.span, sym::vec_macro).is_none() {
             return None;
         }
 
         if let ExprKind::Call(func, [len_expr]) = expr.kind
-            && is_expr_path_def_path(cx, func, &paths::VEC_WITH_CAPACITY)
+            && is_path_diagnostic_item(cx, func, sym::vec_with_capacity)
         {
             Some(InitializedSize::Initialized(len_expr))
-        } else if matches!(expr.kind, ExprKind::Call(func, _) if is_expr_path_def_path(cx, func, &paths::VEC_NEW)) {
+        } else if matches!(expr.kind, ExprKind::Call(func, []) if is_path_diagnostic_item(cx, func, sym::vec_new)) {
             Some(InitializedSize::Uninitialized)
         } else {
             None
@@ -196,7 +193,7 @@ impl SlowVectorInit {
         };
     }
 
-    fn emit_lint(cx: &LateContext<'_>, slow_fill: &Expr<'_>, vec_alloc: &VecAllocation<'_>, msg: &str) {
+    fn emit_lint(cx: &LateContext<'_>, slow_fill: &Expr<'_>, vec_alloc: &VecAllocation<'_>, msg: &'static str) {
         let len_expr = Sugg::hir(
             cx,
             match vec_alloc.size_expr {
@@ -206,14 +203,18 @@ impl SlowVectorInit {
             "len",
         );
 
-        span_lint_and_then(cx, SLOW_VECTOR_INITIALIZATION, slow_fill.span, msg, |diag| {
-            diag.span_suggestion(
-                vec_alloc.allocation_expr.span.source_callsite(),
-                "consider replacing this with",
-                format!("vec![0; {len_expr}]"),
-                Applicability::Unspecified,
-            );
-        });
+        let span_to_replace = slow_fill
+            .span
+            .with_lo(vec_alloc.allocation_expr.span.source_callsite().lo());
+        span_lint_and_sugg(
+            cx,
+            SLOW_VECTOR_INITIALIZATION,
+            span_to_replace,
+            msg,
+            "consider replacing this with",
+            format!("vec![0; {len_expr}]"),
+            Applicability::Unspecified,
+        );
     }
 }
 
@@ -232,13 +233,13 @@ struct VectorInitializationVisitor<'a, 'tcx> {
     initialization_found: bool,
 }
 
-impl<'a, 'tcx> VectorInitializationVisitor<'a, 'tcx> {
+impl<'tcx> VectorInitializationVisitor<'_, 'tcx> {
     /// Checks if the given expression is extending a vector with `repeat(0).take(..)`
     fn search_slow_extend_filling(&mut self, expr: &'tcx Expr<'_>) {
         if self.initialization_found
             && let ExprKind::MethodCall(path, self_arg, [extend_arg], _) = expr.kind
             && path_to_local_id(self_arg, self.vec_alloc.local_id)
-            && path.ident.name == sym!(extend)
+            && path.ident.name.as_str() == "extend"
             && self.is_repeat_take(extend_arg)
         {
             self.slow_expression = Some(InitializationType::Extend(expr));
@@ -250,7 +251,7 @@ impl<'a, 'tcx> VectorInitializationVisitor<'a, 'tcx> {
         if self.initialization_found
             && let ExprKind::MethodCall(path, self_arg, [len_arg, fill_arg], _) = expr.kind
             && path_to_local_id(self_arg, self.vec_alloc.local_id)
-            && path.ident.name == sym!(resize)
+            && path.ident.name.as_str() == "resize"
             // Check that is filled with 0
             && is_integer_literal(fill_arg, 0)
         {
@@ -271,8 +272,8 @@ impl<'a, 'tcx> VectorInitializationVisitor<'a, 'tcx> {
 
     /// Returns `true` if give expression is `repeat(0).take(...)`
     fn is_repeat_take(&mut self, expr: &'tcx Expr<'tcx>) -> bool {
-        if let ExprKind::MethodCall(take_path, recv, [len_arg, ..], _) = expr.kind
-            && take_path.ident.name == sym!(take)
+        if let ExprKind::MethodCall(take_path, recv, [len_arg], _) = expr.kind
+            && take_path.ident.name.as_str() == "take"
             // Check that take is applied to `repeat(0)`
             && self.is_repeat_zero(recv)
         {
@@ -302,7 +303,7 @@ impl<'a, 'tcx> VectorInitializationVisitor<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for VectorInitializationVisitor<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for VectorInitializationVisitor<'_, 'tcx> {
     fn visit_stmt(&mut self, stmt: &'tcx Stmt<'_>) {
         if self.initialization_found {
             match stmt.kind {

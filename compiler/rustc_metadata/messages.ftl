@@ -38,6 +38,12 @@ metadata_crate_dep_multiple =
     cannot satisfy dependencies so `{$crate_name}` only shows up once
     .help = having upstream crates all available in one format will likely make this go away
 
+metadata_crate_dep_not_static =
+    `{$crate_name}` was unavailable as a static crate, preventing fully static linking
+
+metadata_crate_dep_rustc_driver =
+    `feature(rustc_private)` is needed to link to the compiler's `rustc_driver` library
+
 metadata_crate_location_unknown_type =
     extern location for {$crate_name} is of an unknown type: {$path}
 
@@ -88,9 +94,6 @@ metadata_found_staticlib =
     found staticlib `{$crate_name}` instead of rlib or dylib{$add_info}
     .help = please recompile that crate using --crate-type lib
 
-metadata_framework_only_windows =
-    link kind `raw-dylib` is only supported on Windows targets
-
 metadata_global_alloc_required =
     no global memory allocator found but one is required; link to std or add `#[global_allocator]` to a static item that implements the GlobalAlloc trait
 
@@ -131,11 +134,17 @@ metadata_lib_framework_apple =
 metadata_lib_required =
     crate `{$crate_name}` required to be available in {$kind} format, but was not found in this form
 
+metadata_link_arg_unstable =
+    link kind `link-arg` is unstable
+
 metadata_link_cfg_form =
     link cfg must be of the form `cfg(/* predicate */)`
 
 metadata_link_cfg_single_predicate =
     link cfg must have a single predicate argument
+
+metadata_link_cfg_unstable =
+    link cfg is unstable
 
 metadata_link_framework_apple =
     link kind `framework` is only supported on Apple targets
@@ -224,11 +233,11 @@ metadata_prev_alloc_error_handler =
 metadata_prev_global_alloc =
     previous global allocator defined here
 
-metadata_profiler_builtins_needs_core =
-    `profiler_builtins` crate (required by compiler options) is not compatible with crate attribute `#![no_core]`
-
 metadata_raw_dylib_no_nul =
     link name must not contain NUL characters if link kind is `raw-dylib`
+
+metadata_raw_dylib_only_windows =
+    link kind `raw-dylib` is only supported on Windows targets
 
 metadata_renaming_no_link =
     renaming of the library `{$lib_name}` was specified, however this crate contains no `#[link(...)]` attributes referencing this library
@@ -245,13 +254,13 @@ metadata_rustc_lib_required =
     .help = try adding `extern crate rustc_driver;` at the top level of this crate
 
 metadata_stable_crate_id_collision =
-    found crates (`{$crate_name0}` and `{$crate_name1}`) with colliding StableCrateId values.
+    found crates (`{$crate_name0}` and `{$crate_name1}`) with colliding StableCrateId values
 
 metadata_std_required =
     `std` is required by `{$current_crate}` because it does not declare `#![no_std]`
 
 metadata_symbol_conflicts_current =
-    the current crate is indistinguishable from one of its dependencies: it has the same crate-name `{$crate_name}` and was compiled with the same `-C metadata` arguments. This will result in symbol conflicts between the two.
+    the current crate is indistinguishable from one of its dependencies: it has the same crate-name `{$crate_name}` and was compiled with the same `-C metadata` arguments, so this will result in symbol conflicts between the two
 
 metadata_target_no_std_support =
     the `{$locator_triple}` target may not support the standard library

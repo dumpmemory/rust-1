@@ -1,45 +1,42 @@
 //! A mini version of ast::Ty, which is easier to use, and features an explicit `Self` type to use
 //! when specifying impls to be derived.
 
-pub use Ty::*;
-
+pub(crate) use Ty::*;
 use rustc_ast::ptr::P;
 use rustc_ast::{self as ast, Expr, GenericArg, GenericParamKind, Generics, SelfKind};
 use rustc_expand::base::ExtCtxt;
 use rustc_span::source_map::respan;
-use rustc_span::symbol::{kw, Ident, Symbol};
-use rustc_span::Span;
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw};
 use thin_vec::ThinVec;
 
 /// A path, e.g., `::std::option::Option::<i32>` (global). Has support
 /// for type parameters.
 #[derive(Clone)]
-pub struct Path {
+pub(crate) struct Path {
     path: Vec<Symbol>,
     params: Vec<Box<Ty>>,
     kind: PathKind,
 }
 
 #[derive(Clone)]
-pub enum PathKind {
+pub(crate) enum PathKind {
     Local,
     Global,
     Std,
 }
 
 impl Path {
-    pub fn new(path: Vec<Symbol>) -> Path {
+    pub(crate) fn new(path: Vec<Symbol>) -> Path {
         Path::new_(path, Vec::new(), PathKind::Std)
     }
-    pub fn new_local(path: Symbol) -> Path {
+    pub(crate) fn new_local(path: Symbol) -> Path {
         Path::new_(vec![path], Vec::new(), PathKind::Local)
     }
-    pub fn new_(path: Vec<Symbol>, params: Vec<Box<Ty>>, kind: PathKind) -> Path {
+    pub(crate) fn new_(path: Vec<Symbol>, params: Vec<Box<Ty>>, kind: PathKind) -> Path {
         Path { path, params, kind }
     }
 
-    pub fn to_ty(
+    pub(crate) fn to_ty(
         &self,
         cx: &ExtCtxt<'_>,
         span: Span,
@@ -48,7 +45,7 @@ impl Path {
     ) -> P<ast::Ty> {
         cx.ty_path(self.to_path(cx, span, self_ty, self_generics))
     }
-    pub fn to_path(
+    pub(crate) fn to_path(
         &self,
         cx: &ExtCtxt<'_>,
         span: Span,
@@ -73,7 +70,7 @@ impl Path {
 
 /// A type. Supports pointers, Self, and literals.
 #[derive(Clone)]
-pub enum Ty {
+pub(crate) enum Ty {
     Self_,
     /// A reference.
     Ref(Box<Ty>, ast::Mutability),
@@ -84,12 +81,12 @@ pub enum Ty {
     Unit,
 }
 
-pub fn self_ref() -> Ty {
+pub(crate) fn self_ref() -> Ty {
     Ref(Box::new(Self_), ast::Mutability::Not)
 }
 
 impl Ty {
-    pub fn to_ty(
+    pub(crate) fn to_ty(
         &self,
         cx: &ExtCtxt<'_>,
         span: Span,
@@ -110,7 +107,7 @@ impl Ty {
         }
     }
 
-    pub fn to_path(
+    pub(crate) fn to_path(
         &self,
         cx: &ExtCtxt<'_>,
         span: Span,
@@ -164,15 +161,15 @@ fn mk_ty_param(
 
 /// Bounds on type parameters.
 #[derive(Clone)]
-pub struct Bounds {
+pub(crate) struct Bounds {
     pub bounds: Vec<(Symbol, Vec<Path>)>,
 }
 
 impl Bounds {
-    pub fn empty() -> Bounds {
+    pub(crate) fn empty() -> Bounds {
         Bounds { bounds: Vec::new() }
     }
-    pub fn to_generics(
+    pub(crate) fn to_generics(
         &self,
         cx: &ExtCtxt<'_>,
         span: Span,
@@ -197,7 +194,7 @@ impl Bounds {
     }
 }
 
-pub fn get_explicit_self(cx: &ExtCtxt<'_>, span: Span) -> (P<Expr>, ast::ExplicitSelf) {
+pub(crate) fn get_explicit_self(cx: &ExtCtxt<'_>, span: Span) -> (P<Expr>, ast::ExplicitSelf) {
     // This constructs a fresh `self` path.
     let self_path = cx.expr_self(span);
     let self_ty = respan(span, SelfKind::Region(None, ast::Mutability::Not));

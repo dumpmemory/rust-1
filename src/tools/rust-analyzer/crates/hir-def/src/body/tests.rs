@@ -1,6 +1,5 @@
 mod block;
 
-use base_db::SourceDatabase;
 use expect_test::{expect, Expect};
 use test_fixture::WithFixture;
 
@@ -11,7 +10,7 @@ use super::*;
 fn lower(ra_fixture: &str) -> (TestDB, Arc<Body>, DefWithBodyId) {
     let db = TestDB::with_files(ra_fixture);
 
-    let krate = db.crate_graph().iter().next().unwrap();
+    let krate = db.fetch_test_crate();
     let def_map = db.crate_def_map(krate);
     let mut fn_def = None;
     'outer: for (_, module) in def_map.modules() {
@@ -53,6 +52,7 @@ fn your_stack_belongs_to_me() {
     cov_mark::check!(your_stack_belongs_to_me);
     lower(
         r#"
+#![recursion_limit = "32"]
 macro_rules! n_nuple {
     ($e:tt) => ();
     ($($rest:tt)*) => {{
@@ -69,6 +69,7 @@ fn your_stack_belongs_to_me2() {
     cov_mark::check!(overflow_but_not_me);
     lower(
         r#"
+#![recursion_limit = "32"]
 macro_rules! foo {
     () => {{ foo!(); foo!(); }}
 }
@@ -79,8 +80,6 @@ fn main() { foo!(); }
 
 #[test]
 fn recursion_limit() {
-    cov_mark::check!(your_stack_belongs_to_me);
-
     lower(
         r#"
 #![recursion_limit = "2"]
@@ -143,6 +142,41 @@ mod m {
 }
 
 #[test]
+fn desugar_for_loop() {
+    let (db, body, def) = lower(
+        r#"
+//- minicore: iterator
+fn main() {
+    for ident in 0..10 {
+        foo();
+        bar()
+    }
+}
+"#,
+    );
+
+    expect![[r#"
+        fn main() -> () {
+            match builtin#lang(into_iter)(
+                (0) ..(10) ,
+            ) {
+                mut <ra@gennew>11 => loop {
+                    match builtin#lang(next)(
+                        &mut <ra@gennew>11,
+                    ) {
+                        builtin#lang(None) => break,
+                        builtin#lang(Some)(ident) => {
+                            foo();
+                            bar()
+                        },
+                    }
+                },
+            }
+        }"#]]
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
+}
+
+#[test]
 fn desugar_builtin_format_args() {
     let (db, body, def) = lower(
         r#"
@@ -150,18 +184,18 @@ fn desugar_builtin_format_args() {
 fn main() {
     let are = "are";
     let count = 10;
-    builtin#format_args("hello {count:02} {} friends, we {are:?} {0}{last}", "fancy", last = "!");
+    builtin#format_args("\u{1b}hello {count:02} {} friends, we {are:?} {0}{last}", "fancy", last = "!");
 }
 "#,
     );
 
     expect![[r#"
-        fn main() {
+        fn main() -> () {
             let are = "are";
             let count = 10;
             builtin#lang(Arguments::new_v1_formatted)(
                 &[
-                    "hello ", " ", " friends, we ", " ", "",
+                    "\u{1b}hello ", " ", " friends, we ", " ", "",
                 ],
                 &[
                     builtin#lang(Argument::new_display)(
@@ -219,7 +253,7 @@ fn main() {
                 },
             );
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }
 
 #[test]
@@ -258,7 +292,7 @@ impl SsrError {
 
     assert_eq!(db.body_with_source_map(def).1.diagnostics(), &[]);
     expect![[r#"
-        fn main() {
+        fn main() -> () {
             _ = $crate::error::SsrError::new(
                 builtin#lang(Arguments::new_v1_formatted)(
                     &[
@@ -285,7 +319,7 @@ impl SsrError {
                 ),
             );
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }
 
 #[test]
@@ -303,7 +337,7 @@ macro_rules! m {
     };
 }
 
-fn f() {
+fn f(a: i32, b: u32) -> String {
     m!();
 }
 "#,
@@ -317,19 +351,96 @@ fn f() {
     }
 
     expect![[r#"
-        fn f() {
-            $crate::panicking::panic_fmt(
-                builtin#lang(Arguments::new_v1_formatted)(
-                    &[
-                        "cc",
-                    ],
-                    &[],
-                    &[],
-                    unsafe {
-                        builtin#lang(UnsafeArg::new)()
-                    },
-                ),
-            );
+        fn f(a: i32, b: u32) -> String {
+            {
+                $crate::panicking::panic_fmt(
+                    builtin#lang(Arguments::new_v1_formatted)(
+                        &[
+                            "cc",
+                        ],
+                        &[],
+                        &[],
+                        unsafe {
+                            builtin#lang(UnsafeArg::new)()
+                        },
+                    ),
+                );
+            };
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
+}
+
+#[test]
+fn destructuring_assignment_tuple_macro() {
+    // This is a funny one. `let m!()() = Bar()` is an error in rustc, because `m!()()` isn't a valid pattern,
+    // but in destructuring assignment it is valid, because `m!()()` is a valid expression, and destructuring
+    // assignments start their lives as expressions. So we have to do the same.
+
+    let (db, body, def) = lower(
+        r#"
+struct Bar();
+
+macro_rules! m {
+    () => { Bar };
+}
+
+fn foo() {
+    m!()() = Bar();
+}
+"#,
+    );
+
+    let (_, source_map) = db.body_with_source_map(def);
+    assert_eq!(source_map.diagnostics(), &[]);
+
+    for (_, def_map) in body.blocks(&db) {
+        assert_eq!(def_map.diagnostics(), &[]);
+    }
+
+    expect![[r#"
+        fn foo() -> () {
+            Bar() = Bar();
+        }"#]]
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
+}
+
+#[test]
+fn shadowing_record_variant() {
+    let (_, body, _) = lower(
+        r#"
+enum A {
+    B { field: i32 },
+}
+fn f() {
+    use A::*;
+    match () {
+        B => {}
+    };
+}
+    "#,
+    );
+    assert_eq!(body.bindings.len(), 1, "should have a binding for `B`");
+    assert_eq!(
+        body.bindings[BindingId::from_raw(RawIdx::from_u32(0))].name.as_str(),
+        "B",
+        "should have a binding for `B`",
+    );
+}
+
+#[test]
+fn regression_pretty_print_bind_pat() {
+    let (db, body, owner) = lower(
+        r#"
+fn foo() {
+    let v @ u = 123;
+}
+"#,
+    );
+    let printed = body.pretty_print(&db, owner, Edition::CURRENT);
+    assert_eq!(
+        printed,
+        r#"fn foo() -> () {
+    let v @ u = 123;
+}"#
+    );
 }

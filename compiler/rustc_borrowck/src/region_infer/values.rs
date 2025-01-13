@@ -1,21 +1,21 @@
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::fx::FxIndexSet;
-use rustc_index::bit_set::SparseBitMatrix;
-use rustc_index::interval::IntervalSet;
-use rustc_index::interval::SparseIntervalMatrix;
+use std::fmt::Debug;
+use std::rc::Rc;
+
+use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_index::Idx;
+use rustc_index::bit_set::SparseBitMatrix;
+use rustc_index::interval::{IntervalSet, SparseIntervalMatrix};
 use rustc_middle::mir::{BasicBlock, Location};
 use rustc_middle::ty::{self, RegionVid};
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
-use std::fmt::Debug;
-use std::rc::Rc;
+use tracing::debug;
 
 use crate::BorrowIndex;
 
 rustc_index::newtype_index! {
     /// A single integer representing a `ty::Placeholder`.
     #[debug_format = "PlaceholderIndex({})"]
-    pub struct PlaceholderIndex {}
+    pub(crate) struct PlaceholderIndex {}
 }
 
 /// An individual element in a region value -- the value of a
@@ -38,7 +38,7 @@ pub(crate) enum RegionElement {
 /// an interval matrix storing liveness ranges for each region-vid.
 pub(crate) struct LivenessValues {
     /// The map from locations to points.
-    elements: Rc<DenseLocationMap>,
+    location_map: Rc<DenseLocationMap>,
 
     /// Which regions are live. This is exclusive with the fine-grained tracking in `points`, and
     /// currently only used for validating promoteds (which don't care about more precise tracking).
@@ -77,11 +77,11 @@ impl LiveLoans {
 
 impl LivenessValues {
     /// Create an empty map of regions to locations where they're live.
-    pub(crate) fn with_specific_points(elements: Rc<DenseLocationMap>) -> Self {
+    pub(crate) fn with_specific_points(location_map: Rc<DenseLocationMap>) -> Self {
         LivenessValues {
             live_regions: None,
-            points: Some(SparseIntervalMatrix::new(elements.num_points())),
-            elements,
+            points: Some(SparseIntervalMatrix::new(location_map.num_points())),
+            location_map,
             loans: None,
         }
     }
@@ -90,13 +90,21 @@ impl LivenessValues {
     ///
     /// Unlike `with_specific_points`, does not track exact locations where something is live, only
     /// which regions are live.
-    pub(crate) fn without_specific_points(elements: Rc<DenseLocationMap>) -> Self {
+    pub(crate) fn without_specific_points(location_map: Rc<DenseLocationMap>) -> Self {
         LivenessValues {
             live_regions: Some(Default::default()),
             points: None,
-            elements,
+            location_map,
             loans: None,
         }
+    }
+
+    /// Returns the liveness matrix of points where each region is live. Panics if the liveness
+    /// values have been created without any per-point data (that is, for promoteds).
+    pub(crate) fn points(&self) -> &SparseIntervalMatrix<RegionVid, PointIndex> {
+        self.points
+            .as_ref()
+            .expect("this `LivenessValues` wasn't created using `with_specific_points`")
     }
 
     /// Iterate through each region that has a value in this set.
@@ -114,14 +122,12 @@ impl LivenessValues {
 
     /// Records `region` as being live at the given `location`.
     pub(crate) fn add_location(&mut self, region: RegionVid, location: Location) {
-        let point = self.elements.point_from_location(location);
+        let point = self.location_map.point_from_location(location);
         debug!("LivenessValues::add_location(region={:?}, location={:?})", region, location);
         if let Some(points) = &mut self.points {
             points.insert(region, point);
-        } else {
-            if self.elements.point_in_range(point) {
-                self.live_regions.as_mut().unwrap().insert(region);
-            }
+        } else if self.location_map.point_in_range(point) {
+            self.live_regions.as_mut().unwrap().insert(region);
         }
 
         // When available, record the loans flowing into this region as live at the given point.
@@ -137,10 +143,8 @@ impl LivenessValues {
         debug!("LivenessValues::add_points(region={:?}, points={:?})", region, points);
         if let Some(this) = &mut self.points {
             this.union_row(region, points);
-        } else {
-            if points.iter().any(|point| self.elements.point_in_range(point)) {
-                self.live_regions.as_mut().unwrap().insert(region);
-            }
+        } else if points.iter().any(|point| self.location_map.point_in_range(point)) {
+            self.live_regions.as_mut().unwrap().insert(region);
         }
 
         // When available, record the loans flowing into this region as live at the given points.
@@ -166,7 +170,7 @@ impl LivenessValues {
 
     /// Returns whether `region` is marked live at the given `location`.
     pub(crate) fn is_live_at(&self, region: RegionVid, location: Location) -> bool {
-        let point = self.elements.point_from_location(location);
+        let point = self.location_map.point_from_location(location);
         if let Some(points) = &self.points {
             points.row(region).is_some_and(|r| r.contains(point))
         } else {
@@ -187,20 +191,26 @@ impl LivenessValues {
             .row(region)
             .into_iter()
             .flat_map(|set| set.iter())
-            .take_while(|&p| self.elements.point_in_range(p))
+            .take_while(|&p| self.location_map.point_in_range(p))
     }
 
     /// For debugging purposes, returns a pretty-printed string of the points where the `region` is
     /// live.
     pub(crate) fn pretty_print_live_points(&self, region: RegionVid) -> String {
         pretty_print_region_elements(
-            self.live_points(region).map(|p| RegionElement::Location(self.elements.to_location(p))),
+            self.live_points(region)
+                .map(|p| RegionElement::Location(self.location_map.to_location(p))),
         )
     }
 
     #[inline]
     pub(crate) fn point_from_location(&self, location: Location) -> PointIndex {
-        self.elements.point_from_location(location)
+        self.location_map.point_from_location(location)
+    }
+
+    #[inline]
+    pub(crate) fn location_from_point(&self, point: PointIndex) -> Location {
+        self.location_map.to_location(point)
     }
 
     /// When using `-Zpolonius=next`, returns whether the `loan_idx` is live at the given `point`.
@@ -262,10 +272,9 @@ impl PlaceholderIndices {
 /// Here, the variable `'0` would contain the free region `'a`,
 /// because (since it is returned) it must live for at least `'a`. But
 /// it would also contain various points from within the function.
-#[derive(Clone)]
 pub(crate) struct RegionValues<N: Idx> {
-    elements: Rc<DenseLocationMap>,
-    placeholder_indices: Rc<PlaceholderIndices>,
+    location_map: Rc<DenseLocationMap>,
+    placeholder_indices: PlaceholderIndices,
     points: SparseIntervalMatrix<N, PointIndex>,
     free_regions: SparseBitMatrix<N, RegionVid>,
 
@@ -279,15 +288,16 @@ impl<N: Idx> RegionValues<N> {
     /// Each of the regions in num_region_variables will be initialized with an
     /// empty set of points and no causal information.
     pub(crate) fn new(
-        elements: &Rc<DenseLocationMap>,
+        location_map: Rc<DenseLocationMap>,
         num_universal_regions: usize,
-        placeholder_indices: &Rc<PlaceholderIndices>,
+        placeholder_indices: PlaceholderIndices,
     ) -> Self {
+        let num_points = location_map.num_points();
         let num_placeholders = placeholder_indices.len();
         Self {
-            elements: elements.clone(),
-            points: SparseIntervalMatrix::new(elements.num_points()),
-            placeholder_indices: placeholder_indices.clone(),
+            location_map,
+            points: SparseIntervalMatrix::new(num_points),
+            placeholder_indices,
             free_regions: SparseBitMatrix::new(num_universal_regions),
             placeholders: SparseBitMatrix::new(num_placeholders),
         }
@@ -327,7 +337,7 @@ impl<N: Idx> RegionValues<N> {
         end: usize,
     ) -> Option<usize> {
         let row = self.points.row(r)?;
-        let block = self.elements.entry_point(block);
+        let block = self.location_map.entry_point(block);
         let start = block.plus(start);
         let end = block.plus(end);
         let first_unset = row.first_unset_in(start..=end)?;
@@ -366,8 +376,8 @@ impl<N: Idx> RegionValues<N> {
     pub(crate) fn locations_outlived_by<'a>(&'a self, r: N) -> impl Iterator<Item = Location> + 'a {
         self.points.row(r).into_iter().flat_map(move |set| {
             set.iter()
-                .take_while(move |&p| self.elements.point_in_range(p))
-                .map(move |p| self.elements.to_location(p))
+                .take_while(move |&p| self.location_map.point_in_range(p))
+                .map(move |p| self.location_map.to_location(p))
         })
     }
 
@@ -421,12 +431,12 @@ pub(crate) trait ToElementIndex: Debug + Copy {
 
 impl ToElementIndex for Location {
     fn add_to_row<N: Idx>(self, values: &mut RegionValues<N>, row: N) -> bool {
-        let index = values.elements.point_from_location(self);
+        let index = values.location_map.point_from_location(self);
         values.points.insert(row, index)
     }
 
     fn contained_in_row<N: Idx>(self, values: &RegionValues<N>, row: N) -> bool {
-        let index = values.elements.point_from_location(self);
+        let index = values.location_map.point_from_location(self);
         values.points.contains(row, index)
     }
 }
@@ -455,14 +465,14 @@ impl ToElementIndex for ty::PlaceholderRegion {
 
 /// For debugging purposes, returns a pretty-printed string of the given points.
 pub(crate) fn pretty_print_points(
-    elements: &DenseLocationMap,
+    location_map: &DenseLocationMap,
     points: impl IntoIterator<Item = PointIndex>,
 ) -> String {
     pretty_print_region_elements(
         points
             .into_iter()
-            .take_while(|&p| elements.point_in_range(p))
-            .map(|p| elements.to_location(p))
+            .take_while(|&p| location_map.point_in_range(p))
+            .map(|p| location_map.to_location(p))
             .map(RegionElement::Location),
     )
 }
@@ -535,12 +545,12 @@ fn pretty_print_region_elements(elements: impl IntoIterator<Item = RegionElement
 
     return result;
 
-    fn push_location_range(str: &mut String, location1: Location, location2: Location) {
+    fn push_location_range(s: &mut String, location1: Location, location2: Location) {
         if location1 == location2 {
-            str.push_str(&format!("{location1:?}"));
+            s.push_str(&format!("{location1:?}"));
         } else {
             assert_eq!(location1.block, location2.block);
-            str.push_str(&format!(
+            s.push_str(&format!(
                 "{:?}[{}..={}]",
                 location1.block, location1.statement_index, location2.statement_index
             ));

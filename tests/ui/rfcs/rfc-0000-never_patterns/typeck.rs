@@ -2,7 +2,6 @@
 //@[pass] check-pass
 //@[fail] check-fail
 #![feature(never_patterns)]
-#![feature(min_exhaustive_patterns)]
 #![allow(incomplete_features)]
 
 #[derive(Copy, Clone)]
@@ -121,5 +120,17 @@ fn never_pattern_typeck_pass(void: Void) {
     match None::<&Result<Void, Void>> {
         None => {}
         Some(!),
+    }
+}
+
+struct Unsized {
+    void: Void,
+    slice: [u8],
+}
+
+#[cfg(pass)]
+fn not_sized(x: &Unsized) {
+    match *x {
+        !,
     }
 }

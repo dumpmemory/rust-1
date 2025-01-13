@@ -1,4 +1,3 @@
-use crate::vec::Vec;
 use core::borrow::Borrow;
 use core::cmp::Ordering;
 use core::error::Error;
@@ -10,21 +9,22 @@ use core::mem::{self, ManuallyDrop};
 use core::ops::{Bound, Index, RangeBounds};
 use core::ptr;
 
-use crate::alloc::{Allocator, Global};
-
 use super::borrow::DormantMutRef;
 use super::dedup_sorted_iter::DedupSortedIter;
 use super::navigate::{LazyLeafRange, LeafRange};
-use super::node::{self, marker, ForceResult::*, Handle, NodeRef, Root};
-use super::search::{SearchBound, SearchResult::*};
+use super::node::ForceResult::*;
+use super::node::{self, Handle, NodeRef, Root, marker};
+use super::search::SearchBound;
+use super::search::SearchResult::*;
 use super::set_val::SetValZST;
+use crate::alloc::{Allocator, Global};
+use crate::vec::Vec;
 
 mod entry;
 
+use Entry::*;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use entry::{Entry, OccupiedEntry, OccupiedError, VacantEntry};
-
-use Entry::*;
 
 /// Minimum number of elements in a node that is not a root.
 /// We might temporarily have fewer elements during methods.
@@ -72,7 +72,7 @@ pub(super) const MIN_LEN: usize = node::MIN_LEN_AFTER_SPLIT;
 /// `BTreeMap` that observed the logic error and not result in undefined behavior. This could
 /// include panics, incorrect results, aborts, memory leaks, and non-termination.
 ///
-/// Iterators obtained from functions such as [`BTreeMap::iter`], [`BTreeMap::values`], or
+/// Iterators obtained from functions such as [`BTreeMap::iter`], [`BTreeMap::into_iter`], [`BTreeMap::values`], or
 /// [`BTreeMap::keys`] produce their items in order by key, and take worst-case logarithmic and
 /// amortized constant time per item returned.
 ///
@@ -289,40 +289,12 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BTreeMap<K, V, A> {
     }
 }
 
-impl<K, Q: ?Sized, A: Allocator + Clone> super::Recover<Q> for BTreeMap<K, SetValZST, A>
-where
-    K: Borrow<Q> + Ord,
-    Q: Ord,
-{
-    type Key = K;
-
-    fn get(&self, key: &Q) -> Option<&K> {
-        let root_node = self.root.as_ref()?.reborrow();
-        match root_node.search_tree(key) {
-            Found(handle) => Some(handle.into_kv().0),
-            GoDown(_) => None,
-        }
-    }
-
-    fn take(&mut self, key: &Q) -> Option<K> {
-        let (map, dormant_map) = DormantMutRef::new(self);
-        let root_node = map.root.as_mut()?.borrow_mut();
-        match root_node.search_tree(key) {
-            Found(handle) => Some(
-                OccupiedEntry {
-                    handle,
-                    dormant_map,
-                    alloc: (*map.alloc).clone(),
-                    _marker: PhantomData,
-                }
-                .remove_kv()
-                .0,
-            ),
-            GoDown(_) => None,
-        }
-    }
-
-    fn replace(&mut self, key: K) -> Option<K> {
+/// Internal functionality for `BTreeSet`.
+impl<K, A: Allocator + Clone> BTreeMap<K, SetValZST, A> {
+    pub(super) fn replace(&mut self, key: K) -> Option<K>
+    where
+        K: Ord,
+    {
         let (map, dormant_map) = DormantMutRef::new(self);
         let root_node =
             map.root.get_or_insert_with(|| Root::new((*map.alloc).clone())).borrow_mut();
@@ -336,8 +308,35 @@ where
                     alloc: (*map.alloc).clone(),
                     _marker: PhantomData,
                 }
-                .insert(SetValZST::default());
+                .insert(SetValZST);
                 None
+            }
+        }
+    }
+
+    pub(super) fn get_or_insert_with<Q: ?Sized, F>(&mut self, q: &Q, f: F) -> &K
+    where
+        K: Borrow<Q> + Ord,
+        Q: Ord,
+        F: FnOnce(&Q) -> K,
+    {
+        let (map, dormant_map) = DormantMutRef::new(self);
+        let root_node =
+            map.root.get_or_insert_with(|| Root::new((*map.alloc).clone())).borrow_mut();
+        match root_node.search_tree(q) {
+            Found(handle) => handle.into_kv_mut().0,
+            GoDown(handle) => {
+                let key = f(q);
+                assert!(*key.borrow() == *q, "new value is not equal");
+                VacantEntry {
+                    key,
+                    handle: Some(handle),
+                    dormant_map,
+                    alloc: (*map.alloc).clone(),
+                    _marker: PhantomData,
+                }
+                .insert_entry(SetValZST)
+                .into_key()
             }
         }
     }
@@ -415,7 +414,7 @@ impl<'a, K: 'a, V: 'a> Default for IterMut<'a, K, V> {
     }
 }
 
-/// An owning iterator over the entries of a `BTreeMap`.
+/// An owning iterator over the entries of a `BTreeMap`, sorted by key.
 ///
 /// This `struct` is created by the [`into_iter`] method on [`BTreeMap`]
 /// (provided by the [`IntoIterator`] trait). See its documentation for more.
@@ -705,7 +704,11 @@ impl<K, V, A: Allocator + Clone> BTreeMap<K, V, A> {
         }
     }
 
-    /// Returns the key-value pair corresponding to the supplied key.
+    /// Returns the key-value pair corresponding to the supplied key. This is
+    /// potentially useful:
+    /// - for key types where non-identical keys can be considered equal;
+    /// - for getting the `&K` stored key value from a borrowed `&Q` lookup key; or
+    /// - for getting a reference to a key with the same lifetime as the collection.
     ///
     /// The supplied key may be any borrowed form of the map's key type, but the ordering
     /// on the borrowed form *must* match the ordering on the key type.
@@ -713,12 +716,46 @@ impl<K, V, A: Allocator + Clone> BTreeMap<K, V, A> {
     /// # Examples
     ///
     /// ```
+    /// use std::cmp::Ordering;
     /// use std::collections::BTreeMap;
     ///
+    /// #[derive(Clone, Copy, Debug)]
+    /// struct S {
+    ///     id: u32,
+    /// #   #[allow(unused)] // prevents a "field `name` is never read" error
+    ///     name: &'static str, // ignored by equality and ordering operations
+    /// }
+    ///
+    /// impl PartialEq for S {
+    ///     fn eq(&self, other: &S) -> bool {
+    ///         self.id == other.id
+    ///     }
+    /// }
+    ///
+    /// impl Eq for S {}
+    ///
+    /// impl PartialOrd for S {
+    ///     fn partial_cmp(&self, other: &S) -> Option<Ordering> {
+    ///         self.id.partial_cmp(&other.id)
+    ///     }
+    /// }
+    ///
+    /// impl Ord for S {
+    ///     fn cmp(&self, other: &S) -> Ordering {
+    ///         self.id.cmp(&other.id)
+    ///     }
+    /// }
+    ///
+    /// let j_a = S { id: 1, name: "Jessica" };
+    /// let j_b = S { id: 1, name: "Jess" };
+    /// let p = S { id: 2, name: "Paul" };
+    /// assert_eq!(j_a, j_b);
+    ///
     /// let mut map = BTreeMap::new();
-    /// map.insert(1, "a");
-    /// assert_eq!(map.get_key_value(&1), Some((&1, &"a")));
-    /// assert_eq!(map.get_key_value(&2), None);
+    /// map.insert(j_a, "Paris");
+    /// assert_eq!(map.get_key_value(&j_a), Some((&j_a, &"Paris")));
+    /// assert_eq!(map.get_key_value(&j_b), Some((&j_a, &"Paris"))); // the notable case
+    /// assert_eq!(map.get_key_value(&p), None);
     /// ```
     #[stable(feature = "map_get_key_value", since = "1.40.0")]
     pub fn get_key_value<Q: ?Sized>(&self, k: &Q) -> Option<(&K, &V)>
@@ -916,6 +953,7 @@ impl<K, V, A: Allocator + Clone> BTreeMap<K, V, A> {
     /// assert_eq!(map.contains_key(&2), false);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "btreemap_contains_key")]
     pub fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool
     where
         K: Borrow<Q> + Ord,
@@ -981,6 +1019,7 @@ impl<K, V, A: Allocator + Clone> BTreeMap<K, V, A> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("push", "put", "set")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "btreemap_insert")]
     pub fn insert(&mut self, key: K, value: V) -> Option<V>
     where
         K: Ord,
@@ -1637,6 +1676,7 @@ impl<K, V, A: Allocator + Clone> IntoIterator for BTreeMap<K, V, A> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V, A>;
 
+    /// Gets an owning iterator over the entries of the map, sorted by key.
     fn into_iter(self) -> IntoIter<K, V, A> {
         let mut me = ManuallyDrop::new(self);
         if let Some(root) = me.root.take() {
@@ -2015,6 +2055,20 @@ impl<K, V> Default for Range<'_, K, V> {
     }
 }
 
+#[stable(feature = "default_iters_sequel", since = "1.82.0")]
+impl<K, V> Default for RangeMut<'_, K, V> {
+    /// Creates an empty `btree_map::RangeMut`.
+    ///
+    /// ```
+    /// # use std::collections::btree_map;
+    /// let iter: btree_map::RangeMut<'_, u8, u8> = Default::default();
+    /// assert_eq!(iter.count(), 0);
+    /// ```
+    fn default() -> Self {
+        RangeMut { inner: Default::default(), _marker: PhantomData }
+    }
+}
+
 #[stable(feature = "map_values_mut", since = "1.10.0")]
 impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
     type Item = &'a mut V;
@@ -2048,6 +2102,20 @@ impl<K, V> ExactSizeIterator for ValuesMut<'_, K, V> {
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<K, V> FusedIterator for ValuesMut<'_, K, V> {}
+
+#[stable(feature = "default_iters_sequel", since = "1.82.0")]
+impl<K, V> Default for ValuesMut<'_, K, V> {
+    /// Creates an empty `btree_map::ValuesMut`.
+    ///
+    /// ```
+    /// # use std::collections::btree_map;
+    /// let iter: btree_map::ValuesMut<'_, u8, u8> = Default::default();
+    /// assert_eq!(iter.count(), 0);
+    /// ```
+    fn default() -> Self {
+        ValuesMut { inner: Default::default() }
+    }
+}
 
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
 impl<K, V, A: Allocator + Clone> Iterator for IntoKeys<K, V, A> {
@@ -2221,6 +2289,10 @@ impl<K, V> FusedIterator for RangeMut<'_, K, V> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<K: Ord, V> FromIterator<(K, V)> for BTreeMap<K, V> {
+    /// Constructs a `BTreeMap<K, V>` from an iterator of key-value pairs.
+    ///
+    /// If the iterator produces any pairs with equal keys,
+    /// all but one of the corresponding values will be dropped.
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> BTreeMap<K, V> {
         let mut inputs: Vec<_> = iter.into_iter().collect();
 
@@ -2335,7 +2407,10 @@ where
 
 #[stable(feature = "std_collections_from_array", since = "1.56.0")]
 impl<K: Ord, V, const N: usize> From<[(K, V); N]> for BTreeMap<K, V> {
-    /// Converts a `[(K, V); N]` into a `BTreeMap<(K, V)>`.
+    /// Converts a `[(K, V); N]` into a `BTreeMap<K, V>`.
+    ///
+    /// If any entries in the array have equal keys,
+    /// all but one of the corresponding values will be dropped.
     ///
     /// ```
     /// use std::collections::BTreeMap;
@@ -2920,7 +2995,7 @@ impl<'a, K, V> Cursor<'a, K, V> {
     /// Returns a reference to the key and value of the next element without
     /// moving the cursor.
     ///
-    /// If the cursor is at the end of the map then `None` is returned
+    /// If the cursor is at the end of the map then `None` is returned.
     #[unstable(feature = "btree_cursors", issue = "107540")]
     pub fn peek_next(&self) -> Option<(&'a K, &'a V)> {
         self.clone().next()
@@ -2962,7 +3037,7 @@ impl<'a, K, V, A> CursorMut<'a, K, V, A> {
     /// Returns a reference to the key and value of the next element without
     /// moving the cursor.
     ///
-    /// If the cursor is at the end of the map then `None` is returned
+    /// If the cursor is at the end of the map then `None` is returned.
     #[unstable(feature = "btree_cursors", issue = "107540")]
     pub fn peek_next(&mut self) -> Option<(&K, &mut V)> {
         let (k, v) = self.inner.peek_next()?;
@@ -3060,7 +3135,7 @@ impl<'a, K, V, A> CursorMutKey<'a, K, V, A> {
     /// Returns a reference to the key and value of the next element without
     /// moving the cursor.
     ///
-    /// If the cursor is at the end of the map then `None` is returned
+    /// If the cursor is at the end of the map then `None` is returned.
     #[unstable(feature = "btree_cursors", issue = "107540")]
     pub fn peek_next(&mut self) -> Option<(&mut K, &mut V)> {
         let current = self.current.as_mut()?;
@@ -3273,7 +3348,7 @@ impl<'a, K: Ord, V, A: Allocator + Clone> CursorMutKey<'a, K, V, A> {
         Some(kv)
     }
 
-    /// Removes the precending element from the `BTreeMap`.
+    /// Removes the preceding element from the `BTreeMap`.
     ///
     /// The element that was removed is returned. The cursor position is
     /// unchanged (after the removed element).
@@ -3379,7 +3454,7 @@ impl<'a, K: Ord, V, A: Allocator + Clone> CursorMut<'a, K, V, A> {
         self.inner.remove_next()
     }
 
-    /// Removes the precending element from the `BTreeMap`.
+    /// Removes the preceding element from the `BTreeMap`.
     ///
     /// The element that was removed is returned. The cursor position is
     /// unchanged (after the removed element).

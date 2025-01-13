@@ -1,15 +1,16 @@
 //! Related to out filenames of compilation (e.g. binaries).
-use crate::config::{CrateType, Input, OutFileName, OutputFilenames, OutputType};
+
+use std::path::Path;
+
+use rustc_ast::{self as ast, attr};
+use rustc_span::{Span, Symbol, sym};
+
+use crate::Session;
+use crate::config::{self, CrateType, Input, OutFileName, OutputFilenames, OutputType};
 use crate::errors::{
-    CrateNameDoesNotMatch, CrateNameEmpty, CrateNameInvalid, FileIsNotWriteable,
+    self, CrateNameDoesNotMatch, CrateNameEmpty, CrateNameInvalid, FileIsNotWriteable,
     InvalidCharacterInCrateName, InvalidCrateNameHelp,
 };
-use crate::Session;
-use rustc_ast::{self as ast, attr};
-use rustc_errors::FatalError;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
-use std::path::Path;
 
 pub fn out_filename(
     sess: &Session,
@@ -84,15 +85,14 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute]) -> Symbol {
         }
     }
 
-    Symbol::intern("rust_out")
+    sym::rust_out
 }
 
 pub fn validate_crate_name(sess: &Session, s: Symbol, sp: Option<Span>) {
-    let mut err_count = 0;
+    let mut guar = None;
     {
         if s.is_empty() {
-            err_count += 1;
-            sess.dcx().emit_err(CrateNameEmpty { span: sp });
+            guar = Some(sess.dcx().emit_err(CrateNameEmpty { span: sp }));
         }
         for c in s.as_str().chars() {
             if c.is_alphanumeric() {
@@ -101,8 +101,7 @@ pub fn validate_crate_name(sess: &Session, s: Symbol, sp: Option<Span>) {
             if c == '_' {
                 continue;
             }
-            err_count += 1;
-            sess.dcx().emit_err(InvalidCharacterInCrateName {
+            guar = Some(sess.dcx().emit_err(InvalidCharacterInCrateName {
                 span: sp,
                 character: c,
                 crate_name: s,
@@ -111,12 +110,12 @@ pub fn validate_crate_name(sess: &Session, s: Symbol, sp: Option<Span>) {
                 } else {
                     None
                 },
-            });
+            }));
         }
     }
 
-    if err_count > 0 {
-        FatalError.raise();
+    if let Some(guar) = guar {
+        guar.raise_fatal();
     }
 }
 
@@ -199,4 +198,65 @@ pub fn invalid_output_for_target(sess: &Session, crate_type: CrateType) -> bool 
     }
 
     false
+}
+
+pub const CRATE_TYPES: &[(Symbol, CrateType)] = &[
+    (sym::rlib, CrateType::Rlib),
+    (sym::dylib, CrateType::Dylib),
+    (sym::cdylib, CrateType::Cdylib),
+    (sym::lib, config::default_lib_output()),
+    (sym::staticlib, CrateType::Staticlib),
+    (sym::proc_dash_macro, CrateType::ProcMacro),
+    (sym::bin, CrateType::Executable),
+];
+
+pub fn categorize_crate_type(s: Symbol) -> Option<CrateType> {
+    Some(CRATE_TYPES.iter().find(|(key, _)| *key == s)?.1)
+}
+
+pub fn collect_crate_types(session: &Session, attrs: &[ast::Attribute]) -> Vec<CrateType> {
+    // If we're generating a test executable, then ignore all other output
+    // styles at all other locations
+    if session.opts.test {
+        return vec![CrateType::Executable];
+    }
+
+    // Only check command line flags if present. If no types are specified by
+    // command line, then reuse the empty `base` Vec to hold the types that
+    // will be found in crate attributes.
+    // JUSTIFICATION: before wrapper fn is available
+    #[allow(rustc::bad_opt_access)]
+    let mut base = session.opts.crate_types.clone();
+    if base.is_empty() {
+        let attr_types = attrs.iter().filter_map(|a| {
+            if a.has_name(sym::crate_type)
+                && let Some(s) = a.value_str()
+            {
+                categorize_crate_type(s)
+            } else {
+                None
+            }
+        });
+        base.extend(attr_types);
+        if base.is_empty() {
+            base.push(default_output_for_target(session));
+        } else {
+            base.sort();
+            base.dedup();
+        }
+    }
+
+    base.retain(|crate_type| {
+        if invalid_output_for_target(session, *crate_type) {
+            session.dcx().emit_warn(errors::UnsupportedCrateTypeForTarget {
+                crate_type: *crate_type,
+                target_triple: &session.opts.target_triple,
+            });
+            false
+        } else {
+            true
+        }
+    });
+
+    base
 }

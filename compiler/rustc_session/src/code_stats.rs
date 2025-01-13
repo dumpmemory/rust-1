@@ -1,9 +1,10 @@
+use std::cmp;
+
+use rustc_abi::{Align, Size};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lock;
-use rustc_span::def_id::DefId;
 use rustc_span::Symbol;
-use rustc_target::abi::{Align, Size};
-use std::cmp;
+use rustc_span::def_id::DefId;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct VariantInfo {
@@ -44,6 +45,10 @@ pub struct FieldInfo {
     pub offset: u64,
     pub size: u64,
     pub align: u64,
+    /// Name of the type of this field.
+    /// Present only if the creator thought that this would be important for identifying the field,
+    /// typically because the field name is uninformative.
+    pub type_name: Option<Symbol>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -192,7 +197,7 @@ impl CodeStats {
                 fields.sort_by_key(|f| (f.offset, f.size));
 
                 for field in fields {
-                    let FieldInfo { kind, ref name, offset, size, align } = field;
+                    let FieldInfo { kind, ref name, offset, size, align, type_name } = field;
 
                     if offset > min_offset {
                         let pad = offset - min_offset;
@@ -201,19 +206,25 @@ impl CodeStats {
 
                     if offset < min_offset {
                         // If this happens it's probably a union.
-                        println!(
+                        print!(
                             "print-type-size {indent}{kind} `.{name}`: {size} bytes, \
                                   offset: {offset} bytes, \
                                   alignment: {align} bytes"
                         );
                     } else if info.packed || offset == min_offset {
-                        println!("print-type-size {indent}{kind} `.{name}`: {size} bytes");
+                        print!("print-type-size {indent}{kind} `.{name}`: {size} bytes");
                     } else {
                         // Include field alignment in output only if it caused padding injection
-                        println!(
+                        print!(
                             "print-type-size {indent}{kind} `.{name}`: {size} bytes, \
                                   alignment: {align} bytes"
                         );
+                    }
+
+                    if let Some(type_name) = type_name {
+                        println!(", type: {type_name}");
+                    } else {
+                        println!();
                     }
 
                     min_offset = offset + size;

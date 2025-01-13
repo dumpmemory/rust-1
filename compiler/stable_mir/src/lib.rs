@@ -16,21 +16,18 @@
 //!
 //! The goal is to eventually be published on
 //! [crates.io](https://crates.io).
-#[macro_use]
-extern crate scoped_tls;
 
-use std::fmt;
 use std::fmt::Debug;
-use std::io;
+use std::{fmt, io};
+
+use serde::Serialize;
 
 use crate::compiler_interface::with;
-pub use crate::crate_def::CrateDef;
-pub use crate::crate_def::DefId;
+pub use crate::crate_def::{CrateDef, CrateDefType, DefId};
 pub use crate::error::*;
-use crate::mir::pretty::function_name;
-use crate::mir::Body;
-use crate::mir::Mutability;
-use crate::ty::{ForeignModuleDef, ImplDef, IndexedVal, Span, TraitDef, Ty};
+use crate::mir::mono::StaticDef;
+use crate::mir::{Body, Mutability};
+use crate::ty::{FnDef, ForeignModuleDef, ImplDef, IndexedVal, Span, TraitDef, Ty};
 
 pub mod abi;
 #[macro_use]
@@ -78,7 +75,7 @@ pub type TraitDecls = Vec<TraitDef>;
 pub type ImplTraitDecls = Vec<ImplDef>;
 
 /// Holds information about a crate.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct Crate {
     pub id: CrateNum,
     pub name: Symbol,
@@ -100,9 +97,19 @@ impl Crate {
     pub fn trait_impls(&self) -> ImplTraitDecls {
         with(|cx| cx.trait_impls(self.id))
     }
+
+    /// Return a list of function definitions from this crate independent on their visibility.
+    pub fn fn_defs(&self) -> Vec<FnDef> {
+        with(|cx| cx.crate_functions(self.id))
+    }
+
+    /// Return a list of static items defined in this crate independent on their visibility.
+    pub fn statics(&self) -> Vec<StaticDef> {
+        with(|cx| cx.crate_statics(self.id))
+    }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Serialize)]
 pub enum ItemKind {
     Fn,
     Static,
@@ -110,7 +117,7 @@ pub enum ItemKind {
     Ctor(CtorKind),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Serialize)]
 pub enum CtorKind {
     Const,
     Fn,
@@ -118,12 +125,16 @@ pub enum CtorKind {
 
 pub type Filename = String;
 
-crate_def! {
+crate_def_with_ty! {
     /// Holds information about an item in a crate.
+    #[derive(Serialize)]
     pub CrateItem;
 }
 
 impl CrateItem {
+    /// This will return the body of an item.
+    ///
+    /// This will panic if no body is available.
     pub fn body(&self) -> mir::Body {
         with(|cx| cx.mir_body(self.0))
     }
@@ -148,9 +159,8 @@ impl CrateItem {
         with(|cx| cx.is_foreign_item(self.0))
     }
 
-    pub fn dump<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
-        writeln!(w, "{}", function_name(*self))?;
-        self.body().dump(w)
+    pub fn emit_mir<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        self.body().dump(w, &self.name())
     }
 }
 
@@ -190,7 +200,7 @@ pub fn all_trait_impls() -> ImplTraitDecls {
 }
 
 /// A type that provides internal information but that can still be used for debug purpose.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Opaque(String);
 
 impl std::fmt::Display for Opaque {

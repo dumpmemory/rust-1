@@ -1,6 +1,6 @@
-use crate::spec::{base, Cc, LinkerFlavor, Lld, Target};
+use crate::spec::{Cc, LinkerFlavor, Lld, Target, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     let mut base = base::windows_gnullvm::opts();
     base.cpu = "x86-64".into();
     base.features = "+cx16,+sse3,+sahf".into();
@@ -11,7 +11,12 @@ pub fn target() -> Target {
 
     Target {
         llvm_target: "x86_64-pc-windows-gnu".into(),
-        description: None,
+        metadata: crate::spec::TargetMetadata {
+            description: Some("64-bit x86 MinGW (Windows 10+), LLVM ABI".into()),
+            tier: Some(2),
+            host_tools: Some(false),
+            std: Some(true),
+        },
         pointer_width: 64,
         data_layout:
             "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),

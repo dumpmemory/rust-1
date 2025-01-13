@@ -1,9 +1,10 @@
 // This test ensures that the elements in the sidebar are displayed correctly.
+include: "utils.goml"
 javascript: false
 go-to: "file://" + |DOC_PATH| + "/src/test_docs/lib.rs.html"
 // Since the javascript is disabled, there shouldn't be a toggle.
 wait-for-css: (".sidebar", {"display": "none"})
-assert-css: ("#sidebar-button", {"display": "none"})
+assert-false: "#sidebar-button"
 
 // Let's retry with javascript enabled.
 javascript: true
@@ -30,12 +31,11 @@ show-text: true
 
 define-function: (
     "check-colors",
-    (
+    [
         theme, color, color_hover, background, background_hover, background_toggle,
-    ),
+    ],
     block {
-        set-local-storage: {"rustdoc-theme": |theme|, "rustdoc-use-system-theme": "false"}
-        reload:
+        call-function: ("switch-theme", {"theme": |theme|})
         wait-for-css: (".src .sidebar > *", {"visibility": "visible"})
         assert-css: (
             "#src-sidebar details[open] > .files a.selected",
@@ -141,14 +141,15 @@ click: "#sidebar-button"
 wait-for-css: (".src .sidebar > *", {"visibility": "hidden"})
 // We scroll to line 117 to change the scroll position.
 scroll-to: '//*[@id="117"]'
-assert-window-property: {"pageYOffset": "2516"}
+store-value: (y_offset, "2578")
+assert-window-property: {"pageYOffset": |y_offset|}
 // Expanding the sidebar...
 click: "#sidebar-button"
 wait-for-css: (".sidebar", {"left": "0px"})
 click: "#sidebar-button"
 wait-for-css: (".sidebar", {"left": "-1000px"})
 // The "scrollTop" property should be the same.
-assert-window-property: {"pageYOffset": "2516"}
+assert-window-property: {"pageYOffset": |y_offset|}
 
 // We now check that opening the sidebar and clicking a link will close it.
 // The behavior here on mobile is different than the behavior on desktop,

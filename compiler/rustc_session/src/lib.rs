@@ -1,18 +1,13 @@
-#![feature(generic_nonzero)]
-#![feature(let_chains)]
-#![feature(lazy_cell)]
-#![feature(option_get_or_insert_default)]
-#![feature(rustc_attrs)]
-#![feature(map_many_mut)]
-#![feature(iter_intersperse)]
+// tidy-alphabetical-start
 #![allow(internal_features)]
+#![feature(iter_intersperse)]
+#![feature(let_chains)]
+#![feature(map_many_mut)]
+#![feature(rustc_attrs)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate rustc_macros;
 pub mod errors;
-
-#[macro_use]
-extern crate tracing;
 
 pub mod utils;
 pub use lint::{declare_lint, declare_lint_pass, declare_tool_lint, impl_lint_pass};
@@ -33,9 +28,6 @@ pub use session::*;
 pub mod output;
 
 pub use getopts;
-
-mod version;
-pub use version::RustcVersion;
 
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 

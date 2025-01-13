@@ -5,7 +5,8 @@ use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, ImplTraitInTraitData, TyCtxt};
-use rustc_span::symbol::kw;
+use rustc_middle::{bug, span_bug};
+use rustc_span::kw;
 
 pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
@@ -139,7 +140,7 @@ fn associated_item_from_trait_item_ref(trait_item_ref: &hir::TraitItemRef) -> ty
         kind,
         def_id: owner_id.to_def_id(),
         trait_item_def_id: Some(owner_id.to_def_id()),
-        container: ty::TraitContainer,
+        container: ty::AssocItemContainer::Trait,
         fn_has_self_parameter: has_self,
         opt_rpitit_info: None,
     }
@@ -158,7 +159,7 @@ fn associated_item_from_impl_item_ref(impl_item_ref: &hir::ImplItemRef) -> ty::A
         kind,
         def_id: def_id.to_def_id(),
         trait_item_def_id: impl_item_ref.trait_item_def_id,
-        container: ty::ImplContainer,
+        container: ty::AssocItemContainer::Impl,
         fn_has_self_parameter: has_self,
         opt_rpitit_info: None,
     }
@@ -181,19 +182,16 @@ fn associated_types_for_impl_traits_in_associated_fn(
 
     match tcx.def_kind(parent_def_id) {
         DefKind::Trait => {
-            struct RPITVisitor<'tcx> {
+            struct RPITVisitor {
                 rpits: FxIndexSet<LocalDefId>,
-                tcx: TyCtxt<'tcx>,
             }
 
-            impl<'tcx> Visitor<'tcx> for RPITVisitor<'tcx> {
+            impl<'tcx> Visitor<'tcx> for RPITVisitor {
                 fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx>) {
-                    if let hir::TyKind::OpaqueDef(item_id, _, _) = ty.kind
-                        && self.rpits.insert(item_id.owner_id.def_id)
+                    if let hir::TyKind::OpaqueDef(opaq) = ty.kind
+                        && self.rpits.insert(opaq.def_id)
                     {
-                        let opaque_item =
-                            self.tcx.hir().expect_item(item_id.owner_id.def_id).expect_opaque_ty();
-                        for bound in opaque_item.bounds {
+                        for bound in opaq.bounds {
                             intravisit::walk_param_bound(self, bound);
                         }
                     }
@@ -201,7 +199,7 @@ fn associated_types_for_impl_traits_in_associated_fn(
                 }
             }
 
-            let mut visitor = RPITVisitor { tcx, rpits: FxIndexSet::default() };
+            let mut visitor = RPITVisitor { rpits: FxIndexSet::default() };
 
             if let Some(output) = tcx.hir().get_fn_output(fn_def_id) {
                 visitor.visit_fn_ret_ty(output);
@@ -244,8 +242,9 @@ fn associated_type_for_impl_trait_in_trait(
     tcx: TyCtxt<'_>,
     opaque_ty_def_id: LocalDefId,
 ) -> LocalDefId {
-    let (hir::OpaqueTyOrigin::FnReturn(fn_def_id) | hir::OpaqueTyOrigin::AsyncFn(fn_def_id)) =
-        tcx.opaque_type_origin(opaque_ty_def_id)
+    let (hir::OpaqueTyOrigin::FnReturn { parent: fn_def_id, .. }
+    | hir::OpaqueTyOrigin::AsyncFn { parent: fn_def_id, .. }) =
+        tcx.local_opaque_ty_origin(opaque_ty_def_id)
     else {
         bug!("expected opaque for {opaque_ty_def_id:?}");
     };
@@ -258,9 +257,7 @@ fn associated_type_for_impl_trait_in_trait(
     let local_def_id = trait_assoc_ty.def_id();
     let def_id = local_def_id.to_def_id();
 
-    // There's no HIR associated with this new synthesized `def_id`, so feed
-    // `opt_local_def_id_to_hir_id` with `None`.
-    trait_assoc_ty.opt_local_def_id_to_hir_id(None);
+    trait_assoc_ty.feed_hir();
 
     // Copy span of the opaque.
     trait_assoc_ty.def_ident_span(Some(span));
@@ -270,7 +267,7 @@ fn associated_type_for_impl_trait_in_trait(
         kind: ty::AssocKind::Type,
         def_id,
         trait_item_def_id: None,
-        container: ty::TraitContainer,
+        container: ty::AssocItemContainer::Trait,
         fn_has_self_parameter: false,
         opt_rpitit_info: Some(ImplTraitInTraitData::Trait {
             fn_def_id: fn_def_id.to_def_id(),
@@ -283,8 +280,6 @@ fn associated_type_for_impl_trait_in_trait(
 
     // Copy defaultness of the containing function.
     trait_assoc_ty.defaultness(tcx.defaultness(fn_def_id));
-
-    trait_assoc_ty.is_type_alias_impl_trait(false);
 
     // There are no inferred outlives for the synthesized associated type.
     trait_assoc_ty.inferred_outlives_of(&[]);
@@ -304,11 +299,7 @@ fn associated_type_for_impl_trait_in_impl(
 ) -> LocalDefId {
     let impl_local_def_id = tcx.local_parent(impl_fn_def_id);
 
-    let decl = tcx
-        .opt_hir_node_by_def_id(impl_fn_def_id)
-        .expect("expected item")
-        .fn_decl()
-        .expect("expected decl");
+    let decl = tcx.hir_node_by_def_id(impl_fn_def_id).fn_decl().expect("expected decl");
     let span = match decl.output {
         hir::FnRetTy::DefaultReturn(_) => tcx.def_span(impl_fn_def_id),
         hir::FnRetTy::Return(ty) => ty.span,
@@ -318,9 +309,7 @@ fn associated_type_for_impl_trait_in_impl(
     let local_def_id = impl_assoc_ty.def_id();
     let def_id = local_def_id.to_def_id();
 
-    // There's no HIR associated with this new synthesized `def_id`, so feed
-    // `opt_local_def_id_to_hir_id` with `None`.
-    impl_assoc_ty.opt_local_def_id_to_hir_id(None);
+    impl_assoc_ty.feed_hir();
 
     // Copy span of the opaque.
     impl_assoc_ty.def_ident_span(Some(span));
@@ -330,7 +319,7 @@ fn associated_type_for_impl_trait_in_impl(
         kind: ty::AssocKind::Type,
         def_id,
         trait_item_def_id: Some(trait_assoc_def_id),
-        container: ty::ImplContainer,
+        container: ty::AssocItemContainer::Impl,
         fn_has_self_parameter: false,
         opt_rpitit_info: Some(ImplTraitInTraitData::Impl { fn_def_id: impl_fn_def_id.to_def_id() }),
     });
@@ -348,26 +337,25 @@ fn associated_type_for_impl_trait_in_impl(
     impl_assoc_ty.generics_of({
         let trait_assoc_generics = tcx.generics_of(trait_assoc_def_id);
         let trait_assoc_parent_count = trait_assoc_generics.parent_count;
-        let mut params = trait_assoc_generics.params.clone();
+        let mut own_params = trait_assoc_generics.own_params.clone();
 
         let parent_generics = tcx.generics_of(impl_local_def_id.to_def_id());
-        let parent_count = parent_generics.parent_count + parent_generics.params.len();
+        let parent_count = parent_generics.parent_count + parent_generics.own_params.len();
 
-        for param in &mut params {
+        for param in &mut own_params {
             param.index = param.index + parent_count as u32 - trait_assoc_parent_count as u32;
         }
 
         let param_def_id_to_index =
-            params.iter().map(|param| (param.def_id, param.index)).collect();
+            own_params.iter().map(|param| (param.def_id, param.index)).collect();
 
         ty::Generics {
             parent: Some(impl_local_def_id.to_def_id()),
             parent_count,
-            params,
+            own_params,
             param_def_id_to_index,
             has_self: false,
             has_late_bound_regions: trait_assoc_generics.has_late_bound_regions,
-            host_effect_index: parent_generics.host_effect_index,
         }
     });
 

@@ -8,23 +8,19 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::cmp::{self, Ordering};
-use core::fmt;
 use core::hash::{Hash, Hasher};
-use core::iter::{repeat_n, repeat_with, ByRefSized};
-use core::mem::{ManuallyDrop, SizedTypeProperties};
-use core::ops::{Index, IndexMut, Range, RangeBounds};
-use core::ptr;
-use core::slice;
-
+use core::iter::{ByRefSized, repeat_n, repeat_with};
 // This is used in a bunch of intra-doc links.
 // FIXME: For some reason, `#[cfg(doc)]` wasn't sufficient, resulting in
 // failures in linkchecker even though rustdoc built the docs just fine.
 #[allow(unused_imports)]
 use core::mem;
+use core::mem::{ManuallyDrop, SizedTypeProperties};
+use core::ops::{Index, IndexMut, Range, RangeBounds};
+use core::{fmt, ptr, slice};
 
 use crate::alloc::{Allocator, Global};
-use crate::collections::TryReserveError;
-use crate::collections::TryReserveErrorKind;
+use crate::collections::{TryReserveError, TryReserveErrorKind};
 use crate::raw_vec::RawVec;
 use crate::vec::Vec;
 
@@ -107,15 +103,21 @@ pub struct VecDeque<
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
+    #[track_caller]
     fn clone(&self) -> Self {
         let mut deq = Self::with_capacity_in(self.len(), self.allocator().clone());
         deq.extend(self.iter().cloned());
         deq
     }
 
-    fn clone_from(&mut self, other: &Self) {
+    /// Overwrites the contents of `self` with a clone of the contents of `source`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation if possible.
+    #[track_caller]
+    fn clone_from(&mut self, source: &Self) {
         self.clear();
-        self.extend(other.iter().cloned());
+        self.extend(source.iter().cloned());
     }
 }
 
@@ -158,6 +160,20 @@ impl<T, A: Allocator> VecDeque<T, A> {
     #[inline]
     fn ptr(&self) -> *mut T {
         self.buf.ptr()
+    }
+
+    /// Appends an element to the buffer.
+    ///
+    /// # Safety
+    ///
+    /// May only be called if `deque.len() < deque.capacity()`
+    #[inline]
+    unsafe fn push_unchecked(&mut self, element: T) {
+        // SAFETY: Because of the precondition, it's guaranteed that there is space
+        // in the logical array after the last element.
+        unsafe { self.buffer_write(self.to_physical_idx(self.len), element) };
+        // This can't overflow because `deque.len() < deque.capacity() <= usize::MAX`.
+        self.len += 1;
     }
 
     /// Moves an element out of the buffer
@@ -540,8 +556,8 @@ impl<T> VecDeque<T> {
     #[rustc_const_stable(feature = "const_vec_deque_new", since = "1.68.0")]
     #[must_use]
     pub const fn new() -> VecDeque<T> {
-        // FIXME: This should just be `VecDeque::new_in(Global)` once that hits stable.
-        VecDeque { head: 0, len: 0, buf: RawVec::NEW }
+        // FIXME(const-hack): This should just be `VecDeque::new_in(Global)` once that hits stable.
+        VecDeque { head: 0, len: 0, buf: RawVec::new() }
     }
 
     /// Creates an empty deque with space for at least `capacity` elements.
@@ -556,6 +572,7 @@ impl<T> VecDeque<T> {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use]
+    #[track_caller]
     pub fn with_capacity(capacity: usize) -> VecDeque<T> {
         Self::with_capacity_in(capacity, Global)
     }
@@ -611,6 +628,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// let deque: VecDeque<u32> = VecDeque::with_capacity(10);
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
+    #[track_caller]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> VecDeque<T, A> {
         VecDeque { head: 0, len: 0, buf: RawVec::with_capacity_in(capacity, alloc) }
     }
@@ -775,6 +793,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// [`reserve`]: VecDeque::reserve
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[track_caller]
     pub fn reserve_exact(&mut self, additional: usize) {
         let new_cap = self.len.checked_add(additional).expect("capacity overflow");
         let old_cap = self.capacity();
@@ -804,6 +823,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 11);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[track_caller]
     pub fn reserve(&mut self, additional: usize) {
         let new_cap = self.len.checked_add(additional).expect("capacity overflow");
         let old_cap = self.capacity();
@@ -935,6 +955,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 4);
     /// ```
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
+    #[track_caller]
     pub fn shrink_to_fit(&mut self) {
         self.shrink_to(0);
     }
@@ -960,6 +981,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 4);
     /// ```
     #[stable(feature = "shrink_to", since = "1.56.0")]
+    #[track_caller]
     pub fn shrink_to(&mut self, min_capacity: usize) {
         let target_cap = min_capacity.max(self.len);
 
@@ -978,6 +1000,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // `head` and `len` are at most `isize::MAX` and `target_cap < self.capacity()`, so nothing can
         // overflow.
         let tail_outside = (target_cap + 1..=self.capacity()).contains(&(self.head + self.len));
+        // Used in the drop guard below.
+        let old_head = self.head;
 
         if self.len == 0 {
             self.head = 0;
@@ -1030,10 +1054,72 @@ impl<T, A: Allocator> VecDeque<T, A> {
             }
             self.head = new_head;
         }
-        self.buf.shrink_to_fit(target_cap);
+
+        struct Guard<'a, T, A: Allocator> {
+            deque: &'a mut VecDeque<T, A>,
+            old_head: usize,
+            target_cap: usize,
+        }
+
+        impl<T, A: Allocator> Drop for Guard<'_, T, A> {
+            #[cold]
+            fn drop(&mut self) {
+                unsafe {
+                    // SAFETY: This is only called if `buf.shrink_to_fit` unwinds,
+                    // which is the only time it's safe to call `abort_shrink`.
+                    self.deque.abort_shrink(self.old_head, self.target_cap)
+                }
+            }
+        }
+
+        let guard = Guard { deque: self, old_head, target_cap };
+
+        guard.deque.buf.shrink_to_fit(target_cap);
+
+        // Don't drop the guard if we didn't unwind.
+        mem::forget(guard);
 
         debug_assert!(self.head < self.capacity() || self.capacity() == 0);
         debug_assert!(self.len <= self.capacity());
+    }
+
+    /// Reverts the deque back into a consistent state in case `shrink_to` failed.
+    /// This is necessary to prevent UB if the backing allocator returns an error
+    /// from `shrink` and `handle_alloc_error` subsequently unwinds (see #123369).
+    ///
+    /// `old_head` refers to the head index before `shrink_to` was called. `target_cap`
+    /// is the capacity that it was trying to shrink to.
+    unsafe fn abort_shrink(&mut self, old_head: usize, target_cap: usize) {
+        // Moral equivalent of self.head + self.len <= target_cap. Won't overflow
+        // because `self.len <= target_cap`.
+        if self.head <= target_cap - self.len {
+            // The deque's buffer is contiguous, so no need to copy anything around.
+            return;
+        }
+
+        // `shrink_to` already copied the head to fit into the new capacity, so this won't overflow.
+        let head_len = target_cap - self.head;
+        // `self.head > target_cap - self.len` => `self.len > target_cap - self.head =: head_len` so this must be positive.
+        let tail_len = self.len - head_len;
+
+        if tail_len <= cmp::min(head_len, self.capacity() - target_cap) {
+            // There's enough spare capacity to copy the tail to the back (because `tail_len < self.capacity() - target_cap`),
+            // and copying the tail should be cheaper than copying the head (because `tail_len <= head_len`).
+
+            unsafe {
+                // The old tail and the new tail can't overlap because the head slice lies between them. The
+                // head slice ends at `target_cap`, so that's where we copy to.
+                self.copy_nonoverlapping(0, target_cap, tail_len);
+            }
+        } else {
+            // Either there's not enough spare capacity to make the deque contiguous, or the head is shorter than the tail
+            // (and therefore hopefully cheaper to copy).
+            unsafe {
+                // The old and the new head slice can overlap, so we can't use `copy_nonoverlapping` here.
+                self.copy(self.head, old_head, head_len);
+                self.head = old_head;
+            }
+        }
     }
 
     /// Shortens the deque, keeping the first `len` elements and dropping
@@ -1123,6 +1209,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(&c[..], b);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "vecdeque_iter")]
     pub fn iter(&self) -> Iter<'_, T> {
         let (a, b) = self.as_slices();
         Iter::new(a.iter(), b.iter())
@@ -1614,7 +1701,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
             let old_head = self.head;
             self.head = self.to_physical_idx(1);
             self.len -= 1;
-            Some(unsafe { self.buffer_read(old_head) })
+            unsafe {
+                core::hint::assert_unchecked(self.len < self.capacity());
+                Some(self.buffer_read(old_head))
+            }
         }
     }
 
@@ -1638,7 +1728,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
             None
         } else {
             self.len -= 1;
-            Some(unsafe { self.buffer_read(self.to_physical_idx(self.len)) })
+            unsafe {
+                core::hint::assert_unchecked(self.len < self.capacity());
+                Some(self.buffer_read(self.to_physical_idx(self.len)))
+            }
         }
     }
 
@@ -1655,6 +1748,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(d.front(), Some(&2));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[track_caller]
     pub fn push_front(&mut self, value: T) {
         if self.is_full() {
             self.grow();
@@ -1682,6 +1776,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("push", "put", "append")]
+    #[track_caller]
     pub fn push_back(&mut self, value: T) {
         if self.is_full() {
             self.grow();
@@ -1774,7 +1869,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is greater than deque's length
+    /// Panics if `index` is strictly greater than deque's length
     ///
     /// # Examples
     ///
@@ -1789,8 +1884,12 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// vec_deque.insert(1, 'd');
     /// assert_eq!(vec_deque, &['a', 'd', 'b', 'c']);
+    ///
+    /// vec_deque.insert(4, 'e');
+    /// assert_eq!(vec_deque, &['a', 'd', 'b', 'c', 'e']);
     /// ```
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
+    #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
         assert!(index <= self.len(), "index out of bounds");
         if self.is_full() {
@@ -1832,13 +1931,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// use std::collections::VecDeque;
     ///
     /// let mut buf = VecDeque::new();
-    /// buf.push_back(1);
-    /// buf.push_back(2);
-    /// buf.push_back(3);
-    /// assert_eq!(buf, [1, 2, 3]);
+    /// buf.push_back('a');
+    /// buf.push_back('b');
+    /// buf.push_back('c');
+    /// assert_eq!(buf, ['a', 'b', 'c']);
     ///
-    /// assert_eq!(buf.remove(1), Some(2));
-    /// assert_eq!(buf, [1, 3]);
+    /// assert_eq!(buf.remove(1), Some('b'));
+    /// assert_eq!(buf, ['a', 'c']);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("delete", "take")]
@@ -1886,14 +1985,15 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     /// use std::collections::VecDeque;
     ///
-    /// let mut buf: VecDeque<_> = [1, 2, 3].into();
+    /// let mut buf: VecDeque<_> = ['a', 'b', 'c'].into();
     /// let buf2 = buf.split_off(1);
-    /// assert_eq!(buf, [1]);
-    /// assert_eq!(buf2, [2, 3]);
+    /// assert_eq!(buf, ['a']);
+    /// assert_eq!(buf2, ['b', 'c']);
     /// ```
     #[inline]
     #[must_use = "use `.truncate()` if you don't need the other half"]
     #[stable(feature = "split_off", since = "1.4.0")]
+    #[track_caller]
     pub fn split_off(&mut self, at: usize) -> Self
     where
         A: Clone,
@@ -1960,6 +2060,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[inline]
     #[stable(feature = "append", since = "1.4.0")]
+    #[track_caller]
     pub fn append(&mut self, other: &mut Self) {
         if T::IS_ZST {
             self.len = self.len.checked_add(other.len).expect("capacity overflow");
@@ -2024,7 +2125,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
     /// Retains only the elements specified by the predicate.
     ///
-    /// In other words, remove all elements `e` for which `f(&e)` returns false.
+    /// In other words, remove all elements `e` for which `f(&mut e)` returns false.
     /// This method operates in place, visiting each element exactly once in the
     /// original order, and preserves the order of the retained elements.
     ///
@@ -2082,12 +2183,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     // be called in cold paths.
     // This may panic or abort
     #[inline(never)]
+    #[track_caller]
     fn grow(&mut self) {
         // Extend or possibly remove this assertion when valid use-cases for growing the
         // buffer without it being full emerge
         debug_assert!(self.is_full());
         let old_cap = self.capacity();
-        self.buf.reserve_for_push(old_cap);
+        self.buf.grow_one();
         unsafe {
             self.handle_capacity_increase(old_cap);
         }
@@ -2120,6 +2222,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [5, 10, 101, 102, 103]);
     /// ```
     #[stable(feature = "vec_resize_with", since = "1.33.0")]
+    #[track_caller]
     pub fn resize_with(&mut self, new_len: usize, generator: impl FnMut() -> T) {
         let len = self.len;
 
@@ -2464,8 +2567,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// let mut deque: VecDeque<_> = [0, 1, 1, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55].into();
     /// let num = 42;
-    /// let idx = deque.partition_point(|&x| x < num);
-    /// // The above is equivalent to `let idx = deque.binary_search(&num).unwrap_or_else(|x| x);`
+    /// let idx = deque.partition_point(|&x| x <= num);
+    /// // If `num` is unique, `s.partition_point(|&x| x < num)` (with `<`) is equivalent to
+    /// // `s.binary_search(&num).unwrap_or_else(|x| x)`, but using `<=` may allow `insert`
+    /// // to shift less elements.
     /// deque.insert(idx, num);
     /// assert_eq!(deque, &[0, 1, 1, 1, 1, 2, 3, 5, 8, 13, 21, 34, 42, 55]);
     /// ```
@@ -2664,6 +2769,7 @@ impl<T: Clone, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [5, 10, 20, 20, 20]);
     /// ```
     #[stable(feature = "deque_extras", since = "1.16.0")]
+    #[track_caller]
     pub fn resize(&mut self, new_len: usize, value: T) {
         if new_len > self.len() {
             let extra = new_len - self.len();
@@ -2783,6 +2889,7 @@ impl<T, A: Allocator> IndexMut<usize> for VecDeque<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> FromIterator<T> for VecDeque<T> {
+    #[track_caller]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> VecDeque<T> {
         SpecFromIter::spec_from_iter(iter.into_iter())
     }
@@ -2822,35 +2929,57 @@ impl<'a, T, A: Allocator> IntoIterator for &'a mut VecDeque<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
+    #[track_caller]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         <Self as SpecExtend<T, I::IntoIter>>::spec_extend(self, iter.into_iter());
     }
 
     #[inline]
+    #[track_caller]
     fn extend_one(&mut self, elem: T) {
         self.push_back(elem);
     }
 
     #[inline]
+    #[track_caller]
     fn extend_reserve(&mut self, additional: usize) {
         self.reserve(additional);
+    }
+
+    #[inline]
+    unsafe fn extend_one_unchecked(&mut self, item: T) {
+        // SAFETY: Our preconditions ensure the space has been reserved, and `extend_reserve` is implemented correctly.
+        unsafe {
+            self.push_unchecked(item);
+        }
     }
 }
 
 #[stable(feature = "extend_ref", since = "1.2.0")]
 impl<'a, T: 'a + Copy, A: Allocator> Extend<&'a T> for VecDeque<T, A> {
+    #[track_caller]
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.spec_extend(iter.into_iter());
     }
 
     #[inline]
+    #[track_caller]
     fn extend_one(&mut self, &elem: &'a T) {
         self.push_back(elem);
     }
 
     #[inline]
+    #[track_caller]
     fn extend_reserve(&mut self, additional: usize) {
         self.reserve(additional);
+    }
+
+    #[inline]
+    unsafe fn extend_one_unchecked(&mut self, &item: &'a T) {
+        // SAFETY: Our preconditions ensure the space has been reserved, and `extend_reserve` is implemented correctly.
+        unsafe {
+            self.push_unchecked(item);
+        }
     }
 }
 
@@ -2938,6 +3067,7 @@ impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
     /// let deq2: VecDeque<_> = [1, 2, 3, 4].into();
     /// assert_eq!(deq1, deq2);
     /// ```
+    #[track_caller]
     fn from(arr: [T; N]) -> Self {
         let mut deq = VecDeque::with_capacity(N);
         let arr = ManuallyDrop::new(arr);

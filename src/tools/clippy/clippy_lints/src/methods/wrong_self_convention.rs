@@ -127,7 +127,7 @@ pub(super) fn check<'tcx>(
                         .collect::<Vec<_>>()
                         .join(" and ");
 
-                    format!("methods with the following characteristics: ({})", &s)
+                    format!("methods with the following characteristics: ({s})")
                 } else {
                     format!("methods called {}", &conventions[0])
                 }
@@ -137,7 +137,7 @@ pub(super) fn check<'tcx>(
                 cx,
                 WRONG_SELF_CONVENTION,
                 first_arg_span,
-                &format!(
+                format!(
                     "{suggestion} usually take {}",
                     &self_kinds
                         .iter()

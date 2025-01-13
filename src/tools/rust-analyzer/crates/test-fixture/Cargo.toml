@@ -5,7 +5,6 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
 
 [dependencies]
 hir-expand.workspace = true
@@ -16,6 +15,7 @@ base-db.workspace = true
 rustc-hash.workspace = true
 span.workspace = true
 stdx.workspace = true
+intern.workspace = true
 
 [lints]
 workspace = true

@@ -1,13 +1,14 @@
-use crate::ffi::{CStr, CString};
+use core::arch::asm;
+
+use crate::ffi::CStr;
 use crate::io;
 use crate::num::NonZero;
 use crate::os::xous::ffi::{
-    blocking_scalar, create_thread, do_yield, join_thread, map_memory, update_memory_flags,
-    MemoryFlags, Syscall, ThreadId,
+    MemoryFlags, Syscall, ThreadId, blocking_scalar, create_thread, do_yield, join_thread,
+    map_memory, update_memory_flags,
 };
-use crate::os::xous::services::{ticktimer_server, TicktimerScalar};
+use crate::os::xous::services::{TicktimerScalar, ticktimer_server};
 use crate::time::Duration;
-use core::arch::asm;
 
 pub struct Thread {
     tid: ThreadId,
@@ -81,7 +82,7 @@ impl Thread {
             // Destroy TLS, which will free the TLS page and call the destructor for
             // any thread local storage (if any).
             unsafe {
-                crate::sys::thread_local_key::destroy_tls();
+                crate::sys::thread_local::key::destroy_tls();
             }
 
             // Deallocate the stack memory, along with the guard pages. Afterwards,
@@ -113,10 +114,6 @@ impl Thread {
         // nope
     }
 
-    pub fn get_name() -> Option<CString> {
-        None
-    }
-
     pub fn sleep(dur: Duration) {
         // Because the sleep server works on units of `usized milliseconds`, split
         // the messages up into these chunks. This means we may run into issues
@@ -139,14 +136,4 @@ impl Thread {
 pub fn available_parallelism() -> io::Result<NonZero<usize>> {
     // We're unicore right now.
     Ok(unsafe { NonZero::new_unchecked(1) })
-}
-
-pub mod guard {
-    pub type Guard = !;
-    pub unsafe fn current() -> Option<Guard> {
-        None
-    }
-    pub unsafe fn init() -> Option<Guard> {
-        None
-    }
 }

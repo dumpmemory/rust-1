@@ -8,16 +8,12 @@
 
 #![deny(unsafe_code)]
 
-use crate::{Delimiter, Level, Spacing};
-use std::fmt;
 use std::hash::Hash;
-use std::marker;
-use std::mem;
-use std::ops::Bound;
-use std::ops::Range;
-use std::panic;
+use std::ops::{Bound, Range};
 use std::sync::Once;
-use std::thread;
+use std::{fmt, marker, mem, panic, thread};
+
+use crate::{Delimiter, Level, Spacing};
 
 /// Higher-order macro describing the server RPC API, allowing automatic
 /// generation of type-safe Rust APIs, both client-side and server-side.
@@ -154,7 +150,7 @@ macro_rules! reverse_decode {
 mod arena;
 #[allow(unsafe_code)]
 mod buffer;
-#[forbid(unsafe_code)]
+#[deny(unsafe_code)]
 pub mod client;
 #[allow(unsafe_code)]
 mod closure;
@@ -165,8 +161,6 @@ mod handle;
 #[macro_use]
 #[forbid(unsafe_code)]
 mod rpc;
-#[allow(unsafe_code)]
-mod scoped_cell;
 #[allow(unsafe_code)]
 mod selfless_reify;
 #[forbid(unsafe_code)]

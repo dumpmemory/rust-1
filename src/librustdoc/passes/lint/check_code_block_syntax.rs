@@ -1,28 +1,26 @@
 //! Validates syntax inside Rust code blocks (\`\`\`rust).
+
 use rustc_data_structures::sync::{Lock, Lrc};
-use rustc_errors::{
-    emitter::Emitter,
-    translation::{to_fluent_args, Translate},
-    Applicability, DiagCtxt, DiagInner, LazyFallbackBundle,
-};
-use rustc_parse::parse_stream_from_source_str;
+use rustc_errors::emitter::Emitter;
+use rustc_errors::registry::Registry;
+use rustc_errors::translation::{Translate, to_fluent_args};
+use rustc_errors::{Applicability, DiagCtxt, DiagInner, LazyFallbackBundle};
+use rustc_parse::{source_str_to_stream, unwrap_or_emit_fatal};
 use rustc_resolve::rustdoc::source_span_for_markdown_range;
 use rustc_session::parse::ParseSess;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId, Transparency};
 use rustc_span::source_map::{FilePathMapping, SourceMap};
-use rustc_span::{FileName, InnerSpan, DUMMY_SP};
+use rustc_span::{DUMMY_SP, FileName, InnerSpan};
 
 use crate::clean;
 use crate::core::DocContext;
 use crate::html::markdown::{self, RustCodeBlock};
 
-pub(crate) fn visit_item(cx: &DocContext<'_>, item: &clean::Item) {
-    if let Some(dox) = &item.opt_doc_value() {
+pub(crate) fn visit_item(cx: &DocContext<'_>, item: &clean::Item, dox: &str) {
+    if let Some(def_id) = item.item_id.as_local_def_id() {
         let sp = item.attr_span(cx.tcx);
-        let extra = crate::html::markdown::ExtraInfo::new(cx.tcx, item.item_id.expect_def_id(), sp);
-        for code_block in
-            markdown::rust_code_blocks(dox, &extra, cx.tcx.features().custom_code_classes_in_docs)
-        {
+        let extra = crate::html::markdown::ExtraInfo::new(cx.tcx, def_id, sp);
+        for code_block in markdown::rust_code_blocks(dox, &extra) {
             check_rust_syntax(cx, item, dox, code_block);
         }
     }
@@ -53,12 +51,12 @@ fn check_rust_syntax(
     let span = DUMMY_SP.apply_mark(expn_id.to_expn_id(), Transparency::Transparent);
 
     let is_empty = rustc_driver::catch_fatal_errors(|| {
-        parse_stream_from_source_str(
+        unwrap_or_emit_fatal(source_str_to_stream(
+            &psess,
             FileName::Custom(String::from("doctest")),
             source,
-            &psess,
             Some(span),
-        )
+        ))
         .is_empty()
     })
     .unwrap_or(false);
@@ -99,7 +97,9 @@ fn check_rust_syntax(
     // All points of divergence have been handled earlier so this can be
     // done the same way whether the span is precise or not.
     let hir_id = cx.tcx.local_def_id_to_hir_id(local_id);
-    cx.tcx.node_span_lint(crate::lint::INVALID_RUST_CODEBLOCKS, hir_id, sp, msg, |lint| {
+    cx.tcx.node_span_lint(crate::lint::INVALID_RUST_CODEBLOCKS, hir_id, sp, |lint| {
+        lint.primary_message(msg);
+
         let explanation = if is_ignore {
             "`ignore` code blocks require valid Rust code for syntax highlighting; \
                     mark blocks that do not contain Rust code as text"
@@ -146,17 +146,17 @@ struct BufferEmitter {
 }
 
 impl Translate for BufferEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<rustc_errors::FluentBundle>> {
+    fn fluent_bundle(&self) -> Option<&rustc_errors::FluentBundle> {
         None
     }
 
     fn fallback_fluent_bundle(&self) -> &rustc_errors::FluentBundle {
-        &**self.fallback_bundle
+        &self.fallback_bundle
     }
 }
 
 impl Emitter for BufferEmitter {
-    fn emit_diagnostic(&mut self, diag: DiagInner) {
+    fn emit_diagnostic(&mut self, diag: DiagInner, _registry: &Registry) {
         let mut buffer = self.buffer.borrow_mut();
 
         let fluent_args = to_fluent_args(diag.args.iter());
@@ -170,7 +170,7 @@ impl Emitter for BufferEmitter {
         }
     }
 
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+    fn source_map(&self) -> Option<&SourceMap> {
         None
     }
 }

@@ -3,15 +3,11 @@
 #![stable(feature = "io_safety", since = "1.63.0")]
 
 use super::raw::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
-use crate::fmt;
-use crate::fs;
-use crate::io;
 use crate::marker::PhantomData;
-use crate::mem::forget;
-use crate::ptr;
-use crate::sys;
+use crate::mem::ManuallyDrop;
 use crate::sys::cvt;
 use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::{fmt, fs, io, ptr, sys};
 
 /// A borrowed handle.
 ///
@@ -91,7 +87,7 @@ pub struct OwnedHandle {
 #[repr(transparent)]
 #[stable(feature = "io_safety", since = "1.63.0")]
 #[derive(Debug)]
-pub struct HandleOrNull(OwnedHandle);
+pub struct HandleOrNull(RawHandle);
 
 /// FFI type for handles in return values or out parameters, where `INVALID_HANDLE_VALUE` is used
 /// as a sentry value to indicate errors, such as in the return value of `CreateFileW`. This uses
@@ -110,7 +106,7 @@ pub struct HandleOrNull(OwnedHandle);
 #[repr(transparent)]
 #[stable(feature = "io_safety", since = "1.63.0")]
 #[derive(Debug)]
-pub struct HandleOrInvalid(OwnedHandle);
+pub struct HandleOrInvalid(RawHandle);
 
 // The Windows [`HANDLE`] type may be transferred across and shared between
 // thread boundaries (despite containing a `*mut void`, which in general isn't
@@ -135,7 +131,7 @@ unsafe impl Sync for HandleOrInvalid {}
 unsafe impl Sync for BorrowedHandle<'_> {}
 
 impl BorrowedHandle<'_> {
-    /// Return a `BorrowedHandle` holding the given raw handle.
+    /// Returns a `BorrowedHandle` holding the given raw handle.
     ///
     /// # Safety
     ///
@@ -163,15 +159,24 @@ impl TryFrom<HandleOrNull> for OwnedHandle {
 
     #[inline]
     fn try_from(handle_or_null: HandleOrNull) -> Result<Self, NullHandleError> {
-        let owned_handle = handle_or_null.0;
-        if owned_handle.handle.is_null() {
-            // Don't call `CloseHandle`; it'd be harmless, except that it could
-            // overwrite the `GetLastError` error.
-            forget(owned_handle);
-
-            Err(NullHandleError(()))
+        let handle_or_null = ManuallyDrop::new(handle_or_null);
+        if handle_or_null.is_valid() {
+            // SAFETY: The handle is not null.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle_or_null.0) })
         } else {
-            Ok(owned_handle)
+            Err(NullHandleError(()))
+        }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl Drop for HandleOrNull {
+    #[inline]
+    fn drop(&mut self) {
+        if self.is_valid() {
+            unsafe {
+                let _ = sys::c::CloseHandle(self.0);
+            }
         }
     }
 }
@@ -232,15 +237,24 @@ impl TryFrom<HandleOrInvalid> for OwnedHandle {
 
     #[inline]
     fn try_from(handle_or_invalid: HandleOrInvalid) -> Result<Self, InvalidHandleError> {
-        let owned_handle = handle_or_invalid.0;
-        if owned_handle.handle == sys::c::INVALID_HANDLE_VALUE {
-            // Don't call `CloseHandle`; it'd be harmless, except that it could
-            // overwrite the `GetLastError` error.
-            forget(owned_handle);
-
-            Err(InvalidHandleError(()))
+        let handle_or_invalid = ManuallyDrop::new(handle_or_invalid);
+        if handle_or_invalid.is_valid() {
+            // SAFETY: The handle is not invalid.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle_or_invalid.0) })
         } else {
-            Ok(owned_handle)
+            Err(InvalidHandleError(()))
+        }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl Drop for HandleOrInvalid {
+    #[inline]
+    fn drop(&mut self) {
+        if self.is_valid() {
+            unsafe {
+                let _ = sys::c::CloseHandle(self.0);
+            }
         }
     }
 }
@@ -301,9 +315,7 @@ impl AsRawHandle for OwnedHandle {
 impl IntoRawHandle for OwnedHandle {
     #[inline]
     fn into_raw_handle(self) -> RawHandle {
-        let handle = self.handle;
-        forget(self);
-        handle
+        ManuallyDrop::new(self).handle
     }
 }
 
@@ -333,7 +345,11 @@ impl HandleOrNull {
     #[stable(feature = "io_safety", since = "1.63.0")]
     #[inline]
     pub unsafe fn from_raw_handle(handle: RawHandle) -> Self {
-        Self(OwnedHandle::from_raw_handle(handle))
+        Self(handle)
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.0.is_null()
     }
 }
 
@@ -356,7 +372,11 @@ impl HandleOrInvalid {
     #[stable(feature = "io_safety", since = "1.63.0")]
     #[inline]
     pub unsafe fn from_raw_handle(handle: RawHandle) -> Self {
-        Self(OwnedHandle::from_raw_handle(handle))
+        Self(handle)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.0 != sys::c::INVALID_HANDLE_VALUE
     }
 }
 
@@ -459,6 +479,14 @@ impl<T: AsHandle + ?Sized> AsHandle for crate::sync::Arc<T> {
 
 #[stable(feature = "as_windows_ptrs", since = "1.71.0")]
 impl<T: AsHandle + ?Sized> AsHandle for crate::rc::Rc<T> {
+    #[inline]
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        (**self).as_handle()
+    }
+}
+
+#[unstable(feature = "unique_rc_arc", issue = "112566")]
+impl<T: AsHandle + ?Sized> AsHandle for crate::rc::UniqueRc<T> {
     #[inline]
     fn as_handle(&self) -> BorrowedHandle<'_> {
         (**self).as_handle()

@@ -2,20 +2,21 @@
 //! are *mostly* used as a part of that interface, but these should
 //! probably get a better home if someone can find one.
 
-use crate::search_paths::PathKind;
-use crate::utils::NativeLibKind;
-use crate::Session;
-use rustc_ast as ast;
-use rustc_data_structures::sync::{self, AppendOnlyIndexVec, FreezeLock};
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, StableCrateId, LOCAL_CRATE};
-use rustc_hir::definitions::{DefKey, DefPath, DefPathHash, Definitions};
-use rustc_span::hygiene::{ExpnHash, ExpnId};
-use rustc_span::symbol::Symbol;
-use rustc_span::Span;
-use rustc_target::spec::abi::Abi;
-
 use std::any::Any;
 use std::path::PathBuf;
+
+use rustc_abi::ExternAbi;
+use rustc_ast as ast;
+use rustc_data_structures::sync::{self, AppendOnlyIndexVec, FreezeLock};
+use rustc_hir::def_id::{
+    CrateNum, DefId, LOCAL_CRATE, LocalDefId, StableCrateId, StableCrateIdMap,
+};
+use rustc_hir::definitions::{DefKey, DefPath, DefPathHash, Definitions};
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_span::{Span, Symbol};
+
+use crate::search_paths::PathKind;
+use crate::utils::NativeLibKind;
 
 // lonely orphan structs and enums looking for a better home
 
@@ -41,7 +42,7 @@ pub enum CrateDepKind {
     /// A dependency that is only used for its macros.
     MacrosOnly,
     /// A dependency that is always injected into the dependency list and so
-    /// doesn't need to be linked to an rlib, e.g., the injected allocator.
+    /// doesn't need to be linked to an rlib, e.g., the injected panic runtime.
     Implicit,
     /// A dependency that is required by an rlib version of this crate.
     /// Ordinary `extern crate`s result in `Explicit` dependencies.
@@ -70,7 +71,7 @@ pub struct NativeLib {
     pub name: Symbol,
     /// If packed_bundled_libs enabled, actual filename of library is stored.
     pub filename: Option<Symbol>,
-    pub cfg: Option<ast::MetaItem>,
+    pub cfg: Option<ast::MetaItemInner>,
     pub foreign_module: Option<DefId>,
     pub verbatim: Option<bool>,
     pub dll_imports: Vec<DllImport>,
@@ -128,6 +129,11 @@ impl DllImport {
             None
         }
     }
+
+    pub fn is_missing_decorations(&self) -> bool {
+        self.import_name_type == Some(PeImportNameType::Undecorated)
+            || self.import_name_type == Some(PeImportNameType::NoPrefix)
+    }
 }
 
 /// Calling convention for a function defined in an external library.
@@ -146,7 +152,7 @@ pub enum DllCallingConvention {
 pub struct ForeignModule {
     pub foreign_items: Vec<DefId>,
     pub def_id: DefId,
-    pub abi: Abi,
+    pub abi: ExternAbi,
 }
 
 #[derive(Copy, Clone, Debug, HashStable_Generic)]
@@ -219,23 +225,6 @@ pub trait CrateStore: std::fmt::Debug {
     // incr. comp. uses to identify a CrateNum.
     fn crate_name(&self, cnum: CrateNum) -> Symbol;
     fn stable_crate_id(&self, cnum: CrateNum) -> StableCrateId;
-    fn stable_crate_id_to_crate_num(&self, stable_crate_id: StableCrateId) -> CrateNum;
-
-    /// Fetch a DefId from a DefPathHash for a foreign crate.
-    fn def_path_hash_to_def_id(&self, cnum: CrateNum, hash: DefPathHash) -> DefId;
-    fn expn_hash_to_expn_id(
-        &self,
-        sess: &Session,
-        cnum: CrateNum,
-        index_guess: u32,
-        hash: ExpnHash,
-    ) -> ExpnId;
-
-    /// Imports all `SourceFile`s from the given crate into the current session.
-    /// This normally happens automatically when we decode a `Span` from
-    /// that crate's metadata - however, the incr comp cache needs
-    /// to trigger this manually when decoding a foreign `Span`
-    fn import_source_files(&self, sess: &Session, cnum: CrateNum);
 }
 
 pub type CrateStoreDyn = dyn CrateStore + sync::DynSync + sync::DynSend;
@@ -245,4 +234,6 @@ pub struct Untracked {
     /// Reference span for definitions.
     pub source_span: AppendOnlyIndexVec<LocalDefId, Span>,
     pub definitions: FreezeLock<Definitions>,
+    /// The interned [StableCrateId]s.
+    pub stable_crate_ids: FreezeLock<StableCrateIdMap>,
 }

@@ -3,11 +3,13 @@
 
 use std::cmp;
 
+use rustc_abi::{HasDataLayout, Size};
 use rustc_data_structures::sorted_map::SortedMap;
-use rustc_target::abi::{HasDataLayout, Size};
-
-use super::{alloc_range, AllocError, AllocRange, AllocResult, CtfeProvenance, Provenance};
+use rustc_macros::HashStable;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+use tracing::trace;
+
+use super::{AllocError, AllocRange, AllocResult, CtfeProvenance, Provenance, alloc_range};
 
 /// Stores the provenance information of pointers stored in memory.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -192,6 +194,25 @@ impl<Prov: Provenance> ProvenanceMap<Prov> {
         self.ptrs.remove_range(first..last);
 
         Ok(())
+    }
+
+    /// Overwrites all provenance in the allocation with wildcard provenance.
+    ///
+    /// Provided for usage in Miri and panics otherwise.
+    pub fn write_wildcards(&mut self, alloc_size: usize) {
+        assert!(
+            Prov::OFFSET_IS_ADDR,
+            "writing wildcard provenance is not supported when `OFFSET_IS_ADDR` is false"
+        );
+        let wildcard = Prov::WILDCARD.unwrap();
+
+        // Remove all pointer provenances, then write wildcards into the whole byte range.
+        self.ptrs.clear();
+        let last = Size::from_bytes(alloc_size);
+        let bytes = self.bytes.get_or_insert_with(Box::default);
+        for offset in Size::ZERO..last {
+            bytes.insert(offset, wildcard);
+        }
     }
 }
 

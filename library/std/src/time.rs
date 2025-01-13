@@ -34,17 +34,16 @@
 #[cfg(test)]
 mod tests;
 
+#[stable(feature = "time", since = "1.3.0")]
+pub use core::time::Duration;
+#[stable(feature = "duration_checked_float", since = "1.66.0")]
+pub use core::time::TryFromFloatSecsError;
+
 use crate::error::Error;
 use crate::fmt;
 use crate::ops::{Add, AddAssign, Sub, SubAssign};
 use crate::sys::time;
 use crate::sys_common::{FromInner, IntoInner};
-
-#[stable(feature = "time", since = "1.3.0")]
-pub use core::time::Duration;
-
-#[stable(feature = "duration_checked_float", since = "1.66.0")]
-pub use core::time::TryFromFloatSecsError;
 
 /// A measurement of a monotonically nondecreasing clock.
 /// Opaque and useful only with [`Duration`].
@@ -179,9 +178,9 @@ pub struct Instant(time::Instant);
 /// system.
 ///
 /// A `SystemTime` does not count leap seconds.
-/// `SystemTime::now()`'s behaviour around a leap second
+/// `SystemTime::now()`'s behavior around a leap second
 /// is the same as the operating system's wall clock.
-/// The precise behaviour near a leap second
+/// The precise behavior near a leap second
 /// (e.g. whether the clock appears to run slow or fast, or stop, or jump)
 /// depends on platform and configuration,
 /// so should not be relied on.
@@ -281,6 +280,7 @@ impl Instant {
     /// ```
     #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "instant_now")]
     pub fn now() -> Instant {
         Instant(time::Instant::now())
     }

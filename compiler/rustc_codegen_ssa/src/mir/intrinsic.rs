@@ -1,20 +1,16 @@
-use super::operand::{OperandRef, OperandValue};
-use super::place::PlaceRef;
-use super::FunctionCx;
-use crate::common::IntPredicate;
-use crate::errors;
-use crate::errors::InvalidMonomorphization;
-use crate::meth;
-use crate::size_of_val;
-use crate::traits::*;
-use crate::MemFlags;
-
+use rustc_abi::WrappingRange;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::{sym, Span};
-use rustc_target::abi::{
-    call::{FnAbi, PassMode},
-    WrappingRange,
-};
+use rustc_middle::{bug, span_bug};
+use rustc_session::config::OptLevel;
+use rustc_span::{Span, sym};
+use rustc_target::callconv::{FnAbi, PassMode};
+
+use super::FunctionCx;
+use super::operand::OperandRef;
+use super::place::PlaceRef;
+use crate::errors::InvalidMonomorphization;
+use crate::traits::*;
+use crate::{MemFlags, errors, meth, size_of_val};
 
 fn copy_intrinsic<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
@@ -63,18 +59,42 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         llresult: Bx::Value,
         span: Span,
     ) -> Result<(), ty::Instance<'tcx>> {
-        let callee_ty = instance.ty(bx.tcx(), ty::ParamEnv::reveal_all());
+        let callee_ty = instance.ty(bx.tcx(), bx.typing_env());
 
         let ty::FnDef(def_id, fn_args) = *callee_ty.kind() else {
             bug!("expected fn item type, found {}", callee_ty);
         };
 
         let sig = callee_ty.fn_sig(bx.tcx());
-        let sig = bx.tcx().normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), sig);
+        let sig = bx.tcx().normalize_erasing_late_bound_regions(bx.typing_env(), sig);
         let arg_tys = sig.inputs();
         let ret_ty = sig.output();
         let name = bx.tcx().item_name(def_id);
         let name_str = name.as_str();
+
+        // If we're swapping something that's *not* an `OperandValue::Ref`,
+        // then we can do it directly and avoid the alloca.
+        // Otherwise, we'll let the fallback MIR body take care of it.
+        if let sym::typed_swap_nonoverlapping = name {
+            let pointee_ty = fn_args.type_at(0);
+            let pointee_layout = bx.layout_of(pointee_ty);
+            if !bx.is_backend_ref(pointee_layout)
+                // But if we're not going to optimize, trying to use the fallback
+                // body just makes things worse, so don't bother.
+                || bx.sess().opts.optimize == OptLevel::No
+                // NOTE(eddyb) SPIR-V's Logical addressing model doesn't allow for arbitrary
+                // reinterpretation of values as (chunkable) byte arrays, and the loop in the
+                // block optimization in `ptr::swap_nonoverlapping` is hard to rewrite back
+                // into the (unoptimized) direct swapping implementation, so we disable it.
+                || bx.sess().target.arch == "spirv"
+            {
+                let align = pointee_layout.align.abi;
+                let x_place = args[0].val.deref(align);
+                let y_place = args[1].val.deref(align);
+                bx.typed_place_swap(x_place, y_place, pointee_layout);
+                return Ok(());
+            }
+        }
 
         let llret_ty = bx.backend_type(bx.layout_of(ret_ty));
         let result = PlaceRef::new_sized(llresult, fn_abi.ret.layout);
@@ -89,15 +109,13 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             sym::va_end => bx.va_end(args[0].immediate()),
             sym::size_of_val => {
                 let tp_ty = fn_args.type_at(0);
-                let meta =
-                    if let OperandValue::Pair(_, meta) = args[0].val { Some(meta) } else { None };
+                let (_, meta) = args[0].val.pointer_parts();
                 let (llsize, _) = size_of_val::size_and_align_of_dst(bx, tp_ty, meta);
                 llsize
             }
             sym::min_align_of_val => {
                 let tp_ty = fn_args.type_at(0);
-                let meta =
-                    if let OperandValue::Pair(_, meta) = args[0].val { Some(meta) } else { None };
+                let (_, meta) = args[0].val.pointer_parts();
                 let (_, llalign) = size_of_val::size_and_align_of_dst(bx, tp_ty, meta);
                 llalign
             }
@@ -108,7 +126,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     sym::vtable_align => ty::COMMON_VTABLE_ENTRIES_ALIGN,
                     _ => bug!(),
                 };
-                let value = meth::VirtualIndex::from_index(idx).get_usize(bx, vtable);
+                let value = meth::VirtualIndex::from_index(idx).get_usize(bx, vtable, callee_ty);
                 match name {
                     // Size is always <= isize::MAX.
                     sym::vtable_size => {
@@ -128,10 +146,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             | sym::type_id
             | sym::type_name
             | sym::variant_count => {
-                let value = bx
-                    .tcx()
-                    .const_eval_instance(ty::ParamEnv::reveal_all(), instance, None)
-                    .unwrap();
+                let value = bx.tcx().const_eval_instance(bx.typing_env(), instance, span).unwrap();
                 OperandRef::from_const(bx, value, ret_ty).immediate_or_packed_pair(bx)
             }
             sym::arith_offset => {
@@ -350,14 +365,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         if int_type_width_signed(ty, bx.tcx()).is_some() || ty.is_unsafe_ptr() {
                             let weak = instruction == "cxchgweak";
                             let dst = args[0].immediate();
-                            let mut cmp = args[1].immediate();
-                            let mut src = args[2].immediate();
-                            if ty.is_unsafe_ptr() {
-                                // Some platforms do not support atomic operations on pointers,
-                                // so we cast to integer first.
-                                cmp = bx.ptrtoint(cmp, bx.type_isize());
-                                src = bx.ptrtoint(src, bx.type_isize());
-                            }
+                            let cmp = args[1].immediate();
+                            let src = args[2].immediate();
                             let (val, success) = bx.atomic_cmpxchg(
                                 dst,
                                 cmp,
@@ -370,9 +379,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             let success = bx.from_immediate(success);
 
                             let dest = result.project_field(bx, 0);
-                            bx.store(val, dest.llval, dest.align);
+                            bx.store_to_place(val, dest.val);
                             let dest = result.project_field(bx, 1);
-                            bx.store(success, dest.llval, dest.align);
+                            bx.store_to_place(success, dest.val);
                         } else {
                             invalid_monomorphization(ty);
                         }
@@ -385,26 +394,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             let layout = bx.layout_of(ty);
                             let size = layout.size;
                             let source = args[0].immediate();
-                            if ty.is_unsafe_ptr() {
-                                // Some platforms do not support atomic operations on pointers,
-                                // so we cast to integer first...
-                                let llty = bx.type_isize();
-                                let result = bx.atomic_load(
-                                    llty,
-                                    source,
-                                    parse_ordering(bx, ordering),
-                                    size,
-                                );
-                                // ... and then cast the result back to a pointer
-                                bx.inttoptr(result, bx.backend_type(layout))
-                            } else {
-                                bx.atomic_load(
-                                    bx.backend_type(layout),
-                                    source,
-                                    parse_ordering(bx, ordering),
-                                    size,
-                                )
-                            }
+                            bx.atomic_load(
+                                bx.backend_type(layout),
+                                source,
+                                parse_ordering(bx, ordering),
+                                size,
+                            )
                         } else {
                             invalid_monomorphization(ty);
                             return Ok(());
@@ -415,13 +410,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let ty = fn_args.type_at(0);
                         if int_type_width_signed(ty, bx.tcx()).is_some() || ty.is_unsafe_ptr() {
                             let size = bx.layout_of(ty).size;
-                            let mut val = args[1].immediate();
+                            let val = args[1].immediate();
                             let ptr = args[0].immediate();
-                            if ty.is_unsafe_ptr() {
-                                // Some platforms do not support atomic operations on pointers,
-                                // so we cast to integer first.
-                                val = bx.ptrtoint(val, bx.type_isize());
-                            }
                             bx.atomic_store(val, ptr, parse_ordering(bx, ordering), size);
                         } else {
                             invalid_monomorphization(ty);
@@ -465,12 +455,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let ty = fn_args.type_at(0);
                         if int_type_width_signed(ty, bx.tcx()).is_some() || ty.is_unsafe_ptr() {
                             let ptr = args[0].immediate();
-                            let mut val = args[1].immediate();
-                            if ty.is_unsafe_ptr() {
-                                // Some platforms do not support atomic operations on pointers,
-                                // so we cast to integer first.
-                                val = bx.ptrtoint(val, bx.type_isize());
-                            }
+                            let val = args[1].immediate();
                             bx.atomic_rmw(atom_op, ptr, val, parse_ordering(bx, ordering))
                         } else {
                             invalid_monomorphization(ty);
@@ -484,12 +469,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let dst = args[0].deref(bx.cx());
                 args[1].val.nontemporal_store(bx, dst);
                 return Ok(());
-            }
-
-            sym::ptr_guaranteed_cmp => {
-                let a = args[0].immediate();
-                let b = args[1].immediate();
-                bx.icmp(IntPredicate::IntEQ, a, b)
             }
 
             sym::ptr_offset_from | sym::ptr_offset_from_unsigned => {
@@ -516,6 +495,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
+            sym::cold_path => {
+                // This is a no-op. The intrinsic is just a hint to the optimizer.
+                return Ok(());
+            }
+
             _ => {
                 // Need to use backend-specific things in the implementation.
                 return bx.codegen_intrinsic_call(instance, fn_abi, args, llresult, span);
@@ -524,7 +508,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         if !fn_abi.ret.is_ignore() {
             if let PassMode::Cast { .. } = &fn_abi.ret.mode {
-                bx.store(llval, result.llval, result.align);
+                bx.store_to_place(llval, result.val);
             } else {
                 OperandRef::from_immediate_or_packed_pair(bx, llval, result.layout)
                     .val

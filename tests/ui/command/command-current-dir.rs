@@ -1,5 +1,6 @@
 //@ run-pass
-//@ ignore-emscripten no processes
+//@ no-prefer-dynamic We move the binary around, so do not depend dynamically on libstd
+//@ ignore-wasm32 no processes
 //@ ignore-sgx no processes
 //@ ignore-fuchsia Needs directory creation privilege
 

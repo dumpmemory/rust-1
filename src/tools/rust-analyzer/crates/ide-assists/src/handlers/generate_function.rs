@@ -1,24 +1,23 @@
 use hir::{
-    Adt, AsAssocItem, HasSource, HirDisplay, HirFileIdExt, Module, PathResolution, Semantics, Type,
-    TypeInfo,
+    Adt, AsAssocItem, HasSource, HirDisplay, HirFileIdExt, Module, PathResolution, Semantics,
+    StructKind, Type, TypeInfo,
 };
 use ide_db::{
-    base_db::FileId,
     defs::{Definition, NameRefClass},
     famous_defs::FamousDefs,
     helpers::is_editable_crate,
     path_transform::PathTransform,
     source_change::SourceChangeBuilder,
-    FxHashMap, FxHashSet, RootDatabase, SnippetCap,
+    FileId, FxHashMap, FxHashSet, RootDatabase, SnippetCap,
 };
 use itertools::Itertools;
 use stdx::to_lower_snake_case;
 use syntax::{
     ast::{
-        self, edit::IndentLevel, edit_in_place::Indent, make, AstNode, CallExpr, HasArgList,
-        HasGenericParams, HasModuleItem, HasTypeBounds,
+        self, edit::IndentLevel, edit_in_place::Indent, make, AstNode, BlockExpr, CallExpr,
+        HasArgList, HasGenericParams, HasModuleItem, HasTypeBounds,
     },
-    ted, SyntaxKind, SyntaxNode, TextRange, T,
+    ted, Edition, SyntaxKind, SyntaxNode, TextRange, T,
 };
 
 use crate::{
@@ -66,7 +65,7 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     }
 
     let fn_name = &*name_ref.text();
-    let TargetInfo { target_module, adt_name, target, file } =
+    let TargetInfo { target_module, adt_info, target, file } =
         fn_target_info(ctx, path, &call, fn_name)?;
 
     if let Some(m) = target_module {
@@ -75,15 +74,16 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         }
     }
 
-    let function_builder = FunctionBuilder::from_call(ctx, &call, fn_name, target_module, target)?;
+    let function_builder =
+        FunctionBuilder::from_call(ctx, &call, fn_name, target_module, target, &adt_info)?;
     let text_range = call.syntax().text_range();
     let label = format!("Generate {} function", function_builder.fn_name);
-    add_func_to_accumulator(acc, ctx, text_range, function_builder, file, adt_name, label)
+    add_func_to_accumulator(acc, ctx, text_range, function_builder, file, adt_info, label)
 }
 
 struct TargetInfo {
     target_module: Option<Module>,
-    adt_name: Option<hir::Name>,
+    adt_info: Option<AdtInfo>,
     target: GeneratedFunctionTarget,
     file: FileId,
 }
@@ -91,11 +91,11 @@ struct TargetInfo {
 impl TargetInfo {
     fn new(
         target_module: Option<Module>,
-        adt_name: Option<hir::Name>,
+        adt_info: Option<AdtInfo>,
         target: GeneratedFunctionTarget,
         file: FileId,
     ) -> Self {
-        Self { target_module, adt_name, target, file }
+        Self { target_module, adt_info, target, file }
     }
 }
 
@@ -157,9 +157,9 @@ fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         target,
     )?;
     let text_range = call.syntax().text_range();
-    let adt_name = if impl_.is_none() { Some(adt.name(ctx.sema.db)) } else { None };
+    let adt_info = AdtInfo::new(adt, impl_.is_some());
     let label = format!("Generate {} method", function_builder.fn_name);
-    add_func_to_accumulator(acc, ctx, text_range, function_builder, file, adt_name, label)
+    add_func_to_accumulator(acc, ctx, text_range, function_builder, file, Some(adt_info), label)
 }
 
 fn add_func_to_accumulator(
@@ -168,18 +168,24 @@ fn add_func_to_accumulator(
     text_range: TextRange,
     function_builder: FunctionBuilder,
     file: FileId,
-    adt_name: Option<hir::Name>,
+    adt_info: Option<AdtInfo>,
     label: String,
 ) -> Option<()> {
     acc.add(AssistId("generate_function", AssistKind::Generate), label, text_range, |edit| {
         edit.edit_file(file);
 
         let target = function_builder.target.clone();
-        let function_template = function_builder.render();
-        let func = function_template.to_ast(ctx.config.snippet_cap, edit);
+        let edition = function_builder.target_edition;
+        let func = function_builder.render(ctx.config.snippet_cap, edit);
 
-        if let Some(name) = adt_name {
-            let name = make::ty_path(make::ext::ident_path(&format!("{}", name.display(ctx.db()))));
+        if let Some(adt) =
+            adt_info
+                .and_then(|adt_info| if adt_info.impl_exists { None } else { Some(adt_info.adt) })
+        {
+            let name = make::ty_path(make::ext::ident_path(&format!(
+                "{}",
+                adt.name(ctx.db()).display(ctx.db(), edition)
+            )));
 
             // FIXME: adt may have generic params.
             let impl_ = make::impl_(None, None, name, None, None).clone_for_update();
@@ -198,42 +204,12 @@ fn get_adt_source(
     adt: &hir::Adt,
     fn_name: &str,
 ) -> Option<(Option<ast::Impl>, FileId)> {
-    let range = adt.source(ctx.sema.db)?.syntax().original_file_range(ctx.sema.db);
+    let range = adt.source(ctx.sema.db)?.syntax().original_file_range_rooted(ctx.sema.db);
     let file = ctx.sema.parse(range.file_id);
     let adt_source =
         ctx.sema.find_node_at_offset_with_macros(file.syntax(), range.range.start())?;
-    find_struct_impl(ctx, &adt_source, &[fn_name.to_owned()]).map(|impl_| (impl_, range.file_id))
-}
-
-struct FunctionTemplate {
-    fn_def: ast::Fn,
-    ret_type: Option<ast::RetType>,
-    should_focus_return_type: bool,
-    tail_expr: ast::Expr,
-}
-
-impl FunctionTemplate {
-    fn to_ast(&self, cap: Option<SnippetCap>, edit: &mut SourceChangeBuilder) -> ast::Fn {
-        let Self { fn_def, ret_type, should_focus_return_type, tail_expr } = self;
-
-        if let Some(cap) = cap {
-            if *should_focus_return_type {
-                // Focus the return type if there is one
-                match ret_type {
-                    Some(ret_type) => {
-                        edit.add_placeholder_snippet(cap, ret_type.clone());
-                    }
-                    None => {
-                        edit.add_placeholder_snippet(cap, tail_expr.clone());
-                    }
-                }
-            } else {
-                edit.add_placeholder_snippet(cap, tail_expr.clone());
-            }
-        }
-
-        fn_def.clone()
-    }
+    find_struct_impl(ctx, &adt_source, &[fn_name.to_owned()])
+        .map(|impl_| (impl_, range.file_id.file_id()))
 }
 
 struct FunctionBuilder {
@@ -242,10 +218,12 @@ struct FunctionBuilder {
     generic_param_list: Option<ast::GenericParamList>,
     where_clause: Option<ast::WhereClause>,
     params: ast::ParamList,
+    fn_body: BlockExpr,
     ret_type: Option<ast::RetType>,
     should_focus_return_type: bool,
     visibility: Visibility,
     is_async: bool,
+    target_edition: Edition,
 }
 
 impl FunctionBuilder {
@@ -257,9 +235,11 @@ impl FunctionBuilder {
         fn_name: &str,
         target_module: Option<Module>,
         target: GeneratedFunctionTarget,
+        adt_info: &Option<AdtInfo>,
     ) -> Option<Self> {
         let target_module =
             target_module.or_else(|| ctx.sema.scope(target.syntax()).map(|it| it.module()))?;
+        let target_edition = target_module.krate().edition(ctx.db());
 
         let current_module = ctx.sema.scope(call.syntax())?.module();
         let visibility = calculate_necessary_visibility(current_module, target_module, ctx);
@@ -275,9 +255,29 @@ impl FunctionBuilder {
         let await_expr = call.syntax().parent().and_then(ast::AwaitExpr::cast);
         let is_async = await_expr.is_some();
 
-        let expr_for_ret_ty = await_expr.map_or_else(|| call.clone().into(), |it| it.into());
-        let (ret_type, should_focus_return_type) =
-            make_return_type(ctx, &expr_for_ret_ty, target_module, &mut necessary_generic_params);
+        let ret_type;
+        let should_focus_return_type;
+        let fn_body;
+
+        // If generated function has the name "new" and is an associated function, we generate fn body
+        // as a constructor and assume a "Self" return type.
+        if let Some(body) =
+            make_fn_body_as_new_function(ctx, &fn_name.text(), adt_info, target_edition)
+        {
+            ret_type = Some(make::ret_type(make::ty_path(make::ext::ident_path("Self"))));
+            should_focus_return_type = false;
+            fn_body = body;
+        } else {
+            let expr_for_ret_ty = await_expr.map_or_else(|| call.clone().into(), |it| it.into());
+            (ret_type, should_focus_return_type) = make_return_type(
+                ctx,
+                &expr_for_ret_ty,
+                target_module,
+                &mut necessary_generic_params,
+            );
+            let placeholder_expr = make::ext::expr_todo();
+            fn_body = make::block_expr(vec![], Some(placeholder_expr));
+        };
 
         let (generic_param_list, where_clause) =
             fn_generic_params(ctx, necessary_generic_params, &target)?;
@@ -288,10 +288,12 @@ impl FunctionBuilder {
             generic_param_list,
             where_clause,
             params,
+            fn_body,
             ret_type,
             should_focus_return_type,
             visibility,
             is_async,
+            target_edition,
         })
     }
 
@@ -303,6 +305,8 @@ impl FunctionBuilder {
         target_module: Module,
         target: GeneratedFunctionTarget,
     ) -> Option<Self> {
+        let target_edition = target_module.krate().edition(ctx.db());
+
         let current_module = ctx.sema.scope(call.syntax())?.module();
         let visibility = calculate_necessary_visibility(current_module, target_module, ctx);
 
@@ -326,22 +330,25 @@ impl FunctionBuilder {
         let (generic_param_list, where_clause) =
             fn_generic_params(ctx, necessary_generic_params, &target)?;
 
+        let placeholder_expr = make::ext::expr_todo();
+        let fn_body = make::block_expr(vec![], Some(placeholder_expr));
+
         Some(Self {
             target,
             fn_name,
             generic_param_list,
             where_clause,
             params,
+            fn_body,
             ret_type,
             should_focus_return_type,
             visibility,
             is_async,
+            target_edition,
         })
     }
 
-    fn render(self) -> FunctionTemplate {
-        let placeholder_expr = make::ext::expr_todo();
-        let fn_body = make::block_expr(vec![], Some(placeholder_expr));
+    fn render(self, cap: Option<SnippetCap>, edit: &mut SourceChangeBuilder) -> ast::Fn {
         let visibility = match self.visibility {
             Visibility::None => None,
             Visibility::Crate => Some(make::visibility_pub_crate()),
@@ -353,25 +360,40 @@ impl FunctionBuilder {
             self.generic_param_list,
             self.where_clause,
             self.params,
-            fn_body,
+            self.fn_body,
             self.ret_type,
             self.is_async,
             false, // FIXME : const and unsafe are not handled yet.
             false,
+            false,
         )
         .clone_for_update();
 
-        FunctionTemplate {
-            ret_type: fn_def.ret_type(),
-            // PANIC: we guarantee we always create a function body with a tail expr
-            tail_expr: fn_def
-                .body()
-                .expect("generated function should have a body")
-                .tail_expr()
-                .expect("function body should have a tail expression"),
-            should_focus_return_type: self.should_focus_return_type,
-            fn_def,
+        let ret_type = fn_def.ret_type();
+        // PANIC: we guarantee we always create a function body with a tail expr
+        let tail_expr = fn_def
+            .body()
+            .expect("generated function should have a body")
+            .tail_expr()
+            .expect("function body should have a tail expression");
+
+        if let Some(cap) = cap {
+            if self.should_focus_return_type {
+                // Focus the return type if there is one
+                match ret_type {
+                    Some(ret_type) => {
+                        edit.add_placeholder_snippet(cap, ret_type.clone());
+                    }
+                    None => {
+                        edit.add_placeholder_snippet(cap, tail_expr.clone());
+                    }
+                }
+            } else {
+                edit.add_placeholder_snippet(cap, tail_expr.clone());
+            }
         }
+
+        fn_def
     }
 }
 
@@ -381,9 +403,9 @@ impl FunctionBuilder {
 /// The rule for whether we focus a return type or not (and thus focus the function body),
 /// is rather simple:
 /// * If we could *not* infer what the return type should be, focus it (so the user can fill-in
-/// the correct return type).
+///   the correct return type).
 /// * If we could infer the return type, don't focus it (and thus focus the function body) so the
-/// user can change the `todo!` function body.
+///   user can change the `todo!` function body.
 fn make_return_type(
     ctx: &AssistContext<'_>,
     expr: &ast::Expr,
@@ -409,6 +431,57 @@ fn make_return_type(
     (ret_type, should_focus_return_type)
 }
 
+fn make_fn_body_as_new_function(
+    ctx: &AssistContext<'_>,
+    fn_name: &str,
+    adt_info: &Option<AdtInfo>,
+    edition: Edition,
+) -> Option<ast::BlockExpr> {
+    if fn_name != "new" {
+        return None;
+    };
+    let adt_info = adt_info.as_ref()?;
+
+    let path_self = make::ext::ident_path("Self");
+    let placeholder_expr = make::ext::expr_todo();
+    let tail_expr = if let Some(strukt) = adt_info.adt.as_struct() {
+        match strukt.kind(ctx.db()) {
+            StructKind::Record => {
+                let fields = strukt
+                    .fields(ctx.db())
+                    .iter()
+                    .map(|field| {
+                        make::record_expr_field(
+                            make::name_ref(&format!(
+                                "{}",
+                                field.name(ctx.db()).display(ctx.db(), edition)
+                            )),
+                            Some(placeholder_expr.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                make::record_expr(path_self, make::record_expr_field_list(fields)).into()
+            }
+            StructKind::Tuple => {
+                let args = strukt
+                    .fields(ctx.db())
+                    .iter()
+                    .map(|_| placeholder_expr.clone())
+                    .collect::<Vec<_>>();
+
+                make::expr_call(make::expr_path(path_self), make::arg_list(args))
+            }
+            StructKind::Unit => make::expr_path(path_self),
+        }
+    } else {
+        placeholder_expr
+    };
+
+    let fn_body = make::block_expr(vec![], Some(tail_expr));
+    Some(fn_body)
+}
+
 fn get_fn_target_info(
     ctx: &AssistContext<'_>,
     target_module: Option<Module>,
@@ -423,7 +496,7 @@ fn get_fn_target(
     target_module: Option<Module>,
     call: CallExpr,
 ) -> Option<(GeneratedFunctionTarget, FileId)> {
-    let mut file = ctx.file_id();
+    let mut file = ctx.file_id().into();
     let target = match target_module {
         Some(target_module) => {
             let (in_file, target) = next_space_for_fn_in_module(ctx.db(), target_module);
@@ -461,8 +534,8 @@ fn assoc_fn_target_info(
     }
     let (impl_, file) = get_adt_source(ctx, &adt, fn_name)?;
     let target = get_method_target(ctx, &impl_, &adt)?;
-    let adt_name = if impl_.is_none() { Some(adt.name(ctx.sema.db)) } else { None };
-    Some(TargetInfo::new(target_module, adt_name, target, file))
+    let adt_info = AdtInfo::new(adt, impl_.is_some());
+    Some(TargetInfo::new(target_module, Some(adt_info), target, file))
 }
 
 #[derive(Clone)]
@@ -575,6 +648,17 @@ impl GeneratedFunctionTarget {
                 impl_.get_or_create_assoc_item_list().add_item(func.into());
             }
         }
+    }
+}
+
+struct AdtInfo {
+    adt: hir::Adt,
+    impl_exists: bool,
+}
+
+impl AdtInfo {
+    fn new(adt: Adt, impl_exists: bool) -> Self {
+        Self { adt, impl_exists }
     }
 }
 
@@ -848,9 +932,9 @@ fn filter_generic_params(ctx: &AssistContext<'_>, node: SyntaxNode) -> Option<hi
 /// Say we have a trait bound `Struct<T>: Trait<U>`. Given `necessary_params`, when is it relevant
 /// and when not? Some observations:
 /// - When `necessary_params` contains `T`, it's likely that we want this bound, but now we have
-/// an extra param to consider: `U`.
+///   an extra param to consider: `U`.
 /// - On the other hand, when `necessary_params` contains `U` (but not `T`), then it's unlikely
-/// that we want this bound because it doesn't really constrain `U`.
+///   that we want this bound because it doesn't really constrain `U`.
 ///
 /// (FIXME?: The latter clause might be overstating. We may want to include the bound if the self
 /// type does *not* include generic params at all - like `Option<i32>: From<U>`)
@@ -858,7 +942,7 @@ fn filter_generic_params(ctx: &AssistContext<'_>, node: SyntaxNode) -> Option<hi
 /// Can we make this a bit more formal? Let's define "dependency" between generic parameters and
 /// trait bounds:
 /// - A generic parameter `T` depends on a trait bound if `T` appears in the self type (i.e. left
-/// part) of the bound.
+///   part) of the bound.
 /// - A trait bound depends on a generic parameter `T` if `T` appears in the bound.
 ///
 /// Using the notion, what we want is all the bounds that params in `necessary_params`
@@ -993,7 +1077,7 @@ fn fn_arg_name(sema: &Semantics<'_, RootDatabase>, arg_expr: &ast::Expr) -> Stri
                 .filter_map(ast::NameRef::cast)
                 .filter(|name| name.ident_token().is_some())
                 .last()?;
-            if let Some(NameRefClass::Definition(Definition::Const(_) | Definition::Static(_))) =
+            if let Some(NameRefClass::Definition(Definition::Const(_) | Definition::Static(_), _)) =
                 NameRefClass::classify(sema, &name_ref)
             {
                 return Some(name_ref.to_string().to_lowercase());
@@ -1032,8 +1116,9 @@ fn fn_arg_type(
 
         if ty.is_reference() || ty.is_mutable_reference() {
             let famous_defs = &FamousDefs(&ctx.sema, ctx.sema.scope(fn_arg.syntax())?.krate());
+            let target_edition = target_module.krate().edition(ctx.db());
             convert_reference_type(ty.strip_references(), ctx.db(), famous_defs)
-                .map(|conversion| conversion.convert_type(ctx.db()).to_string())
+                .map(|conversion| conversion.convert_type(ctx.db(), target_edition).to_string())
                 .or_else(|| ty.display_source_code(ctx.db(), target_module.into(), true).ok())
         } else {
             ty.display_source_code(ctx.db(), target_module.into(), true).ok()
@@ -1098,7 +1183,7 @@ fn next_space_for_fn_in_module(
         }
     };
 
-    (file, assist_item)
+    (file.file_id(), assist_item)
 }
 
 #[derive(Clone, Copy)]
@@ -1970,7 +2055,7 @@ fn bar(closure: impl Fn(i64) -> i64) {
     }
 
     #[test]
-    fn unresolveable_types_default_to_placeholder() {
+    fn unresolvable_types_default_to_placeholder() {
         check_assist(
             generate_function,
             r"
@@ -2776,18 +2861,18 @@ fn main() {
             r"
 enum Foo {}
 fn main() {
-    Foo::new$0();
+    Foo::bar$0();
 }
 ",
             r"
 enum Foo {}
 impl Foo {
-    fn new() ${0:-> _} {
+    fn bar() ${0:-> _} {
         todo!()
     }
 }
 fn main() {
-    Foo::new();
+    Foo::bar();
 }
 ",
         )
@@ -2866,5 +2951,153 @@ fn main() {
 }
 ",
         );
+    }
+
+    #[test]
+    fn new_function_assume_self_type() {
+        check_assist(
+            generate_function,
+            r"
+pub struct Foo {
+    field_1: usize,
+    field_2: String,
+}
+
+fn main() {
+    let foo = Foo::new$0();
+}
+        ",
+            r"
+pub struct Foo {
+    field_1: usize,
+    field_2: String,
+}
+impl Foo {
+    fn new() -> Self {
+        ${0:Self { field_1: todo!(), field_2: todo!() }}
+    }
+}
+
+fn main() {
+    let foo = Foo::new();
+}
+        ",
+        )
+    }
+
+    #[test]
+    fn new_function_assume_self_type_for_tuple_struct() {
+        check_assist(
+            generate_function,
+            r"
+pub struct Foo (usize, String);
+
+fn main() {
+    let foo = Foo::new$0();
+}
+        ",
+            r"
+pub struct Foo (usize, String);
+impl Foo {
+    fn new() -> Self {
+        ${0:Self(todo!(), todo!())}
+    }
+}
+
+fn main() {
+    let foo = Foo::new();
+}
+        ",
+        )
+    }
+
+    #[test]
+    fn new_function_assume_self_type_for_unit_struct() {
+        check_assist(
+            generate_function,
+            r"
+pub struct Foo;
+
+fn main() {
+    let foo = Foo::new$0();
+}
+        ",
+            r"
+pub struct Foo;
+impl Foo {
+    fn new() -> Self {
+        ${0:Self}
+    }
+}
+
+fn main() {
+    let foo = Foo::new();
+}
+        ",
+        )
+    }
+
+    #[test]
+    fn new_function_assume_self_type_for_enum() {
+        check_assist(
+            generate_function,
+            r"
+pub enum Foo {}
+
+fn main() {
+    let foo = Foo::new$0();
+}
+        ",
+            r"
+pub enum Foo {}
+impl Foo {
+    fn new() -> Self {
+        ${0:todo!()}
+    }
+}
+
+fn main() {
+    let foo = Foo::new();
+}
+        ",
+        )
+    }
+
+    #[test]
+    fn new_function_assume_self_type_with_args() {
+        check_assist(
+            generate_function,
+            r#"
+pub struct Foo {
+    field_1: usize,
+    field_2: String,
+}
+
+struct Baz;
+fn baz() -> Baz { Baz }
+
+fn main() {
+    let foo = Foo::new$0(baz(), baz(), "foo", "bar");
+}
+        "#,
+            r#"
+pub struct Foo {
+    field_1: usize,
+    field_2: String,
+}
+impl Foo {
+    fn new(baz_1: Baz, baz_2: Baz, arg_1: &str, arg_2: &str) -> Self {
+        ${0:Self { field_1: todo!(), field_2: todo!() }}
+    }
+}
+
+struct Baz;
+fn baz() -> Baz { Baz }
+
+fn main() {
+    let foo = Foo::new(baz(), baz(), "foo", "bar");
+}
+        "#,
+        )
     }
 }

@@ -83,17 +83,14 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::fmt;
-use crate::marker;
-
 #[stable(feature = "rust1", since = "1.0.0")]
 #[allow(deprecated)]
 pub use self::sip::SipHasher;
-
 #[unstable(feature = "hashmap_internals", issue = "none")]
 #[allow(deprecated)]
 #[doc(hidden)]
 pub use self::sip::SipHasher13;
+use crate::{fmt, marker};
 
 mod sip;
 
@@ -334,6 +331,7 @@ pub trait Hasher {
     ///
     /// [`write`]: Hasher::write
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[must_use]
     fn finish(&self) -> u64;
 
     /// Writes some data into this `Hasher`.
@@ -454,7 +452,7 @@ pub trait Hasher {
     /// ```
     /// #![feature(hasher_prefixfree_extras)]
     /// # // Stubs to make the `impl` below pass the compiler
-    /// # #![cfg_attr(not(bootstrap), allow(non_local_definitions))]
+    /// # #![allow(non_local_definitions)]
     /// # struct MyCollection<T>(Option<T>);
     /// # impl<T> MyCollection<T> {
     /// #     fn len(&self) -> usize { todo!() }
@@ -752,6 +750,15 @@ pub trait BuildHasher {
 #[stable(since = "1.7.0", feature = "build_hasher")]
 pub struct BuildHasherDefault<H>(marker::PhantomData<fn() -> H>);
 
+impl<H> BuildHasherDefault<H> {
+    /// Creates a new BuildHasherDefault for Hasher `H`.
+    #[stable(feature = "build_hasher_default_const_new", since = "1.85.0")]
+    #[rustc_const_stable(feature = "build_hasher_default_const_new", since = "1.85.0")]
+    pub const fn new() -> Self {
+        BuildHasherDefault(marker::PhantomData)
+    }
+}
+
 #[stable(since = "1.9.0", feature = "core_impl_debug")]
 impl<H> fmt::Debug for BuildHasherDefault<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -778,7 +785,7 @@ impl<H> Clone for BuildHasherDefault<H> {
 #[stable(since = "1.7.0", feature = "build_hasher")]
 impl<H> Default for BuildHasherDefault<H> {
     fn default() -> BuildHasherDefault<H> {
-        BuildHasherDefault(marker::PhantomData)
+        Self::new()
     }
 }
 
@@ -793,10 +800,8 @@ impl<H> PartialEq for BuildHasherDefault<H> {
 impl<H> Eq for BuildHasherDefault<H> {}
 
 mod impls {
-    use crate::mem;
-    use crate::slice;
-
     use super::*;
+    use crate::{mem, slice};
 
     macro_rules! impl_write {
         ($(($ty:ident, $meth:ident),)*) => {$(

@@ -58,7 +58,7 @@
 //! See also this post:
 //! <https://rust-analyzer.github.io/blog/2020/09/28/how-to-make-a-light-bulb.html>
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
 mod assist_config;
 mod assist_context;
@@ -67,7 +67,7 @@ mod tests;
 pub mod utils;
 
 use hir::Semantics;
-use ide_db::{base_db::FileRange, RootDatabase};
+use ide_db::{EditionedFileId, RootDatabase};
 use syntax::TextRange;
 
 pub(crate) use crate::assist_context::{AssistContext, Assists};
@@ -85,10 +85,13 @@ pub fn assists(
     db: &RootDatabase,
     config: &AssistConfig,
     resolve: AssistResolveStrategy,
-    range: FileRange,
+    range: ide_db::FileRange,
 ) -> Vec<Assist> {
     let sema = Semantics::new(db);
-    let ctx = AssistContext::new(sema, config, range);
+    let file_id = sema
+        .attach_first_edition(range.file_id)
+        .unwrap_or_else(|| EditionedFileId::current_edition(range.file_id));
+    let ctx = AssistContext::new(sema, config, hir::FileRange { file_id, range: range.range });
     let mut acc = Assists::new(&ctx, resolve);
     handlers::all().iter().for_each(|handler| {
         handler(&mut acc, &ctx);
@@ -115,7 +118,10 @@ mod handlers {
     mod bool_to_enum;
     mod change_visibility;
     mod convert_bool_then;
+    mod convert_closure_to_fn;
     mod convert_comment_block;
+    mod convert_comment_from_or_to_doc;
+    mod convert_from_to_tryfrom;
     mod convert_integer_literal;
     mod convert_into_to_from;
     mod convert_iter_for_each_to_for;
@@ -132,6 +138,7 @@ mod handlers {
     mod destructure_tuple_binding;
     mod desugar_doc_comment;
     mod expand_glob_import;
+    mod explicit_enum_discriminant;
     mod extract_expressions_from_format_string;
     mod extract_function;
     mod extract_module;
@@ -154,6 +161,7 @@ mod handlers {
     mod generate_enum_is_method;
     mod generate_enum_projection_method;
     mod generate_enum_variant;
+    mod generate_fn_type_alias;
     mod generate_from_impl_for_enum;
     mod generate_function;
     mod generate_getter_or_setter;
@@ -208,15 +216,18 @@ mod handlers {
     mod sort_items;
     mod split_import;
     mod term_search;
+    mod toggle_async_sugar;
     mod toggle_ignore;
+    mod toggle_macro_delimiter;
     mod unmerge_match_arm;
     mod unmerge_use;
     mod unnecessary_async;
     mod unqualify_method_call;
     mod unwrap_block;
-    mod unwrap_result_return_type;
+    mod unwrap_return_type;
     mod unwrap_tuple;
-    mod wrap_return_type_in_result;
+    mod wrap_return_type;
+    mod wrap_unwrap_cfg_attr;
 
     pub(crate) fn all() -> &'static [Handler] {
         &[
@@ -236,7 +247,12 @@ mod handlers {
             change_visibility::change_visibility,
             convert_bool_then::convert_bool_then_to_if,
             convert_bool_then::convert_if_to_bool_then,
+            toggle_async_sugar::desugar_async_into_impl_future,
+            toggle_async_sugar::sugar_impl_future_into_async,
             convert_comment_block::convert_comment_block,
+            convert_comment_from_or_to_doc::convert_comment_from_or_to_doc,
+            convert_closure_to_fn::convert_closure_to_fn,
+            convert_from_to_tryfrom::convert_from_to_tryfrom,
             convert_integer_literal::convert_integer_literal,
             convert_into_to_from::convert_into_to_from,
             convert_iter_for_each_to_for::convert_iter_for_each_to_for,
@@ -254,6 +270,7 @@ mod handlers {
             destructure_tuple_binding::destructure_tuple_binding,
             destructure_struct_binding::destructure_struct_binding,
             expand_glob_import::expand_glob_import,
+            explicit_enum_discriminant::explicit_enum_discriminant,
             extract_expressions_from_format_string::extract_expressions_from_format_string,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
             extract_type_alias::extract_type_alias,
@@ -273,6 +290,7 @@ mod handlers {
             generate_enum_projection_method::generate_enum_as_method,
             generate_enum_projection_method::generate_enum_try_into_method,
             generate_enum_variant::generate_enum_variant,
+            generate_fn_type_alias::generate_fn_type_alias,
             generate_from_impl_for_enum::generate_from_impl_for_enum,
             generate_function::generate_function,
             generate_impl::generate_impl,
@@ -285,6 +303,7 @@ mod handlers {
             inline_call::inline_into_callers,
             inline_const_as_literal::inline_const_as_literal,
             inline_local_variable::inline_local_variable,
+            inline_macro::inline_macro,
             inline_type_alias::inline_type_alias,
             inline_type_alias::inline_type_alias_uses,
             into_to_qualified_from::into_to_qualified_from,
@@ -310,6 +329,7 @@ mod handlers {
             raw_string::add_hash,
             raw_string::make_usual_string,
             raw_string::remove_hash,
+            remove_dbg::remove_dbg,
             remove_mut::remove_mut,
             remove_unused_imports::remove_unused_imports,
             remove_unused_param::remove_unused_param,
@@ -334,14 +354,17 @@ mod handlers {
             split_import::split_import,
             term_search::term_search,
             toggle_ignore::toggle_ignore,
+            toggle_macro_delimiter::toggle_macro_delimiter,
             unmerge_match_arm::unmerge_match_arm,
             unmerge_use::unmerge_use,
             unnecessary_async::unnecessary_async,
             unwrap_block::unwrap_block,
-            unwrap_result_return_type::unwrap_result_return_type,
+            unwrap_return_type::unwrap_return_type,
             unwrap_tuple::unwrap_tuple,
             unqualify_method_call::unqualify_method_call,
-            wrap_return_type_in_result::wrap_return_type_in_result,
+            wrap_return_type::wrap_return_type,
+            wrap_unwrap_cfg_attr::wrap_unwrap_cfg_attr,
+
             // These are manually sorted for better priorities. By default,
             // priority is determined by the size of the target range (smaller
             // target wins). If the ranges are equal, position in this list is
@@ -362,9 +385,6 @@ mod handlers {
             generate_getter_or_setter::generate_setter,
             generate_delegate_methods::generate_delegate_methods,
             generate_deref::generate_deref,
-            //
-            remove_dbg::remove_dbg,
-            inline_macro::inline_macro,
             // Are you sure you want to add new assist here, and not to the
             // sorted list above?
         ]

@@ -15,11 +15,11 @@ error[E0220]: associated type `Baa` not found for `T`
 LL |     T::Baa: std::fmt::Debug,
    |        ^^^ there is a similarly named associated type `Bar` in the trait `Foo`
    |
-help: consider further restricting type parameter `T`
+help: consider further restricting type parameter `T` with trait `Foo`
    |
 LL |     T::Baa: std::fmt::Debug, T: Foo
    |                            ~~~~~~~~
-help: and also change the associated type name
+help: ...and changing the associated type name
    |
 LL |     T::Bar: std::fmt::Debug,
    |        ~~~

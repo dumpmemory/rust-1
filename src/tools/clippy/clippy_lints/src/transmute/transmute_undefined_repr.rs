@@ -3,7 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::ty::is_c_void;
 use rustc_hir::Expr;
 use rustc_lint::LateContext;
-use rustc_middle::ty::{self, GenericArgsRef, IntTy, Ty, TypeAndMut, UintTy};
+use rustc_middle::ty::{self, GenericArgsRef, IntTy, Ty, UintTy};
 
 #[expect(clippy::too_many_lines)]
 pub(super) fn check<'tcx>(
@@ -30,27 +30,23 @@ pub(super) fn check<'tcx>(
             | (ReducedTy::UnorderedFields(from_sub_ty), ReducedTy::OrderedFields(Some(to_sub_ty))) => {
                 from_ty = from_sub_ty;
                 to_ty = to_sub_ty;
-                continue;
             },
             (ReducedTy::OrderedFields(Some(from_sub_ty)), ReducedTy::Other(to_sub_ty)) if reduced_tys.to_fat_ptr => {
                 from_ty = from_sub_ty;
                 to_ty = to_sub_ty;
-                continue;
             },
             (ReducedTy::Other(from_sub_ty), ReducedTy::OrderedFields(Some(to_sub_ty))) if reduced_tys.from_fat_ptr => {
                 from_ty = from_sub_ty;
                 to_ty = to_sub_ty;
-                continue;
             },
 
             // ptr <-> ptr
             (ReducedTy::Other(from_sub_ty), ReducedTy::Other(to_sub_ty))
-                if matches!(from_sub_ty.kind(), ty::Ref(..) | ty::RawPtr(_))
-                    && matches!(to_sub_ty.kind(), ty::Ref(..) | ty::RawPtr(_)) =>
+                if matches!(from_sub_ty.kind(), ty::Ref(..) | ty::RawPtr(_, _))
+                    && matches!(to_sub_ty.kind(), ty::Ref(..) | ty::RawPtr(_, _)) =>
             {
                 from_ty = from_sub_ty;
                 to_ty = to_sub_ty;
-                continue;
             },
 
             // fat ptr <-> (*size, *size)
@@ -71,7 +67,7 @@ pub(super) fn check<'tcx>(
                     cx,
                     TRANSMUTE_UNDEFINED_REPR,
                     e.span,
-                    &format!("transmute from `{from_ty_orig}` which has an undefined layout"),
+                    format!("transmute from `{from_ty_orig}` which has an undefined layout"),
                     |diag| {
                         if from_ty_orig.peel_refs() != from_ty.peel_refs() {
                             diag.note(format!("the contained type `{from_ty}` has an undefined layout"));
@@ -85,7 +81,7 @@ pub(super) fn check<'tcx>(
                     cx,
                     TRANSMUTE_UNDEFINED_REPR,
                     e.span,
-                    &format!("transmute to `{to_ty_orig}` which has an undefined layout"),
+                    format!("transmute to `{to_ty_orig}` which has an undefined layout"),
                     |diag| {
                         if to_ty_orig.peel_refs() != to_ty.peel_refs() {
                             diag.note(format!("the contained type `{to_ty}` has an undefined layout"));
@@ -111,7 +107,7 @@ pub(super) fn check<'tcx>(
                     cx,
                     TRANSMUTE_UNDEFINED_REPR,
                     e.span,
-                    &format!(
+                    format!(
                         "transmute from `{from_ty_orig}` to `{to_ty_orig}`, both of which have an undefined layout"
                     ),
                     |diag| {
@@ -140,7 +136,7 @@ pub(super) fn check<'tcx>(
                     cx,
                     TRANSMUTE_UNDEFINED_REPR,
                     e.span,
-                    &format!("transmute from `{from_ty_orig}` which has an undefined layout"),
+                    format!("transmute from `{from_ty_orig}` which has an undefined layout"),
                     |diag| {
                         if from_ty_orig.peel_refs() != from_ty {
                             diag.note(format!("the contained type `{from_ty}` has an undefined layout"));
@@ -157,7 +153,7 @@ pub(super) fn check<'tcx>(
                     cx,
                     TRANSMUTE_UNDEFINED_REPR,
                     e.span,
-                    &format!("transmute into `{to_ty_orig}` which has an undefined layout"),
+                    format!("transmute into `{to_ty_orig}` which has an undefined layout"),
                     |diag| {
                         if to_ty_orig.peel_refs() != to_ty {
                             diag.note(format!("the contained type `{to_ty}` has an undefined layout"));
@@ -196,22 +192,22 @@ fn reduce_refs<'tcx>(cx: &LateContext<'tcx>, mut from_ty: Ty<'tcx>, mut to_ty: T
     let (from_fat_ptr, to_fat_ptr) = loop {
         break match (from_ty.kind(), to_ty.kind()) {
             (
-                &(ty::Ref(_, from_sub_ty, _) | ty::RawPtr(TypeAndMut { ty: from_sub_ty, .. })),
-                &(ty::Ref(_, to_sub_ty, _) | ty::RawPtr(TypeAndMut { ty: to_sub_ty, .. })),
+                &(ty::Ref(_, from_sub_ty, _) | ty::RawPtr(from_sub_ty, _)),
+                &(ty::Ref(_, to_sub_ty, _) | ty::RawPtr(to_sub_ty, _)),
             ) => {
-                from_raw_ptr = matches!(*from_ty.kind(), ty::RawPtr(_));
+                from_raw_ptr = matches!(*from_ty.kind(), ty::RawPtr(_, _));
                 from_ty = from_sub_ty;
-                to_raw_ptr = matches!(*to_ty.kind(), ty::RawPtr(_));
+                to_raw_ptr = matches!(*to_ty.kind(), ty::RawPtr(_, _));
                 to_ty = to_sub_ty;
                 continue;
             },
-            (&(ty::Ref(_, unsized_ty, _) | ty::RawPtr(TypeAndMut { ty: unsized_ty, .. })), _)
-                if !unsized_ty.is_sized(cx.tcx, cx.param_env) =>
+            (&(ty::Ref(_, unsized_ty, _) | ty::RawPtr(unsized_ty, _)), _)
+                if !unsized_ty.is_sized(cx.tcx, cx.typing_env()) =>
             {
                 (true, false)
             },
-            (_, &(ty::Ref(_, unsized_ty, _) | ty::RawPtr(TypeAndMut { ty: unsized_ty, .. })))
-                if !unsized_ty.is_sized(cx.tcx, cx.param_env) =>
+            (_, &(ty::Ref(_, unsized_ty, _) | ty::RawPtr(unsized_ty, _)))
+                if !unsized_ty.is_sized(cx.tcx, cx.typing_env()) =>
             {
                 (false, true)
             },
@@ -244,7 +240,7 @@ enum ReducedTy<'tcx> {
 /// Reduce structs containing a single non-zero sized field to it's contained type.
 fn reduce_ty<'tcx>(cx: &LateContext<'tcx>, mut ty: Ty<'tcx>) -> ReducedTy<'tcx> {
     loop {
-        ty = cx.tcx.try_normalize_erasing_regions(cx.param_env, ty).unwrap_or(ty);
+        ty = cx.tcx.try_normalize_erasing_regions(cx.typing_env(), ty).unwrap_or(ty);
         return match *ty.kind() {
             ty::Array(sub_ty, _) if matches!(sub_ty.kind(), ty::Int(_) | ty::Uint(_)) => {
                 ReducedTy::TypeErasure { raw_ptr_only: false }
@@ -278,7 +274,7 @@ fn reduce_ty<'tcx>(cx: &LateContext<'tcx>, mut ty: Ty<'tcx>) -> ReducedTy<'tcx> 
                     ty = sized_ty;
                     continue;
                 }
-                if def.repr().inhibit_struct_field_reordering_opt() {
+                if def.repr().inhibit_struct_field_reordering() {
                     ReducedTy::OrderedFields(Some(sized_ty))
                 } else {
                     ReducedTy::UnorderedFields(ty)
@@ -297,8 +293,8 @@ fn reduce_ty<'tcx>(cx: &LateContext<'tcx>, mut ty: Ty<'tcx>) -> ReducedTy<'tcx> 
 }
 
 fn is_zero_sized_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
-    if let Ok(ty) = cx.tcx.try_normalize_erasing_regions(cx.param_env, ty)
-        && let Ok(layout) = cx.tcx.layout_of(cx.param_env.and(ty))
+    if let Ok(ty) = cx.tcx.try_normalize_erasing_regions(cx.typing_env(), ty)
+        && let Ok(layout) = cx.tcx.layout_of(cx.typing_env().as_query_input(ty))
     {
         layout.layout.size().bytes() == 0
     } else {

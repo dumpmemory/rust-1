@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
-use clippy_utils::macros::{find_format_arg_expr, find_format_args, is_format_macro, root_macro_call_first_node};
+use clippy_utils::macros::{FormatArgsStorage, find_format_arg_expr, is_format_macro, root_macro_call_first_node};
 use clippy_utils::{get_parent_as_impl, is_diag_trait_item, path_to_local, peel_ref_operators};
 use rustc_ast::{FormatArgsPiece, FormatTrait};
 use rustc_errors::Applicability;
@@ -7,7 +7,7 @@ use rustc_hir::{Expr, ExprKind, Impl, ImplItem, ImplItemKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::kw;
-use rustc_span::{sym, Symbol};
+use rustc_span::{Symbol, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -97,15 +97,16 @@ struct FormatTraitNames {
     formatter_name: Option<Symbol>,
 }
 
-#[derive(Default)]
 pub struct FormatImpl {
+    format_args: FormatArgsStorage,
     // Whether we are inside Display or Debug trait impl - None for neither
     format_trait_impl: Option<FormatTraitNames>,
 }
 
 impl FormatImpl {
-    pub fn new() -> Self {
+    pub fn new(format_args: FormatArgsStorage) -> Self {
         Self {
+            format_args,
             format_trait_impl: None,
         }
     }
@@ -129,6 +130,7 @@ impl<'tcx> LateLintPass<'tcx> for FormatImpl {
         if let Some(format_trait_impl) = self.format_trait_impl {
             let linter = FormatImplExpr {
                 cx,
+                format_args: &self.format_args,
                 expr,
                 format_trait_impl,
             };
@@ -141,14 +143,15 @@ impl<'tcx> LateLintPass<'tcx> for FormatImpl {
 
 struct FormatImplExpr<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
+    format_args: &'a FormatArgsStorage,
     expr: &'tcx Expr<'tcx>,
     format_trait_impl: FormatTraitNames,
 }
 
-impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
+impl FormatImplExpr<'_, '_> {
     fn check_to_string_in_display(&self) {
         if self.format_trait_impl.name == sym::Display
-            && let ExprKind::MethodCall(path, self_arg, ..) = self.expr.kind
+            && let ExprKind::MethodCall(path, self_arg, [], _) = self.expr.kind
             // Get the hir_id of the object we are calling the method on
             // Is the method to_string() ?
             && path.ident.name == sym::to_string
@@ -175,7 +178,7 @@ impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
         if let Some(outer_macro) = root_macro_call_first_node(self.cx, self.expr)
             && let macro_def_id = outer_macro.def_id
             && is_format_macro(self.cx, macro_def_id)
-            && let Some(format_args) = find_format_args(self.cx, self.expr, outer_macro.expn)
+            && let Some(format_args) = self.format_args.get(self.cx, self.expr, outer_macro.expn)
         {
             for piece in &format_args.template {
                 if let FormatArgsPiece::Placeholder(placeholder) = piece
@@ -193,7 +196,7 @@ impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
                     && trait_name == self.format_trait_impl.name
                     && let Ok(index) = placeholder.argument.index
                     && let Some(arg) = format_args.arguments.all_args().get(index)
-                    && let Ok(arg_expr) = find_format_arg_expr(self.expr, arg)
+                    && let Some(arg_expr) = find_format_arg_expr(self.expr, arg)
                 {
                     self.check_format_arg_self(arg_expr);
                 }
@@ -214,7 +217,7 @@ impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
                 self.cx,
                 RECURSIVE_FORMAT_IMPL,
                 self.expr.span,
-                &format!("using `self` as `{name}` in `impl {name}` will cause infinite recursion"),
+                format!("using `self` as `{name}` in `impl {name}` will cause infinite recursion"),
             );
         }
     }
@@ -235,7 +238,7 @@ impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
                 self.cx,
                 PRINT_IN_FORMAT_IMPL,
                 macro_call.span,
-                &format!("use of `{name}!` in `{}` impl", self.format_trait_impl.name),
+                format!("use of `{name}!` in `{}` impl", self.format_trait_impl.name),
                 "replace with",
                 if let Some(formatter_name) = self.format_trait_impl.formatter_name {
                     format!("{replacement}!({formatter_name}, ..)")

@@ -5,17 +5,21 @@
 //!
 //! [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
 
-use crate::infer::canonical::{
-    Canonical, CanonicalTyVarKind, CanonicalVarInfo, CanonicalVarKind, OriginalQueryValues,
-};
-use crate::infer::InferCtxt;
-use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
-use rustc_middle::ty::GenericArg;
-use rustc_middle::ty::{self, BoundVar, InferConst, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
-
 use rustc_data_structures::fx::FxHashMap;
 use rustc_index::Idx;
+use rustc_middle::bug;
+use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
+use rustc_middle::ty::{
+    self, BoundVar, GenericArg, InferConst, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt,
+};
 use smallvec::SmallVec;
+use tracing::debug;
+
+use crate::infer::InferCtxt;
+use crate::infer::canonical::{
+    Canonical, CanonicalQueryInput, CanonicalTyVarKind, CanonicalVarInfo, CanonicalVarKind,
+    OriginalQueryValues,
+};
 
 impl<'tcx> InferCtxt<'tcx> {
     /// Canonicalizes a query value `V`. When we canonicalize a query,
@@ -37,18 +41,18 @@ impl<'tcx> InferCtxt<'tcx> {
         &self,
         value: ty::ParamEnvAnd<'tcx, V>,
         query_state: &mut OriginalQueryValues<'tcx>,
-    ) -> Canonical<'tcx, ty::ParamEnvAnd<'tcx, V>>
+    ) -> CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, V>>
     where
         V: TypeFoldable<TyCtxt<'tcx>>,
     {
         let (param_env, value) = value.into_parts();
-        let param_env = self.tcx.canonical_param_env_cache.get_or_insert(
+        let canonical_param_env = self.tcx.canonical_param_env_cache.get_or_insert(
             self.tcx,
             param_env,
             query_state,
             |tcx, param_env, query_state| {
                 // FIXME(#118965): We don't canonicalize the static lifetimes that appear in the
-                // `param_env` beacause they are treated differently by trait selection.
+                // `param_env` because they are treated differently by trait selection.
                 Canonicalizer::canonicalize(
                     param_env,
                     None,
@@ -59,15 +63,16 @@ impl<'tcx> InferCtxt<'tcx> {
             },
         );
 
-        Canonicalizer::canonicalize_with_base(
-            param_env,
+        let canonical = Canonicalizer::canonicalize_with_base(
+            canonical_param_env,
             value,
             Some(self),
             self.tcx,
             &CanonicalizeAllFreeRegions,
             query_state,
         )
-        .unchecked_map(|(param_env, value)| param_env.and(value))
+        .unchecked_map(|(param_env, value)| param_env.and(value));
+        CanonicalQueryInput { canonical, typing_mode: self.typing_mode() }
     }
 
     /// Canonicalizes a query *response* `V`. When we canonicalize a
@@ -301,7 +306,7 @@ struct Canonicalizer<'cx, 'tcx> {
 }
 
 impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Canonicalizer<'cx, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -434,12 +439,14 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Canonicalizer<'cx, 'tcx> {
             | ty::RawPtr(..)
             | ty::Ref(..)
             | ty::FnDef(..)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::Dynamic(..)
+            | ty::UnsafeBinder(_)
             | ty::Never
             | ty::Tuple(..)
             | ty::Alias(..)
             | ty::Foreign(..)
+            | ty::Pat(..)
             | ty::Param(..) => {
                 if t.flags().intersects(self.needs_canonical_flags) {
                     t.super_fold_with(self)
@@ -458,7 +465,7 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Canonicalizer<'cx, 'tcx> {
                 // any equated inference vars correctly!
                 let root_vid = self.infcx.unwrap().root_const_var(vid);
                 if root_vid != vid {
-                    ct = ty::Const::new_var(self.tcx, root_vid, ct.ty());
+                    ct = ty::Const::new_var(self.tcx, root_vid);
                     vid = root_vid;
                 }
 
@@ -477,18 +484,7 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Canonicalizer<'cx, 'tcx> {
                             ui = ty::UniverseIndex::ROOT;
                         }
                         return self.canonicalize_const_var(
-                            CanonicalVarInfo { kind: CanonicalVarKind::Const(ui, ct.ty()) },
-                            ct,
-                        );
-                    }
-                }
-            }
-            ty::ConstKind::Infer(InferConst::EffectVar(vid)) => {
-                match self.infcx.unwrap().probe_effect_var(vid) {
-                    Some(value) => return self.fold_const(value),
-                    None => {
-                        return self.canonicalize_const_var(
-                            CanonicalVarInfo { kind: CanonicalVarKind::Effect },
+                            CanonicalVarInfo { kind: CanonicalVarKind::Const(ui) },
                             ct,
                         );
                     }
@@ -506,9 +502,7 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Canonicalizer<'cx, 'tcx> {
             }
             ty::ConstKind::Placeholder(placeholder) => {
                 return self.canonicalize_const_var(
-                    CanonicalVarInfo {
-                        kind: CanonicalVarKind::PlaceholderConst(placeholder, ct.ty()),
-                    },
+                    CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderConst(placeholder) },
                     ct,
                 );
             }
@@ -696,8 +690,7 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
             .iter()
             .map(|v| CanonicalVarInfo {
                 kind: match v.kind {
-                    CanonicalVarKind::Ty(CanonicalTyVarKind::Int | CanonicalTyVarKind::Float)
-                    | CanonicalVarKind::Effect => {
+                    CanonicalVarKind::Ty(CanonicalTyVarKind::Int | CanonicalTyVarKind::Float) => {
                         return *v;
                     }
                     CanonicalVarKind::Ty(CanonicalTyVarKind::General(u)) => {
@@ -706,9 +699,7 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
                     CanonicalVarKind::Region(u) => {
                         CanonicalVarKind::Region(reverse_universe_map[&u])
                     }
-                    CanonicalVarKind::Const(u, t) => {
-                        CanonicalVarKind::Const(reverse_universe_map[&u], t)
-                    }
+                    CanonicalVarKind::Const(u) => CanonicalVarKind::Const(reverse_universe_map[&u]),
                     CanonicalVarKind::PlaceholderTy(placeholder) => {
                         CanonicalVarKind::PlaceholderTy(ty::Placeholder {
                             universe: reverse_universe_map[&placeholder.universe],
@@ -721,14 +712,11 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
                             ..placeholder
                         })
                     }
-                    CanonicalVarKind::PlaceholderConst(placeholder, t) => {
-                        CanonicalVarKind::PlaceholderConst(
-                            ty::Placeholder {
-                                universe: reverse_universe_map[&placeholder.universe],
-                                ..placeholder
-                            },
-                            t,
-                        )
+                    CanonicalVarKind::PlaceholderConst(placeholder) => {
+                        CanonicalVarKind::PlaceholderConst(ty::Placeholder {
+                            universe: reverse_universe_map[&placeholder.universe],
+                            ..placeholder
+                        })
                     }
                 },
             })
@@ -766,8 +754,8 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx> {
         let var = self.canonical_var(info, r.into());
-        let br = ty::BoundRegion { var, kind: ty::BrAnon };
-        ty::Region::new_bound(self.interner(), self.binder_index, br)
+        let br = ty::BoundRegion { var, kind: ty::BoundRegionKind::Anon };
+        ty::Region::new_bound(self.cx(), self.binder_index, br)
     }
 
     /// Given a type variable `ty_var` of the given kind, first check
@@ -790,9 +778,9 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         const_var: ty::Const<'tcx>,
     ) -> ty::Const<'tcx> {
         debug_assert!(
-            !self.infcx.is_some_and(|infcx| const_var != infcx.shallow_resolve(const_var))
+            !self.infcx.is_some_and(|infcx| const_var != infcx.shallow_resolve_const(const_var))
         );
         let var = self.canonical_var(info, const_var.into());
-        ty::Const::new_bound(self.tcx, self.binder_index, var, self.fold_ty(const_var.ty()))
+        ty::Const::new_bound(self.tcx, self.binder_index, var)
     }
 }

@@ -1,10 +1,11 @@
-use clippy_config::msrvs::{self, Msrv};
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
-use clippy_utils::source::snippet_opt;
+use clippy_utils::msrvs::{self, Msrv};
+use clippy_utils::source::SpanRangeExt;
 use clippy_utils::visitors::{is_local_used, local_used_once};
 use clippy_utils::{is_trait_method, path_to_local_id};
 use rustc_errors::Applicability;
-use rustc_hir::{BindingAnnotation, ExprKind, Local, Node, PatKind, StmtKind};
+use rustc_hir::{BindingMode, ExprKind, LetStmt, Node, PatKind, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::sym;
@@ -51,22 +52,23 @@ pub struct ManualHashOne {
 }
 
 impl ManualHashOne {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
     }
 }
 
 impl_lint_pass!(ManualHashOne => [MANUAL_HASH_ONE]);
 
 impl LateLintPass<'_> for ManualHashOne {
-    fn check_local(&mut self, cx: &LateContext<'_>, local: &Local<'_>) {
+    fn check_local(&mut self, cx: &LateContext<'_>, local: &LetStmt<'_>) {
         // `let mut hasher = seg.build_hasher();`
-        if let PatKind::Binding(BindingAnnotation::MUT, hasher, _, None) = local.pat.kind
+        if let PatKind::Binding(BindingMode::MUT, hasher, _, None) = local.pat.kind
             && let Some(init) = local.init
             && !init.span.from_expansion()
             && let ExprKind::MethodCall(seg, build_hasher, [], _) = init.kind
-            && seg.ident.name == sym!(build_hasher)
+            && seg.ident.name.as_str() == "build_hasher"
 
             && let Node::Stmt(local_stmt) = cx.tcx.parent_hir_node(local.hir_id)
             && let Node::Block(block) = cx.tcx.parent_hir_node(local_stmt.hir_id)
@@ -94,7 +96,7 @@ impl LateLintPass<'_> for ManualHashOne {
             && let Node::Expr(finish_expr) = cx.tcx.parent_hir_node(path_expr.hir_id)
             && !finish_expr.span.from_expansion()
             && let ExprKind::MethodCall(seg, _, [], _) = finish_expr.kind
-            && seg.ident.name == sym!(finish)
+            && seg.ident.name.as_str() == "finish"
 
             && self.msrv.meets(msrvs::BUILD_HASHER_HASH_ONE)
         {
@@ -105,8 +107,8 @@ impl LateLintPass<'_> for ManualHashOne {
                 finish_expr.span,
                 "manual implementation of `BuildHasher::hash_one`",
                 |diag| {
-                    if let Some(build_hasher) = snippet_opt(cx, build_hasher.span)
-                        && let Some(hashed_value) = snippet_opt(cx, hashed_value.span)
+                    if let Some(build_hasher) = build_hasher.span.get_source_text(cx)
+                        && let Some(hashed_value) = hashed_value.span.get_source_text(cx)
                     {
                         diag.multipart_suggestion(
                             "try",

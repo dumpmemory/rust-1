@@ -2,16 +2,16 @@
 
 use hir::{Crate, Module, ModuleDef, Semantics};
 use ide_db::{
-    base_db::{CrateGraph, CrateId, FileId, SourceDatabase},
-    RootDatabase,
+    base_db::{CrateGraph, CrateId, SourceDatabase},
+    FileId, RootDatabase,
 };
 use syntax::TextRange;
 
-use crate::{navigation_target::ToNav, runnables::runnable_fn, Runnable, TryToNav};
+use crate::{runnables::runnable_fn, NavigationTarget, Runnable, TryToNav};
 
 #[derive(Debug)]
 pub enum TestItemKind {
-    Crate,
+    Crate(CrateId),
     Module,
     Function,
 }
@@ -32,15 +32,17 @@ pub(crate) fn discover_test_roots(db: &RootDatabase) -> Vec<TestItem> {
     crate_graph
         .iter()
         .filter(|&id| crate_graph[id].origin.is_local())
-        .filter_map(|id| Some(crate_graph[id].display_name.as_ref()?.to_string()))
-        .map(|id| TestItem {
-            kind: TestItemKind::Crate,
-            label: id.clone(),
-            id,
-            parent: None,
-            file: None,
-            text_range: None,
-            runnable: None,
+        .filter_map(|id| {
+            let test_id = crate_graph[id].display_name.as_ref()?.to_string();
+            Some(TestItem {
+                kind: TestItemKind::Crate(id),
+                label: test_id.clone(),
+                id: test_id,
+                parent: None,
+                file: None,
+                text_range: None,
+                runnable: None,
+            })
         })
         .collect()
 }
@@ -54,17 +56,25 @@ fn find_crate_by_id(crate_graph: &CrateGraph, crate_id: &str) -> Option<CrateId>
     })
 }
 
-fn discover_tests_in_module(db: &RootDatabase, module: Module, prefix_id: String) -> Vec<TestItem> {
+fn discover_tests_in_module(
+    db: &RootDatabase,
+    module: Module,
+    prefix_id: String,
+    only_in_this_file: bool,
+) -> Vec<TestItem> {
     let sema = Semantics::new(db);
 
     let mut r = vec![];
     for c in module.children(db) {
-        let module_name =
-            c.name(db).as_ref().and_then(|n| n.as_str()).unwrap_or("[mod without name]").to_owned();
+        let module_name = c
+            .name(db)
+            .as_ref()
+            .map(|n| n.as_str().to_owned())
+            .unwrap_or_else(|| "[mod without name]".to_owned());
         let module_id = format!("{prefix_id}::{module_name}");
-        let module_children = discover_tests_in_module(db, c, module_id.clone());
+        let module_children = discover_tests_in_module(db, c, module_id.clone(), only_in_this_file);
         if !module_children.is_empty() {
-            let nav = c.to_nav(db).call_site;
+            let nav = NavigationTarget::from_module_to_decl(sema.db, c).call_site;
             r.push(TestItem {
                 id: module_id,
                 kind: TestItemKind::Module,
@@ -74,7 +84,9 @@ fn discover_tests_in_module(db: &RootDatabase, module: Module, prefix_id: String
                 text_range: Some(nav.focus_or_full_range()),
                 runnable: None,
             });
-            r.extend(module_children);
+            if !only_in_this_file || c.is_inline(db) {
+                r.extend(module_children);
+            }
         }
     }
     for def in module.declarations(db) {
@@ -85,7 +97,7 @@ fn discover_tests_in_module(db: &RootDatabase, module: Module, prefix_id: String
             continue;
         }
         let nav = f.try_to_nav(db).map(|r| r.call_site);
-        let fn_name = f.name(db).as_str().unwrap_or("[function without name]").to_owned();
+        let fn_name = f.name(db).as_str().to_owned();
         r.push(TestItem {
             id: format!("{prefix_id}::{fn_name}"),
             kind: TestItemKind::Function,
@@ -110,6 +122,55 @@ pub(crate) fn discover_tests_in_crate_by_test_id(
     discover_tests_in_crate(db, crate_id)
 }
 
+pub(crate) fn discover_tests_in_file(db: &RootDatabase, file_id: FileId) -> Vec<TestItem> {
+    let sema = Semantics::new(db);
+
+    let Some(module) = sema.file_to_module_def(file_id) else { return vec![] };
+    let Some((mut tests, id)) = find_module_id_and_test_parents(&sema, module) else {
+        return vec![];
+    };
+    tests.extend(discover_tests_in_module(db, module, id, true));
+    tests
+}
+
+fn find_module_id_and_test_parents(
+    sema: &Semantics<'_, RootDatabase>,
+    module: Module,
+) -> Option<(Vec<TestItem>, String)> {
+    let Some(parent) = module.parent(sema.db) else {
+        let name = module.krate().display_name(sema.db)?.to_string();
+        return Some((
+            vec![TestItem {
+                id: name.clone(),
+                kind: TestItemKind::Crate(module.krate().into()),
+                label: name.clone(),
+                parent: None,
+                file: None,
+                text_range: None,
+                runnable: None,
+            }],
+            name,
+        ));
+    };
+    let (mut r, mut id) = find_module_id_and_test_parents(sema, parent)?;
+    let parent = Some(id.clone());
+    id += "::";
+    let module_name = &module.name(sema.db);
+    let module_name = module_name.as_ref().map(|n| n.as_str()).unwrap_or("[mod without name]");
+    id += module_name;
+    let nav = NavigationTarget::from_module_to_decl(sema.db, module).call_site;
+    r.push(TestItem {
+        id: id.clone(),
+        kind: TestItemKind::Module,
+        label: module_name.to_owned(),
+        parent,
+        file: Some(nav.file_id),
+        text_range: Some(nav.focus_or_full_range()),
+        runnable: None,
+    });
+    Some((r, id))
+}
+
 pub(crate) fn discover_tests_in_crate(db: &RootDatabase, crate_id: CrateId) -> Vec<TestItem> {
     let crate_graph = db.crate_graph();
     if !crate_graph[crate_id].origin.is_local() {
@@ -118,18 +179,19 @@ pub(crate) fn discover_tests_in_crate(db: &RootDatabase, crate_id: CrateId) -> V
     let Some(crate_test_id) = &crate_graph[crate_id].display_name else {
         return vec![];
     };
+    let kind = TestItemKind::Crate(crate_id);
     let crate_test_id = crate_test_id.to_string();
     let crate_id: Crate = crate_id.into();
     let module = crate_id.root_module();
     let mut r = vec![TestItem {
         id: crate_test_id.clone(),
-        kind: TestItemKind::Crate,
+        kind,
         label: crate_test_id.clone(),
         parent: None,
         file: None,
         text_range: None,
         runnable: None,
     }];
-    r.extend(discover_tests_in_module(db, module, crate_test_id));
+    r.extend(discover_tests_in_module(db, module, crate_test_id, false));
     r
 }

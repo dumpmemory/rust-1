@@ -1,7 +1,6 @@
-use crate::clean::{self, rustc_span, PrimitiveType};
-use crate::html::sources;
+use std::path::{Path, PathBuf};
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::intravisit::{self, Visitor};
@@ -11,7 +10,8 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::{BytePos, ExpnKind, Span};
 
-use std::path::{Path, PathBuf};
+use crate::clean::{self, PrimitiveType, rustc_span};
+use crate::html::sources;
 
 /// This enum allows us to store two different kinds of information:
 ///
@@ -36,7 +36,7 @@ pub(crate) enum LinkFromSrc {
 /// It returns the `krate`, the source code files and the `span` correspondence map.
 ///
 /// Note about the `span` correspondence map: the keys are actually `(lo, hi)` of `span`s. We don't
-/// need the `span` context later on, only their position, so instead of keep a whole `Span`, we
+/// need the `span` context later on, only their position, so instead of keeping a whole `Span`, we
 /// only keep the `lo` and `hi`.
 pub(crate) fn collect_spans_and_sources(
     tcx: TyCtxt<'_>,
@@ -44,10 +44,10 @@ pub(crate) fn collect_spans_and_sources(
     src_root: &Path,
     include_sources: bool,
     generate_link_to_definition: bool,
-) -> (FxHashMap<PathBuf, String>, FxHashMap<Span, LinkFromSrc>) {
-    let mut visitor = SpanMapVisitor { tcx, matches: FxHashMap::default() };
-
+) -> (FxIndexMap<PathBuf, String>, FxHashMap<Span, LinkFromSrc>) {
     if include_sources {
+        let mut visitor = SpanMapVisitor { tcx, matches: FxHashMap::default() };
+
         if generate_link_to_definition {
             tcx.hir().walk_toplevel_module(&mut visitor);
         }
@@ -63,7 +63,7 @@ struct SpanMapVisitor<'tcx> {
     pub(crate) matches: FxHashMap<Span, LinkFromSrc>,
 }
 
-impl<'tcx> SpanMapVisitor<'tcx> {
+impl SpanMapVisitor<'_> {
     /// This function is where we handle `hir::Path` elements and add them into the "span map".
     fn handle_path(&mut self, path: &rustc_hir::Path<'_>) {
         match path.res {
@@ -76,7 +76,22 @@ impl<'tcx> SpanMapVisitor<'tcx> {
                 } else {
                     LinkFromSrc::External(def_id)
                 };
-                self.matches.insert(path.span, link);
+                // In case the path ends with generics, we remove them from the span.
+                let span = path
+                    .segments
+                    .last()
+                    .map(|last| {
+                        // In `use` statements, the included item is not in the path segments.
+                        // However, it doesn't matter because you can't have generics on `use`
+                        // statements.
+                        if path.span.contains(last.ident.span) {
+                            path.span.with_hi(last.ident.span.hi())
+                        } else {
+                            path.span
+                        }
+                    })
+                    .unwrap_or(path.span);
+                self.matches.insert(span, link);
             }
             Res::Local(_) => {
                 if let Some(span) = self.tcx.hir().res_span(path.res) {
@@ -162,9 +177,7 @@ impl<'tcx> SpanMapVisitor<'tcx> {
         // compiled (because of cfg)!
         //
         // See discussion in https://github.com/rust-lang/rust/issues/69426#issuecomment-1019412352
-        let typeck_results = self
-            .tcx
-            .typeck_body(hir.maybe_body_owned_by(body_id).expect("a body which isn't a body"));
+        let typeck_results = self.tcx.typeck_body(hir.body_owned_by(body_id).id());
         // Interestingly enough, for method calls, we need the whole expression whereas for static
         // method/function calls, we need the call expression specifically.
         if let Some(def_id) = typeck_results.type_dependent_def_id(expr_hir_id.unwrap_or(hir_id)) {
@@ -232,7 +245,7 @@ impl<'tcx> Visitor<'tcx> for SpanMapVisitor<'tcx> {
         match item.kind {
             ItemKind::Static(_, _, _)
             | ItemKind::Const(_, _, _)
-            | ItemKind::Fn(_, _, _)
+            | ItemKind::Fn { .. }
             | ItemKind::Macro(_, _)
             | ItemKind::TyAlias(_, _)
             | ItemKind::Enum(_, _)
@@ -245,7 +258,6 @@ impl<'tcx> Visitor<'tcx> for SpanMapVisitor<'tcx> {
             | ItemKind::ExternCrate(_)
             | ItemKind::ForeignMod { .. }
             | ItemKind::GlobalAsm(_)
-            | ItemKind::OpaqueTy(_)
             // We already have "visit_mod" above so no need to check it here.
             | ItemKind::Mod(_) => {}
         }

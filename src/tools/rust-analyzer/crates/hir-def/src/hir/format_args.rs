@@ -1,12 +1,14 @@
 //! Parses `format_args` input.
-use std::mem;
 
+use either::Either;
 use hir_expand::name::Name;
+use intern::Symbol;
 use rustc_parse_format as parse;
+use span::SyntaxContextId;
 use stdx::TupleExt;
 use syntax::{
     ast::{self, IsString},
-    SmolStr, TextRange, TextSize,
+    TextRange,
 };
 
 use crate::hir::ExprId;
@@ -28,11 +30,11 @@ pub struct FormatArguments {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatArgsPiece {
-    Literal(Box<str>),
+    Literal(Symbol),
     Placeholder(FormatPlaceholder),
 }
 
-#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatPlaceholder {
     /// Index into [`FormatArgs::arguments`].
     pub argument: FormatArgPosition,
@@ -44,11 +46,11 @@ pub struct FormatPlaceholder {
     pub format_options: FormatOptions,
 }
 
-#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatArgPosition {
     /// Which argument this position refers to (Ok),
     /// or would've referred to if it existed (Err).
-    pub index: Result<usize, usize>,
+    pub index: Result<usize, Either<usize, Name>>,
     /// What kind of position this is. See [`FormatArgPositionKind`].
     pub kind: FormatArgPositionKind,
     /// The span of the name or number.
@@ -87,7 +89,7 @@ pub enum FormatTrait {
     UpperHex,
 }
 
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct FormatOptions {
     /// The width. E.g. `{:5}` or `{:width$}`.
     pub width: Option<FormatCount>,
@@ -132,7 +134,7 @@ pub enum FormatAlignment {
     Center,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormatCount {
     /// `{:5}` or `{:.5}`
     Literal(usize),
@@ -172,10 +174,17 @@ pub(crate) fn parse(
     fmt_snippet: Option<String>,
     mut args: FormatArgumentsCollector,
     is_direct_literal: bool,
-    mut synth: impl FnMut(Name) -> ExprId,
+    mut synth: impl FnMut(Name, Option<TextRange>) -> ExprId,
     mut record_usage: impl FnMut(Name, Option<TextRange>),
+    call_ctx: SyntaxContextId,
 ) -> FormatArgs {
-    let text = s.text_without_quotes();
+    let Ok(text) = s.value() else {
+        return FormatArgs {
+            template: Default::default(),
+            arguments: args.finish(),
+            orphans: vec![],
+        };
+    };
     let str_style = match s.quote_offsets() {
         Some(offsets) => {
             let raw = usize::from(offsets.quotes.0.len()) - 1;
@@ -184,9 +193,8 @@ pub(crate) fn parse(
         }
         None => None,
     };
-
     let mut parser =
-        parse::Parser::new(text, str_style, fmt_snippet, false, parse::ParseMode::Format);
+        parse::Parser::new(&text, str_style, fmt_snippet, false, parse::ParseMode::Format);
 
     let mut pieces = Vec::new();
     while let Some(piece) = parser.next() {
@@ -209,7 +217,6 @@ pub(crate) fn parse(
     let to_span = |inner_span: parse::InnerSpan| {
         is_source_literal.then(|| {
             TextRange::new(inner_span.start.try_into().unwrap(), inner_span.end.try_into().unwrap())
-                - TextSize::from(str_style.map(|it| it + 1).unwrap_or(0) as u32 + 1)
         })
     };
 
@@ -237,12 +244,12 @@ pub(crate) fn parse(
                     Ok(index)
                 } else {
                     // Doesn't exist as an explicit argument.
-                    invalid_refs.push((index, span, used_as, kind));
-                    Err(index)
+                    invalid_refs.push((Either::Left(index), span, used_as, kind));
+                    Err(Either::Left(index))
                 }
             }
             ArgRef::Name(name, span) => {
-                let name = Name::new_text_dont_use(SmolStr::new(name));
+                let name = Name::new(name, call_ctx);
                 if let Some((index, _)) = args.by_name(&name) {
                     record_usage(name, span);
                     // Name found in `args`, so we resolve it to its index.
@@ -257,14 +264,17 @@ pub(crate) fn parse(
                         // For the moment capturing variables from format strings expanded from macros is
                         // disabled (see RFC #2795)
                         // FIXME: Diagnose
+                        invalid_refs.push((Either::Right(name.clone()), span, used_as, kind));
+                        Err(Either::Right(name))
+                    } else {
+                        record_usage(name.clone(), span);
+                        Ok(args.add(FormatArgument {
+                            kind: FormatArgumentKind::Captured(name.clone()),
+                            // FIXME: This is problematic, we might want to synthesize a dummy
+                            // expression proper and/or desugar these.
+                            expr: synth(name, span),
+                        }))
                     }
-                    record_usage(name.clone(), span);
-                    Ok(args.add(FormatArgument {
-                        kind: FormatArgumentKind::Captured(name.clone()),
-                        // FIXME: This is problematic, we might want to synthesize a dummy
-                        // expression proper and/or desugar these.
-                        expr: synth(name),
-                    }))
                 }
             }
         };
@@ -283,9 +293,8 @@ pub(crate) fn parse(
             parse::Piece::NextArgument(arg) => {
                 let parse::Argument { position, position_span, format } = *arg;
                 if !unfinished_literal.is_empty() {
-                    template.push(FormatArgsPiece::Literal(
-                        mem::take(&mut unfinished_literal).into_boxed_str(),
-                    ));
+                    template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
+                    unfinished_literal.clear();
                 }
 
                 let span = parser.arg_places.get(placeholder_index).and_then(|&s| to_span(s));
@@ -405,7 +414,7 @@ pub(crate) fn parse(
     }
 
     if !unfinished_literal.is_empty() {
-        template.push(FormatArgsPiece::Literal(unfinished_literal.into_boxed_str()));
+        template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
     }
 
     if !invalid_refs.is_empty() {

@@ -1,16 +1,16 @@
 //! Things to wrap other things in file ids.
-use std::iter;
+use std::borrow::Borrow;
 
 use either::Either;
 use span::{
-    AstIdNode, ErasedFileAstId, FileAstId, FileId, FileRange, HirFileId, HirFileIdRepr,
-    MacroFileId, SyntaxContextId,
+    AstIdNode, EditionedFileId, ErasedFileAstId, FileAstId, HirFileId, HirFileIdRepr, MacroFileId,
+    SyntaxContextId,
 };
 use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize};
 
 use crate::{
     db::{self, ExpandDatabase},
-    map_node_range_up, span_for_offset, MacroFileIdExt,
+    map_node_range_up, map_node_range_up_rooted, span_for_offset, MacroFileIdExt,
 };
 
 /// `InFile<T>` stores a value of `T` inside a particular file/syntax tree.
@@ -27,7 +27,36 @@ pub struct InFileWrapper<FileKind, T> {
 }
 pub type InFile<T> = InFileWrapper<HirFileId, T>;
 pub type InMacroFile<T> = InFileWrapper<MacroFileId, T>;
-pub type InRealFile<T> = InFileWrapper<FileId, T>;
+pub type InRealFile<T> = InFileWrapper<EditionedFileId, T>;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct FilePositionWrapper<FileKind> {
+    pub file_id: FileKind,
+    pub offset: TextSize,
+}
+pub type HirFilePosition = FilePositionWrapper<HirFileId>;
+pub type MacroFilePosition = FilePositionWrapper<MacroFileId>;
+pub type FilePosition = FilePositionWrapper<EditionedFileId>;
+
+impl From<FilePositionWrapper<EditionedFileId>> for FilePositionWrapper<span::FileId> {
+    fn from(value: FilePositionWrapper<EditionedFileId>) -> Self {
+        FilePositionWrapper { file_id: value.file_id.into(), offset: value.offset }
+    }
+}
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct FileRangeWrapper<FileKind> {
+    pub file_id: FileKind,
+    pub range: TextRange,
+}
+pub type HirFileRange = FileRangeWrapper<HirFileId>;
+pub type MacroFileRange = FileRangeWrapper<MacroFileId>;
+pub type FileRange = FileRangeWrapper<EditionedFileId>;
+
+impl From<FileRangeWrapper<EditionedFileId>> for FileRangeWrapper<span::FileId> {
+    fn from(value: FileRangeWrapper<EditionedFileId>) -> Self {
+        FileRangeWrapper { file_id: value.file_id.into(), range: value.range }
+    }
+}
 
 /// `AstId` points to an AST node in any file.
 ///
@@ -37,6 +66,9 @@ pub type AstId<N> = crate::InFile<FileAstId<N>>;
 impl<N: AstIdNode> AstId<N> {
     pub fn to_node(&self, db: &dyn ExpandDatabase) -> N {
         self.to_ptr(db).to_node(&db.parse_or_expand(self.file_id))
+    }
+    pub fn to_range(&self, db: &dyn ExpandDatabase) -> TextRange {
+        self.to_ptr(db).text_range()
     }
     pub fn to_in_file_node(&self, db: &dyn ExpandDatabase) -> crate::InFile<N> {
         crate::InFile::new(self.file_id, self.to_ptr(db).to_node(&db.parse_or_expand(self.file_id)))
@@ -49,6 +81,9 @@ impl<N: AstIdNode> AstId<N> {
 pub type ErasedAstId = crate::InFile<ErasedFileAstId>;
 
 impl ErasedAstId {
+    pub fn to_range(&self, db: &dyn ExpandDatabase) -> TextRange {
+        self.to_ptr(db).text_range()
+    }
     pub fn to_ptr(&self, db: &dyn ExpandDatabase) -> SyntaxNodePtr {
         db.ast_id_map(self.file_id).get_erased(self.value)
     }
@@ -71,6 +106,13 @@ impl<FileKind: Copy, T> InFileWrapper<FileKind, T> {
 
     pub fn as_ref(&self) -> InFileWrapper<FileKind, &T> {
         self.with_value(&self.value)
+    }
+
+    pub fn borrow<U>(&self) -> InFileWrapper<FileKind, &U>
+    where
+        T: Borrow<U>,
+    {
+        self.with_value(self.value.borrow())
     }
 }
 
@@ -115,7 +157,7 @@ trait FileIdToSyntax: Copy {
     fn file_syntax(self, db: &dyn db::ExpandDatabase) -> SyntaxNode;
 }
 
-impl FileIdToSyntax for FileId {
+impl FileIdToSyntax for EditionedFileId {
     fn file_syntax(self, db: &dyn db::ExpandDatabase) -> SyntaxNode {
         db.parse(self).syntax_node()
     }
@@ -138,59 +180,82 @@ impl<FileId: FileIdToSyntax, T> InFileWrapper<FileId, T> {
     }
 }
 
+#[allow(private_bounds)]
+impl<FileId: FileIdToSyntax, N: AstNode> InFileWrapper<FileId, AstPtr<N>> {
+    pub fn to_node(&self, db: &dyn ExpandDatabase) -> N {
+        self.value.to_node(&self.file_syntax(db))
+    }
+}
+
 impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, N> {
     pub fn syntax(&self) -> InFileWrapper<FileId, &SyntaxNode> {
         self.with_value(self.value.syntax())
     }
 }
 
-// region:specific impls
+impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, &N> {
+    // unfortunately `syntax` collides with the impl above, because `&_` is fundamental
+    pub fn syntax_ref(&self) -> InFileWrapper<FileId, &SyntaxNode> {
+        self.with_value(self.value.syntax())
+    }
+}
 
-impl InFile<&SyntaxNode> {
-    /// Skips the attributed item that caused the macro invocation we are climbing up
-    pub fn ancestors_with_macros_skip_attr_item(
+// region:specific impls
+impl<SN: Borrow<SyntaxNode>> InRealFile<SN> {
+    pub fn file_range(&self) -> FileRange {
+        FileRange { file_id: self.file_id, range: self.value.borrow().text_range() }
+    }
+}
+
+impl<SN: Borrow<SyntaxNode>> InFile<SN> {
+    pub fn parent_ancestors_with_macros(
         self,
         db: &dyn db::ExpandDatabase,
     ) -> impl Iterator<Item = InFile<SyntaxNode>> + '_ {
         let succ = move |node: &InFile<SyntaxNode>| match node.value.parent() {
             Some(parent) => Some(node.with_value(parent)),
-            None => {
-                let macro_file_id = node.file_id.macro_file()?;
-                let parent_node = macro_file_id.call_node(db);
-                if macro_file_id.is_attr_macro(db) {
-                    // macro call was an attributed item, skip it
-                    // FIXME: does this fail if this is a direct expansion of another macro?
-                    parent_node.map(|node| node.parent()).transpose()
-                } else {
-                    Some(parent_node)
-                }
-            }
+            None => db
+                .lookup_intern_macro_call(node.file_id.macro_file()?.macro_call_id)
+                .to_node_item(db)
+                .syntax()
+                .cloned()
+                .map(|node| node.parent())
+                .transpose(),
         };
-        iter::successors(succ(&self.cloned()), succ)
+        std::iter::successors(succ(&self.borrow().cloned()), succ)
+    }
+
+    pub fn ancestors_with_macros(
+        self,
+        db: &dyn db::ExpandDatabase,
+    ) -> impl Iterator<Item = InFile<SyntaxNode>> + '_ {
+        let succ = move |node: &InFile<SyntaxNode>| match node.value.parent() {
+            Some(parent) => Some(node.with_value(parent)),
+            None => db
+                .lookup_intern_macro_call(node.file_id.macro_file()?.macro_call_id)
+                .to_node_item(db)
+                .syntax()
+                .cloned()
+                .map(|node| node.parent())
+                .transpose(),
+        };
+        std::iter::successors(Some(self.borrow().cloned()), succ)
+    }
+
+    pub fn kind(&self) -> parser::SyntaxKind {
+        self.value.borrow().kind()
+    }
+
+    pub fn text_range(&self) -> TextRange {
+        self.value.borrow().text_range()
     }
 
     /// Falls back to the macro call range if the node cannot be mapped up fully.
     ///
     /// For attributes and derives, this will point back to the attribute only.
     /// For the entire item use [`InFile::original_file_range_full`].
-    pub fn original_file_range(self, db: &dyn db::ExpandDatabase) -> FileRange {
-        match self.file_id.repr() {
-            HirFileIdRepr::FileId(file_id) => FileRange { file_id, range: self.value.text_range() },
-            HirFileIdRepr::MacroFile(mac_file) => {
-                if let Some((res, ctxt)) =
-                    map_node_range_up(db, &db.expansion_span_map(mac_file), self.value.text_range())
-                {
-                    // FIXME: Figure out an API that makes proper use of ctx, this only exists to
-                    // keep pre-token map rewrite behaviour.
-                    if ctxt.is_root() {
-                        return res;
-                    }
-                }
-                // Fall back to whole macro call.
-                let loc = db.lookup_intern_macro_call(mac_file.macro_call_id);
-                loc.kind.original_call_range(db)
-            }
-        }
+    pub fn original_file_range_rooted(self, db: &dyn db::ExpandDatabase) -> FileRange {
+        self.borrow().map(SyntaxNode::text_range).original_node_file_range_rooted(db)
     }
 
     /// Falls back to the macro call range if the node cannot be mapped up fully.
@@ -198,41 +263,10 @@ impl InFile<&SyntaxNode> {
         self,
         db: &dyn db::ExpandDatabase,
     ) -> FileRange {
-        match self.file_id.repr() {
-            HirFileIdRepr::FileId(file_id) => FileRange { file_id, range: self.value.text_range() },
-            HirFileIdRepr::MacroFile(mac_file) => {
-                if let Some((res, ctxt)) =
-                    map_node_range_up(db, &db.expansion_span_map(mac_file), self.value.text_range())
-                {
-                    // FIXME: Figure out an API that makes proper use of ctx, this only exists to
-                    // keep pre-token map rewrite behaviour.
-                    if ctxt.is_root() {
-                        return res;
-                    }
-                }
-                // Fall back to whole macro call.
-                let loc = db.lookup_intern_macro_call(mac_file.macro_call_id);
-                loc.kind.original_call_range_with_body(db)
-            }
-        }
+        self.borrow().map(SyntaxNode::text_range).original_node_file_range_with_macro_call_body(db)
     }
 
-    /// Attempts to map the syntax node back up its macro calls.
-    pub fn original_file_range_opt(
-        self,
-        db: &dyn db::ExpandDatabase,
-    ) -> Option<(FileRange, SyntaxContextId)> {
-        match self.file_id.repr() {
-            HirFileIdRepr::FileId(file_id) => {
-                Some((FileRange { file_id, range: self.value.text_range() }, SyntaxContextId::ROOT))
-            }
-            HirFileIdRepr::MacroFile(mac_file) => {
-                map_node_range_up(db, &db.expansion_span_map(mac_file), self.value.text_range())
-            }
-        }
-    }
-
-    pub fn original_syntax_node(
+    pub fn original_syntax_node_rooted(
         self,
         db: &dyn db::ExpandDatabase,
     ) -> Option<InRealFile<SyntaxNode>> {
@@ -240,28 +274,37 @@ impl InFile<&SyntaxNode> {
         // as we don't have node inputs otherwise and therefore can't find an `N` node in the input
         let file_id = match self.file_id.repr() {
             HirFileIdRepr::FileId(file_id) => {
-                return Some(InRealFile { file_id, value: self.value.clone() })
+                return Some(InRealFile { file_id, value: self.value.borrow().clone() })
             }
-            HirFileIdRepr::MacroFile(m) => m,
+            HirFileIdRepr::MacroFile(m) if m.is_attr_macro(db) => m,
+            _ => return None,
         };
-        if !file_id.is_attr_macro(db) {
-            return None;
-        }
 
-        let (FileRange { file_id, range }, ctx) =
-            map_node_range_up(db, &db.expansion_span_map(file_id), self.value.text_range())?;
+        let FileRange { file_id, range } = map_node_range_up_rooted(
+            db,
+            &db.expansion_span_map(file_id),
+            self.value.borrow().text_range(),
+        )?;
 
-        // FIXME: Figure out an API that makes proper use of ctx, this only exists to
-        // keep pre-token map rewrite behavior.
-        if !ctx.is_root() {
-            return None;
-        }
-
-        let anc = db.parse(file_id).syntax_node().covering_element(range);
-        let kind = self.value.kind();
-        // FIXME: This heuristic is brittle and with the right macro may select completely unrelated nodes?
-        let value = anc.ancestors().find(|it| it.kind() == kind)?;
+        let kind = self.kind();
+        let value = db
+            .parse(file_id)
+            .syntax_node()
+            .covering_element(range)
+            .ancestors()
+            .take_while(|it| it.text_range() == range)
+            .find(|it| it.kind() == kind)?;
         Some(InRealFile::new(file_id, value))
+    }
+}
+
+impl InFile<&SyntaxNode> {
+    /// Attempts to map the syntax node back up its macro calls.
+    pub fn original_file_range_opt(
+        self,
+        db: &dyn db::ExpandDatabase,
+    ) -> Option<(FileRange, SyntaxContextId)> {
+        self.borrow().map(SyntaxNode::text_range).original_node_file_range_opt(db)
     }
 }
 
@@ -355,11 +398,29 @@ impl InFile<TextRange> {
         match self.file_id.repr() {
             HirFileIdRepr::FileId(file_id) => FileRange { file_id, range: self.value },
             HirFileIdRepr::MacroFile(mac_file) => {
-                match map_node_range_up(db, &db.expansion_span_map(mac_file), self.value) {
-                    Some((it, SyntaxContextId::ROOT)) => it,
+                match map_node_range_up_rooted(db, &db.expansion_span_map(mac_file), self.value) {
+                    Some(it) => it,
                     _ => {
                         let loc = db.lookup_intern_macro_call(mac_file.macro_call_id);
                         loc.kind.original_call_range(db)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn original_node_file_range_with_macro_call_body(
+        self,
+        db: &dyn db::ExpandDatabase,
+    ) -> FileRange {
+        match self.file_id.repr() {
+            HirFileIdRepr::FileId(file_id) => FileRange { file_id, range: self.value },
+            HirFileIdRepr::MacroFile(mac_file) => {
+                match map_node_range_up_rooted(db, &db.expansion_span_map(mac_file), self.value) {
+                    Some(it) => it,
+                    _ => {
+                        let loc = db.lookup_intern_macro_call(mac_file.macro_call_id);
+                        loc.kind.original_call_range_with_body(db)
                     }
                 }
             }
@@ -395,21 +456,24 @@ impl<N: AstNode> InFile<N> {
             return None;
         }
 
-        let (FileRange { file_id, range }, ctx) = map_node_range_up(
+        let FileRange { file_id, range } = map_node_range_up_rooted(
             db,
             &db.expansion_span_map(file_id),
             self.value.syntax().text_range(),
         )?;
 
-        // FIXME: Figure out an API that makes proper use of ctx, this only exists to
-        // keep pre-token map rewrite behaviour.
-        if !ctx.is_root() {
-            return None;
-        }
-
         // FIXME: This heuristic is brittle and with the right macro may select completely unrelated nodes?
         let anc = db.parse(file_id).syntax_node().covering_element(range);
         let value = anc.ancestors().find_map(N::cast)?;
         Some(InRealFile::new(file_id, value))
+    }
+}
+
+impl<T> InFile<T> {
+    pub fn into_real_file(self) -> Result<InRealFile<T>, InFile<T>> {
+        match self.file_id.repr() {
+            HirFileIdRepr::FileId(file_id) => Ok(InRealFile { file_id, value: self.value }),
+            HirFileIdRepr::MacroFile(_) => Err(self),
+        }
     }
 }

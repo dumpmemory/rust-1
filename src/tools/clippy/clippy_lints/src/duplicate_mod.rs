@@ -63,7 +63,7 @@ impl_lint_pass!(DuplicateMod => [DUPLICATE_MOD]);
 
 impl EarlyLintPass for DuplicateMod {
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
-        if let ItemKind::Mod(_, ModKind::Loaded(_, Inline::No, mod_spans)) = &item.kind
+        if let ItemKind::Mod(_, ModKind::Loaded(_, Inline::No, mod_spans, _)) = &item.kind
             && let FileName::Real(real) = cx.sess().source_map().span_to_filename(mod_spans.inner_span)
             && let Some(local_path) = real.into_local_path()
             && let Ok(absolute_path) = local_path.canonicalize()
@@ -119,7 +119,7 @@ impl EarlyLintPass for DuplicateMod {
                 cx,
                 DUPLICATE_MOD,
                 multi_span,
-                &format!("file is loaded as a module multiple times: `{}`", local_path.display()),
+                format!("file is loaded as a module multiple times: `{}`", local_path.display()),
                 None,
                 "replace all but one `mod` item with `use` items",
             );

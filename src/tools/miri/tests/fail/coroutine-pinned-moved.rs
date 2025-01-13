@@ -1,12 +1,11 @@
 //@compile-flags: -Zmiri-disable-validation -Zmiri-disable-stacked-borrows
-#![feature(coroutines, coroutine_trait)]
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
 
-use std::{
-    ops::{Coroutine, CoroutineState},
-    pin::Pin,
-};
+use std::ops::{Coroutine, CoroutineState};
+use std::pin::Pin;
 
 fn firstn() -> impl Coroutine<Yield = u64, Return = ()> {
+    #[coroutine]
     static move || {
         let mut num = 0;
         let num = &mut num;

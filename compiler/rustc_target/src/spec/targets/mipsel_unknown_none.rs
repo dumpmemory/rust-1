@@ -4,10 +4,15 @@
 
 use crate::spec::{Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, Target, TargetOptions};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "mipsel-unknown-none".into(),
-        description: None,
+        metadata: crate::spec::TargetMetadata {
+            description: Some("Bare MIPS (LE) softfloat".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 32,
         data_layout: "e-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64".into(),
         arch: "mips".into(),

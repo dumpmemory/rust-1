@@ -1,13 +1,15 @@
 //! Code related to parsing literals.
 
+use std::{ascii, fmt, str};
+
+use rustc_lexer::unescape::{
+    MixedUnit, Mode, byte_from_char, unescape_byte, unescape_char, unescape_mixed, unescape_unicode,
+};
+use rustc_span::{Span, Symbol, kw, sym};
+use tracing::debug;
+
 use crate::ast::{self, LitKind, MetaItemLit, StrStyle};
 use crate::token::{self, Token};
-use rustc_lexer::unescape::{
-    byte_from_char, unescape_byte, unescape_char, unescape_mixed, unescape_unicode, MixedUnit, Mode,
-};
-use rustc_span::symbol::{kw, sym, Symbol};
-use rustc_span::Span;
-use std::{ascii, fmt, str};
 
 // Escapes a string, represented as a symbol. Reuses the original symbol,
 // avoiding interning, if no changes are required.
@@ -276,8 +278,10 @@ fn filtered_float_lit(
         Some(suffix) => LitKind::Float(
             symbol,
             ast::LitFloatType::Suffixed(match suffix {
+                sym::f16 => ast::FloatTy::F16,
                 sym::f32 => ast::FloatTy::F32,
                 sym::f64 => ast::FloatTy::F64,
+                sym::f128 => ast::FloatTy::F128,
                 _ => return Err(LitError::InvalidFloatSuffix(suffix)),
             }),
         ),

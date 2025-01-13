@@ -28,8 +28,8 @@ use std::{
 };
 
 use base_db::{
-    salsa::{self, ParallelDatabase},
-    SourceDatabaseExt, SourceRootId, Upcast,
+    ra_salsa::{self, ParallelDatabase},
+    SourceRootDatabase, SourceRootId, Upcast,
 };
 use fst::{raw::IndexedValue, Automaton, Streamer};
 use hir::{
@@ -99,8 +99,8 @@ impl Query {
     }
 }
 
-#[salsa::query_group(SymbolsDatabaseStorage)]
-pub trait SymbolsDatabase: HirDatabase + SourceDatabaseExt + Upcast<dyn HirDatabase> {
+#[ra_salsa::query_group(SymbolsDatabaseStorage)]
+pub trait SymbolsDatabase: HirDatabase + SourceRootDatabase + Upcast<dyn HirDatabase> {
     /// The symbol index for a given module. These modules should only be in source roots that
     /// are inside local_roots.
     fn module_symbols(&self, module: Module) -> Arc<SymbolIndex>;
@@ -108,23 +108,23 @@ pub trait SymbolsDatabase: HirDatabase + SourceDatabaseExt + Upcast<dyn HirDatab
     /// The symbol index for a given source root within library_roots.
     fn library_symbols(&self, source_root_id: SourceRootId) -> Arc<SymbolIndex>;
 
-    #[salsa::transparent]
+    #[ra_salsa::transparent]
     /// The symbol indices of modules that make up a given crate.
     fn crate_symbols(&self, krate: Crate) -> Box<[Arc<SymbolIndex>]>;
 
     /// The set of "local" (that is, from the current workspace) roots.
     /// Files in local roots are assumed to change frequently.
-    #[salsa::input]
+    #[ra_salsa::input]
     fn local_roots(&self) -> Arc<FxHashSet<SourceRootId>>;
 
     /// The set of roots for crates.io libraries.
     /// Files in libraries are assumed to never change.
-    #[salsa::input]
+    #[ra_salsa::input]
     fn library_roots(&self) -> Arc<FxHashSet<SourceRootId>>;
 }
 
 fn library_symbols(db: &dyn SymbolsDatabase, source_root_id: SourceRootId) -> Arc<SymbolIndex> {
-    let _p = tracing::span!(tracing::Level::INFO, "library_symbols").entered();
+    let _p = tracing::info_span!("library_symbols").entered();
 
     let mut symbol_collector = SymbolCollector::new(db.upcast());
 
@@ -142,26 +142,26 @@ fn library_symbols(db: &dyn SymbolsDatabase, source_root_id: SourceRootId) -> Ar
 }
 
 fn module_symbols(db: &dyn SymbolsDatabase, module: Module) -> Arc<SymbolIndex> {
-    let _p = tracing::span!(tracing::Level::INFO, "module_symbols").entered();
+    let _p = tracing::info_span!("module_symbols").entered();
 
     let symbols = SymbolCollector::collect_module(db.upcast(), module);
     Arc::new(SymbolIndex::new(symbols))
 }
 
 pub fn crate_symbols(db: &dyn SymbolsDatabase, krate: Crate) -> Box<[Arc<SymbolIndex>]> {
-    let _p = tracing::span!(tracing::Level::INFO, "crate_symbols").entered();
+    let _p = tracing::info_span!("crate_symbols").entered();
     krate.modules(db.upcast()).into_iter().map(|module| db.module_symbols(module)).collect()
 }
 
 /// Need to wrap Snapshot to provide `Clone` impl for `map_with`
 struct Snap<DB>(DB);
-impl<DB: ParallelDatabase> Snap<salsa::Snapshot<DB>> {
+impl<DB: ParallelDatabase> Snap<ra_salsa::Snapshot<DB>> {
     fn new(db: &DB) -> Self {
         Self(db.snapshot())
     }
 }
-impl<DB: ParallelDatabase> Clone for Snap<salsa::Snapshot<DB>> {
-    fn clone(&self) -> Snap<salsa::Snapshot<DB>> {
+impl<DB: ParallelDatabase> Clone for Snap<ra_salsa::Snapshot<DB>> {
+    fn clone(&self) -> Snap<ra_salsa::Snapshot<DB>> {
         Snap(self.0.snapshot())
     }
 }
@@ -192,7 +192,8 @@ impl<DB> std::ops::Deref for Snap<DB> {
 // Note that filtering does not currently work in VSCode due to the editor never
 // sending the special symbols to the language server. Instead, you can configure
 // the filtering via the `rust-analyzer.workspace.symbol.search.scope` and
-// `rust-analyzer.workspace.symbol.search.kind` settings.
+// `rust-analyzer.workspace.symbol.search.kind` settings. Symbols prefixed
+// with `__` are hidden from the search results unless configured otherwise.
 //
 // |===
 // | Editor  | Shortcut
@@ -200,7 +201,7 @@ impl<DB> std::ops::Deref for Snap<DB> {
 // | VS Code | kbd:[Ctrl+T]
 // |===
 pub fn world_symbols(db: &RootDatabase, query: Query) -> Vec<FileSymbol> {
-    let _p = tracing::span!(tracing::Level::INFO, "world_symbols", query = ?query.query).entered();
+    let _p = tracing::info_span!("world_symbols", query = ?query.query).entered();
 
     let indices: Vec<_> = if query.libs {
         db.library_roots()
@@ -301,8 +302,8 @@ impl SymbolIndex {
     }
 
     fn range_to_map_value(start: usize, end: usize) -> u64 {
-        debug_assert![start <= (std::u32::MAX as usize)];
-        debug_assert![end <= (std::u32::MAX as usize)];
+        debug_assert![start <= (u32::MAX as usize)];
+        debug_assert![end <= (u32::MAX as usize)];
 
         ((start as u64) << 32) | end as u64
     }
@@ -320,7 +321,7 @@ impl Query {
         indices: &'sym [Arc<SymbolIndex>],
         cb: impl FnMut(&'sym FileSymbol),
     ) {
-        let _p = tracing::span!(tracing::Level::INFO, "symbol_index::Query::search").entered();
+        let _p = tracing::info_span!("symbol_index::Query::search").entered();
         let mut op = fst::map::OpBuilder::new();
         match self.mode {
             SearchMode::Exact => {
@@ -356,6 +357,7 @@ impl Query {
         mut stream: fst::map::Union<'_>,
         mut cb: impl FnMut(&'sym FileSymbol),
     ) {
+        let ignore_underscore_prefixed = !self.query.starts_with("__");
         while let Some((_, indexed_values)) = stream.next() {
             for &IndexedValue { index, value } in indexed_values {
                 let symbol_index = &indices[index];
@@ -372,6 +374,10 @@ impl Query {
                                 | hir::ModuleDef::Trait(..)
                         );
                     if non_type_for_type_only_query || !self.matches_assoc_mode(symbol.is_assoc) {
+                        continue;
+                    }
+                    // Hide symbols that start with `__` unless the query starts with `__`
+                    if ignore_underscore_prefixed && symbol.name.starts_with("__") {
                         continue;
                     }
                     if self.mode.check(&self.query, self.case_sensitive, &symbol.name) {

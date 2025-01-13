@@ -1,12 +1,19 @@
-use crate::pp::Breaks::Inconsistent;
-use crate::pprust::state::expr::FixupContext;
-use crate::pprust::state::{AnnNode, PrintState, State, INDENT_UNIT};
-
 use ast::StaticItem;
 use itertools::{Itertools, Position};
 use rustc_ast as ast;
 use rustc_ast::ModKind;
-use rustc_span::symbol::Ident;
+use rustc_ast::ptr::P;
+use rustc_span::Ident;
+
+use crate::pp::Breaks::Inconsistent;
+use crate::pprust::state::fixup::FixupContext;
+use crate::pprust::state::{AnnNode, INDENT_UNIT, PrintState, State};
+
+enum DelegationKind<'a> {
+    Single,
+    List(&'a [(Ident, Option<Ident>)]),
+    Glob,
+}
 
 fn visibility_qualified(vis: &ast::Visibility, s: &str) -> String {
     format!("{}{}", State::to_string(|s| s.print_visibility(vis)), s)
@@ -30,15 +37,18 @@ impl<'a> State<'a> {
             ast::ForeignItemKind::Fn(box ast::Fn { defaultness, sig, generics, body }) => {
                 self.print_fn_full(sig, ident, generics, vis, *defaultness, body.as_deref(), attrs);
             }
-            ast::ForeignItemKind::Static(ty, mutbl, body) => self.print_item_const(
-                ident,
-                Some(*mutbl),
-                &ast::Generics::default(),
-                ty,
-                body.as_deref(),
-                vis,
-                ast::Defaultness::Final,
-            ),
+            ast::ForeignItemKind::Static(box ast::StaticItem { ty, mutability, expr, safety }) => {
+                self.print_item_const(
+                    ident,
+                    Some(*mutability),
+                    &ast::Generics::default(),
+                    ty,
+                    expr.as_deref(),
+                    vis,
+                    *safety,
+                    ast::Defaultness::Final,
+                )
+            }
             ast::ForeignItemKind::TyAlias(box ast::TyAlias {
                 defaultness,
                 generics,
@@ -74,10 +84,12 @@ impl<'a> State<'a> {
         ty: &ast::Ty,
         body: Option<&ast::Expr>,
         vis: &ast::Visibility,
+        safety: ast::Safety,
         defaultness: ast::Defaultness,
     ) {
         self.head("");
         self.print_visibility(vis);
+        self.print_safety(safety);
         self.print_defaultness(defaultness);
         let leading = match mutbl {
             None => "const",
@@ -162,7 +174,8 @@ impl<'a> State<'a> {
                 self.print_use_tree(tree);
                 self.word(";");
             }
-            ast::ItemKind::Static(box StaticItem { ty, mutability: mutbl, expr: body }) => {
+            ast::ItemKind::Static(box StaticItem { ty, safety, mutability: mutbl, expr: body }) => {
+                self.print_safety(*safety);
                 self.print_item_const(
                     item.ident,
                     Some(*mutbl),
@@ -170,6 +183,7 @@ impl<'a> State<'a> {
                     ty,
                     body.as_deref(),
                     &item.vis,
+                    ast::Safety::Default,
                     ast::Defaultness::Final,
                 );
             }
@@ -181,6 +195,7 @@ impl<'a> State<'a> {
                     ty,
                     expr.as_deref(),
                     &item.vis,
+                    ast::Safety::Default,
                     *defaultness,
                 );
             }
@@ -195,10 +210,10 @@ impl<'a> State<'a> {
                     &item.attrs,
                 );
             }
-            ast::ItemKind::Mod(unsafety, mod_kind) => {
+            ast::ItemKind::Mod(safety, mod_kind) => {
                 self.head(Self::to_string(|s| {
                     s.print_visibility(&item.vis);
-                    s.print_unsafety(*unsafety);
+                    s.print_safety(*safety);
                     s.word("mod");
                 }));
                 self.print_ident(item.ident);
@@ -223,7 +238,7 @@ impl<'a> State<'a> {
             }
             ast::ItemKind::ForeignMod(nmod) => {
                 self.head(Self::to_string(|s| {
-                    s.print_unsafety(nmod.unsafety);
+                    s.print_safety(nmod.safety);
                     s.word("extern");
                 }));
                 if let Some(abi) = nmod.abi {
@@ -236,6 +251,7 @@ impl<'a> State<'a> {
                 self.bclose(item.span, empty);
             }
             ast::ItemKind::GlobalAsm(asm) => {
+                // FIXME: Print `builtin # global_asm` once macro `global_asm` uses `builtin_syntax`.
                 self.head(visibility_qualified(&item.vis, "global_asm!"));
                 self.print_inline_asm(asm);
                 self.word(";");
@@ -271,7 +287,7 @@ impl<'a> State<'a> {
                 self.print_struct(struct_def, generics, item.ident, item.span, true);
             }
             ast::ItemKind::Impl(box ast::Impl {
-                unsafety,
+                safety,
                 polarity,
                 defaultness,
                 constness,
@@ -283,7 +299,7 @@ impl<'a> State<'a> {
                 self.head("");
                 self.print_visibility(&item.vis);
                 self.print_defaultness(*defaultness);
-                self.print_unsafety(*unsafety);
+                self.print_safety(*safety);
                 self.word("impl");
 
                 if generics.params.is_empty() {
@@ -319,7 +335,7 @@ impl<'a> State<'a> {
             }
             ast::ItemKind::Trait(box ast::Trait {
                 is_auto,
-                unsafety,
+                safety,
                 generics,
                 bounds,
                 items,
@@ -327,7 +343,7 @@ impl<'a> State<'a> {
             }) => {
                 self.head("");
                 self.print_visibility(&item.vis);
-                self.print_unsafety(*unsafety);
+                self.print_safety(*safety);
                 self.print_is_auto(*is_auto);
                 self.word_nbsp("trait");
                 self.print_ident(item.ident);
@@ -371,9 +387,22 @@ impl<'a> State<'a> {
                     state.print_visibility(&item.vis)
                 });
             }
-            ast::ItemKind::Delegation(box delegation) => {
-                self.print_delegation(delegation, &item.vis, &item.attrs)
-            }
+            ast::ItemKind::Delegation(deleg) => self.print_delegation(
+                &item.attrs,
+                &item.vis,
+                &deleg.qself,
+                &deleg.path,
+                DelegationKind::Single,
+                &deleg.body,
+            ),
+            ast::ItemKind::DelegationMac(deleg) => self.print_delegation(
+                &item.attrs,
+                &item.vis,
+                &deleg.qself,
+                &deleg.prefix,
+                deleg.suffixes.as_ref().map_or(DelegationKind::Glob, |s| DelegationKind::List(s)),
+                &deleg.body,
+            ),
         }
         self.ann.post(self, AnnNode::Item(item))
     }
@@ -524,6 +553,7 @@ impl<'a> State<'a> {
                     ty,
                     expr.as_deref(),
                     vis,
+                    ast::Safety::Default,
                     *defaultness,
                 );
             }
@@ -550,31 +580,70 @@ impl<'a> State<'a> {
                     self.word(";");
                 }
             }
-            ast::AssocItemKind::Delegation(box delegation) => {
-                self.print_delegation(delegation, vis, &item.attrs)
-            }
+            ast::AssocItemKind::Delegation(deleg) => self.print_delegation(
+                &item.attrs,
+                vis,
+                &deleg.qself,
+                &deleg.path,
+                DelegationKind::Single,
+                &deleg.body,
+            ),
+            ast::AssocItemKind::DelegationMac(deleg) => self.print_delegation(
+                &item.attrs,
+                vis,
+                &deleg.qself,
+                &deleg.prefix,
+                deleg.suffixes.as_ref().map_or(DelegationKind::Glob, |s| DelegationKind::List(s)),
+                &deleg.body,
+            ),
         }
         self.ann.post(self, AnnNode::SubItem(id))
     }
 
-    pub(crate) fn print_delegation(
+    fn print_delegation(
         &mut self,
-        delegation: &ast::Delegation,
-        vis: &ast::Visibility,
         attrs: &[ast::Attribute],
+        vis: &ast::Visibility,
+        qself: &Option<P<ast::QSelf>>,
+        path: &ast::Path,
+        kind: DelegationKind<'_>,
+        body: &Option<P<ast::Block>>,
     ) {
-        if delegation.body.is_some() {
+        if body.is_some() {
             self.head("");
         }
         self.print_visibility(vis);
-        self.word_space("reuse");
+        self.word_nbsp("reuse");
 
-        if let Some(qself) = &delegation.qself {
-            self.print_qpath(&delegation.path, qself, false);
+        if let Some(qself) = qself {
+            self.print_qpath(path, qself, false);
         } else {
-            self.print_path(&delegation.path, false, 0);
+            self.print_path(path, false, 0);
         }
-        if let Some(body) = &delegation.body {
+        match kind {
+            DelegationKind::Single => {}
+            DelegationKind::List(suffixes) => {
+                self.word("::");
+                self.word("{");
+                for (i, (ident, rename)) in suffixes.iter().enumerate() {
+                    self.print_ident(*ident);
+                    if let Some(rename) = rename {
+                        self.nbsp();
+                        self.word_nbsp("as");
+                        self.print_ident(*rename);
+                    }
+                    if i != suffixes.len() - 1 {
+                        self.word_space(",");
+                    }
+                }
+                self.word("}");
+            }
+            DelegationKind::Glob => {
+                self.word("::");
+                self.word("*");
+            }
+        }
+        if let Some(body) = body {
             self.nbsp();
             self.print_block_with_attrs(body, attrs);
         } else {
@@ -657,11 +726,12 @@ impl<'a> State<'a> {
     }
 
     pub fn print_where_predicate(&mut self, predicate: &ast::WherePredicate) {
-        match predicate {
-            ast::WherePredicate::BoundPredicate(where_bound_predicate) => {
+        let ast::WherePredicate { kind, id: _, span: _ } = predicate;
+        match kind {
+            ast::WherePredicateKind::BoundPredicate(where_bound_predicate) => {
                 self.print_where_bound_predicate(where_bound_predicate);
             }
-            ast::WherePredicate::RegionPredicate(ast::WhereRegionPredicate {
+            ast::WherePredicateKind::RegionPredicate(ast::WhereRegionPredicate {
                 lifetime,
                 bounds,
                 ..
@@ -673,7 +743,9 @@ impl<'a> State<'a> {
                     self.print_lifetime_bounds(bounds);
                 }
             }
-            ast::WherePredicate::EqPredicate(ast::WhereEqPredicate { lhs_ty, rhs_ty, .. }) => {
+            ast::WherePredicateKind::EqPredicate(ast::WhereEqPredicate {
+                lhs_ty, rhs_ty, ..
+            }) => {
                 self.print_type(lhs_ty);
                 self.space();
                 self.word_space("=");
@@ -712,15 +784,15 @@ impl<'a> State<'a> {
                 }
                 self.word("*");
             }
-            ast::UseTreeKind::Nested(items) => {
+            ast::UseTreeKind::Nested { items, .. } => {
                 if !tree.prefix.segments.is_empty() {
                     self.print_path(&tree.prefix, false, 0);
                     self.word("::");
                 }
                 if items.is_empty() {
                     self.word("{}");
-                } else if items.len() == 1 {
-                    self.print_use_tree(&items[0].0);
+                } else if let [(item, _)] = items.as_slice() {
+                    self.print_use_tree(item);
                 } else {
                     self.cbox(INDENT_UNIT);
                     self.word("{");
@@ -731,7 +803,7 @@ impl<'a> State<'a> {
                         self.print_use_tree(&use_tree.0);
                         if !is_last {
                             self.word(",");
-                            if let ast::UseTreeKind::Nested(_) = use_tree.0.kind {
+                            if let ast::UseTreeKind::Nested { .. } = use_tree.0.kind {
                                 self.hardbreak();
                             } else {
                                 self.space();

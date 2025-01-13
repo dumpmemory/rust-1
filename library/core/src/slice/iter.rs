@@ -3,8 +3,7 @@
 #[macro_use] // import iterator! and forward_iterator!
 mod macros;
 
-use crate::cmp;
-use crate::fmt;
+use super::{from_raw_parts, from_raw_parts_mut};
 use crate::hint::assert_unchecked;
 use crate::iter::{
     FusedIterator, TrustedLen, TrustedRandomAccess, TrustedRandomAccessNoCoerce, UncheckedIterator,
@@ -12,9 +11,11 @@ use crate::iter::{
 use crate::marker::PhantomData;
 use crate::mem::{self, SizedTypeProperties};
 use crate::num::NonZero;
-use crate::ptr::{self, without_provenance, without_provenance_mut, NonNull};
+use crate::ptr::{NonNull, without_provenance, without_provenance_mut};
+use crate::{cmp, fmt};
 
-use super::{from_raw_parts, from_raw_parts_mut};
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<T> !Iterator for [T] {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> IntoIterator for &'a [T] {
@@ -45,11 +46,17 @@ impl<'a, T> IntoIterator for &'a mut [T] {
 /// Basic usage:
 ///
 /// ```
-/// // First, we declare a type which has `iter` method to get the `Iter` struct (`&[usize]` here):
+/// // First, we need a slice to call the `iter` method on:
 /// let slice = &[1, 2, 3];
 ///
-/// // Then, we iterate over it:
+/// // Then we call `iter` on the slice to get the `Iter` iterator,
+/// // and iterate over it:
 /// for element in slice.iter() {
+///     println!("{element}");
+/// }
+///
+/// // This for loop actually already works without calling `iter`:
+/// for element in slice {
 ///     println!("{element}");
 /// }
 /// ```
@@ -67,7 +74,7 @@ pub struct Iter<'a, T: 'a> {
     ptr: NonNull<T>,
     /// For non-ZSTs, the non-null pointer to the past-the-end element.
     ///
-    /// For ZSTs, this is `ptr::dangling(len)`.
+    /// For ZSTs, this is `ptr::without_provenance_mut(len)`.
     end_or_len: *const T,
     _marker: PhantomData<&'a T>,
 }
@@ -100,27 +107,29 @@ impl<'a, T> Iter<'a, T> {
 
     /// Views the underlying data as a subslice of the original data.
     ///
-    /// This has the same lifetime as the original slice, and so the
-    /// iterator can continue to be used while this exists.
-    ///
     /// # Examples
     ///
     /// Basic usage:
     ///
     /// ```
-    /// // First, we declare a type which has the `iter` method to get the `Iter`
-    /// // struct (`&[usize]` here):
+    /// // First, we need a slice to call the `iter` method on:
     /// let slice = &[1, 2, 3];
     ///
-    /// // Then, we get the iterator:
+    /// // Then we call `iter` on the slice to get the `Iter` iterator:
     /// let mut iter = slice.iter();
-    /// // So if we print what `as_slice` method returns here, we have "[1, 2, 3]":
+    /// // Here `as_slice` still returns the whole slice, so this prints "[1, 2, 3]":
     /// println!("{:?}", iter.as_slice());
     ///
-    /// // Next, we move to the second element of the slice:
+    /// // Now, we call the `next` method to remove the first element from the iterator:
     /// iter.next();
-    /// // Now `as_slice` returns "[2, 3]":
+    /// // Here the iterator does not contain the first element of the slice any more,
+    /// // so `as_slice` only returns the last two elements of the slice,
+    /// // and so this prints "[2, 3]":
     /// println!("{:?}", iter.as_slice());
+    ///
+    /// // The underlying slice has not been modified and still contains three elements,
+    /// // so this prints "[1, 2, 3]":
+    /// println!("{:?}", slice);
     /// ```
     #[must_use]
     #[stable(feature = "iter_to_slice", since = "1.4.0")]
@@ -165,11 +174,11 @@ impl<T> AsRef<[T]> for Iter<'_, T> {
 /// Basic usage:
 ///
 /// ```
-/// // First, we declare a type which has `iter_mut` method to get the `IterMut`
-/// // struct (`&[usize]` here):
-/// let mut slice = &mut [1, 2, 3];
+/// // First, we need a slice to call the `iter_mut` method on:
+/// let slice = &mut [1, 2, 3];
 ///
-/// // Then, we iterate over it and increment each element value:
+/// // Then we call `iter_mut` on the slice to get the `IterMut` iterator,
+/// // iterate over it and increment each element value:
 /// for element in slice.iter_mut() {
 ///     *element += 1;
 /// }
@@ -246,28 +255,21 @@ impl<'a, T> IterMut<'a, T> {
     /// Basic usage:
     ///
     /// ```
-    /// // First, we declare a type which has `iter_mut` method to get the `IterMut`
-    /// // struct (`&[usize]` here):
+    /// // First, we need a slice to call the `iter_mut` method on:
     /// let mut slice = &mut [1, 2, 3];
     ///
-    /// {
-    ///     // Then, we get the iterator:
-    ///     let mut iter = slice.iter_mut();
-    ///     // We move to next element:
-    ///     iter.next();
-    ///     // So if we print what `into_slice` method returns here, we have "[2, 3]":
-    ///     println!("{:?}", iter.into_slice());
-    /// }
-    ///
-    /// // Now let's modify a value of the slice:
-    /// {
-    ///     // First we get back the iterator:
-    ///     let mut iter = slice.iter_mut();
-    ///     // We change the value of the first element of the slice returned by the `next` method:
-    ///     *iter.next().unwrap() += 1;
-    /// }
-    /// // Now slice is "[2, 2, 3]":
-    /// println!("{slice:?}");
+    /// // Then we call `iter_mut` on the slice to get the `IterMut` struct:
+    /// let mut iter = slice.iter_mut();
+    /// // Now, we call the `next` method to remove the first element of the iterator,
+    /// // unwrap and dereference what we get from `next` and increase its value by 1:
+    /// *iter.next().unwrap() += 1;
+    /// // Here the iterator does not contain the first element of the slice any more,
+    /// // so `into_slice` only returns the last two elements of the slice,
+    /// // and so this prints "[2, 3]":
+    /// println!("{:?}", iter.into_slice());
+    /// // The underlying slice still contains three elements, but its first element
+    /// // was increased by 1, so this prints "[2, 2, 3]":
+    /// println!("{:?}", slice);
     /// ```
     #[must_use = "`self` will be dropped if the result is not used"]
     #[stable(feature = "iter_to_slice", since = "1.4.0")]
@@ -280,25 +282,30 @@ impl<'a, T> IterMut<'a, T> {
 
     /// Views the underlying data as a subslice of the original data.
     ///
-    /// To avoid creating `&mut [T]` references that alias, the returned slice
-    /// borrows its lifetime from the iterator the method is applied on.
-    ///
     /// # Examples
     ///
     /// Basic usage:
     ///
     /// ```
-    /// let mut slice: &mut [usize] = &mut [1, 2, 3];
+    /// // First, we need a slice to call the `iter_mut` method on:
+    /// let slice = &mut [1, 2, 3];
     ///
-    /// // First, we get the iterator:
+    /// // Then we call `iter_mut` on the slice to get the `IterMut` iterator:
     /// let mut iter = slice.iter_mut();
-    /// // So if we check what the `as_slice` method returns here, we have "[1, 2, 3]":
-    /// assert_eq!(iter.as_slice(), &[1, 2, 3]);
+    /// // Here `as_slice` still returns the whole slice, so this prints "[1, 2, 3]":
+    /// println!("{:?}", iter.as_slice());
     ///
-    /// // Next, we move to the second element of the slice:
-    /// iter.next();
-    /// // Now `as_slice` returns "[2, 3]":
-    /// assert_eq!(iter.as_slice(), &[2, 3]);
+    /// // Now, we call the `next` method to remove the first element from the iterator
+    /// // and increment its value:
+    /// *iter.next().unwrap() += 1;
+    /// // Here the iterator does not contain the first element of the slice any more,
+    /// // so `as_slice` only returns the last two elements of the slice,
+    /// // and so this prints "[2, 3]":
+    /// println!("{:?}", iter.as_slice());
+    ///
+    /// // The underlying slice still contains three elements, but its first element
+    /// // was increased by 1, so this prints "[2, 2, 3]":
+    /// println!("{:?}", slice);
     /// ```
     #[must_use]
     #[stable(feature = "slice_iter_mut_as_slice", since = "1.53.0")]
@@ -308,9 +315,6 @@ impl<'a, T> IterMut<'a, T> {
     }
 
     /// Views the underlying data as a mutable subslice of the original data.
-    ///
-    /// To avoid creating `&mut [T]` references that alias, the returned slice
-    /// borrows its lifetime from the iterator the method is applied on.
     ///
     /// # Examples
     ///
@@ -385,6 +389,9 @@ pub(super) trait SplitIter: DoubleEndedIterator {
 /// ```
 /// let slice = [10, 40, 33, 20];
 /// let mut iter = slice.split(|num| num % 3 == 0);
+/// assert_eq!(iter.next(), Some(&[10, 40][..]));
+/// assert_eq!(iter.next(), Some(&[20][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`split`]: slice::split
@@ -538,6 +545,9 @@ impl<T, P> FusedIterator for Split<'_, T, P> where P: FnMut(&T) -> bool {}
 /// ```
 /// let slice = [10, 40, 33, 20];
 /// let mut iter = slice.split_inclusive(|num| num % 3 == 0);
+/// assert_eq!(iter.next(), Some(&[10, 40, 33][..]));
+/// assert_eq!(iter.next(), Some(&[20][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`split_inclusive`]: slice::split_inclusive
@@ -911,7 +921,10 @@ impl<T, P> FusedIterator for SplitInclusiveMut<'_, T, P> where P: FnMut(&T) -> b
 ///
 /// ```
 /// let slice = [11, 22, 33, 0, 44, 55];
-/// let iter = slice.rsplit(|num| *num == 0);
+/// let mut iter = slice.rsplit(|num| *num == 0);
+/// assert_eq!(iter.next(), Some(&[44, 55][..]));
+/// assert_eq!(iter.next(), Some(&[11, 22, 33][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`rsplit`]: slice::rsplit
@@ -1131,7 +1144,10 @@ impl<T, I: SplitIter<Item = T>> Iterator for GenericSplitN<I> {
 ///
 /// ```
 /// let slice = [10, 40, 30, 20, 60, 50];
-/// let iter = slice.splitn(2, |num| *num % 3 == 0);
+/// let mut iter = slice.splitn(2, |num| *num % 3 == 0);
+/// assert_eq!(iter.next(), Some(&[10, 40][..]));
+/// assert_eq!(iter.next(), Some(&[20, 60, 50][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`splitn`]: slice::splitn
@@ -1172,7 +1188,10 @@ where
 ///
 /// ```
 /// let slice = [10, 40, 30, 20, 60, 50];
-/// let iter = slice.rsplitn(2, |num| *num % 3 == 0);
+/// let mut iter = slice.rsplitn(2, |num| *num % 3 == 0);
+/// assert_eq!(iter.next(), Some(&[50][..]));
+/// assert_eq!(iter.next(), Some(&[10, 40, 30, 20][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`rsplitn`]: slice::rsplitn
@@ -1297,7 +1316,11 @@ forward_iterator! { RSplitNMut: T, &'a mut [T] }
 ///
 /// ```
 /// let slice = ['r', 'u', 's', 't'];
-/// let iter = slice.windows(2);
+/// let mut iter = slice.windows(2);
+/// assert_eq!(iter.next(), Some(&['r', 'u'][..]));
+/// assert_eq!(iter.next(), Some(&['u', 's'][..]));
+/// assert_eq!(iter.next(), Some(&['s', 't'][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`windows`]: slice::windows
@@ -1445,7 +1468,11 @@ unsafe impl<'a, T> TrustedRandomAccessNoCoerce for Windows<'a, T> {
 ///
 /// ```
 /// let slice = ['l', 'o', 'r', 'e', 'm'];
-/// let iter = slice.chunks(2);
+/// let mut iter = slice.chunks(2);
+/// assert_eq!(iter.next(), Some(&['l', 'o'][..]));
+/// assert_eq!(iter.next(), Some(&['r', 'e'][..]));
+/// assert_eq!(iter.next(), Some(&['m'][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`chunks`]: slice::chunks
@@ -1816,7 +1843,10 @@ unsafe impl<T> Sync for ChunksMut<'_, T> where T: Sync {}
 ///
 /// ```
 /// let slice = ['l', 'o', 'r', 'e', 'm'];
-/// let iter = slice.chunks_exact(2);
+/// let mut iter = slice.chunks_exact(2);
+/// assert_eq!(iter.next(), Some(&['l', 'o'][..]));
+/// assert_eq!(iter.next(), Some(&['r', 'e'][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`chunks_exact`]: slice::chunks_exact
@@ -2160,7 +2190,11 @@ unsafe impl<T> Sync for ChunksExactMut<'_, T> where T: Sync {}
 /// #![feature(array_windows)]
 ///
 /// let slice = [0, 1, 2, 3];
-/// let iter = slice.array_windows::<2>();
+/// let mut iter = slice.array_windows::<2>();
+/// assert_eq!(iter.next(), Some(&[0, 1]));
+/// assert_eq!(iter.next(), Some(&[1, 2]));
+/// assert_eq!(iter.next(), Some(&[2, 3]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`array_windows`]: slice::array_windows
@@ -2282,7 +2316,10 @@ impl<T, const N: usize> ExactSizeIterator for ArrayWindows<'_, T, N> {
 /// #![feature(array_chunks)]
 ///
 /// let slice = ['l', 'o', 'r', 'e', 'm'];
-/// let iter = slice.array_chunks::<2>();
+/// let mut iter = slice.array_chunks::<2>();
+/// assert_eq!(iter.next(), Some(&['l', 'o']));
+/// assert_eq!(iter.next(), Some(&['r', 'e']));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`array_chunks`]: slice::array_chunks
@@ -2523,7 +2560,11 @@ unsafe impl<'a, T, const N: usize> TrustedRandomAccessNoCoerce for ArrayChunksMu
 ///
 /// ```
 /// let slice = ['l', 'o', 'r', 'e', 'm'];
-/// let iter = slice.rchunks(2);
+/// let mut iter = slice.rchunks(2);
+/// assert_eq!(iter.next(), Some(&['e', 'm'][..]));
+/// assert_eq!(iter.next(), Some(&['o', 'r'][..]));
+/// assert_eq!(iter.next(), Some(&['l'][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`rchunks`]: slice::rchunks
@@ -2889,7 +2930,10 @@ unsafe impl<T> Sync for RChunksMut<'_, T> where T: Sync {}
 ///
 /// ```
 /// let slice = ['l', 'o', 'r', 'e', 'm'];
-/// let iter = slice.rchunks_exact(2);
+/// let mut iter = slice.rchunks_exact(2);
+/// assert_eq!(iter.next(), Some(&['e', 'm'][..]));
+/// assert_eq!(iter.next(), Some(&['o', 'r'][..]));
+/// assert_eq!(iter.next(), None);
 /// ```
 ///
 /// [`rchunks_exact`]: slice::rchunks_exact

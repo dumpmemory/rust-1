@@ -1,5 +1,6 @@
 // Checks that certain traits for which we don't want to suggest borrowing
 // are blacklisted and don't cause the suggestion to be issued.
+//@compile-flags: --diagnostic-width=300
 
 #![feature(coroutines)]
 
@@ -14,7 +15,7 @@ struct S;
 fn main() {
     f_copy("".to_string()); //~ ERROR: the trait bound `String: Copy` is not satisfied [E0277]
     f_clone(S); //~ ERROR: the trait bound `S: Clone` is not satisfied [E0277]
-    f_unpin(static || { yield; });
+    f_unpin(#[coroutine] static || { yield; });
     //~^ ERROR: cannot be unpinned [E0277]
 
     let cl = || ();

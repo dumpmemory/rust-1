@@ -6,7 +6,7 @@
 // used to modify `x.1` - if it did not, then it might incorrectly assume that it
 // can infer the value of `x.1` at the end of this function.
 
-//@ unit-test: DataflowConstProp
+//@ test-mir-pass: DataflowConstProp
 
 // EMIT_MIR sibling_ptr.main.DataflowConstProp.diff
 
@@ -20,6 +20,6 @@ fn main() {
         *p.add(1) = 1;
     }
 
-    // CHECK: [[x1]] = ({{_.*}}.1: u8);
+    // CHECK: [[x1]] = copy ({{_.*}}.1: u8);
     let x1 = x.1; // should not be propagated
 }

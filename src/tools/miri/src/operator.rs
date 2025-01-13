@@ -1,28 +1,29 @@
 use std::iter;
 
-use rand::{seq::IteratorRandom, Rng};
+use rand::Rng;
+use rand::seq::IteratorRandom;
+use rustc_abi::Size;
 use rustc_apfloat::{Float, FloatConvert};
 use rustc_middle::mir;
-use rustc_target::abi::Size;
 
 use crate::*;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn binary_ptr_op(
         &self,
         bin_op: mir::BinOp,
-        left: &ImmTy<'tcx, Provenance>,
-        right: &ImmTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, (ImmTy<'tcx, Provenance>, bool)> {
+        left: &ImmTy<'tcx>,
+        right: &ImmTy<'tcx>,
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         use rustc_middle::mir::BinOp::*;
 
         let this = self.eval_context_ref();
         trace!("ptr_op: {:?} {:?} {:?}", *left, bin_op, *right);
 
-        Ok(match bin_op {
+        interp_ok(match bin_op {
             Eq | Ne | Lt | Le | Gt | Ge => {
-                assert_eq!(left.layout.abi, right.layout.abi); // types can differ, e.g. fn ptrs with different `for`
+                assert_eq!(left.layout.backend_repr, right.layout.backend_repr); // types can differ, e.g. fn ptrs with different `for`
                 let size = this.pointer_size();
                 // Just compare the bits. ScalarPairs are compared lexicographically.
                 // We thus always compare pairs and simply fill scalars up with 0.
@@ -45,7 +46,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     Ge => left >= right,
                     _ => bug!(),
                 };
-                (ImmTy::from_bool(res, *this.tcx), false)
+                ImmTy::from_bool(res, *this.tcx)
             }
 
             // Some more operations are possible with atomics.
@@ -60,16 +61,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     right.to_scalar().to_target_usize(this)?,
                     this.machine.layouts.usize,
                 );
-                let (result, overflowing) = this.overflowing_binary_op(bin_op, &left, &right)?;
+                let result = this.binary_op(bin_op, &left, &right)?;
                 // Construct a new pointer with the provenance of `ptr` (the LHS).
                 let result_ptr = Pointer::new(
                     ptr.provenance,
                     Size::from_bytes(result.to_scalar().to_target_usize(this)?),
                 );
-                (
-                    ImmTy::from_scalar(Scalar::from_maybe_pointer(result_ptr, this), left.layout),
-                    overflowing,
-                )
+
+                ImmTy::from_scalar(Scalar::from_maybe_pointer(result_ptr, this), left.layout)
             }
 
             _ => span_bug!(this.cur_span(), "Invalid operator on pointers: {:?}", bin_op),
@@ -115,9 +114,5 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else {
             nan
         }
-    }
-
-    fn adjust_nan<F1: Float + FloatConvert<F2>, F2: Float>(&self, f: F2, inputs: &[F1]) -> F2 {
-        if f.is_nan() { self.generate_nan(inputs) } else { f }
     }
 }

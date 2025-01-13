@@ -1,4 +1,3 @@
-#![feature(lint_reasons)]
 #![allow(
     unused,
     clippy::many_single_char_names,
@@ -282,7 +281,7 @@ mod issue_9218 {
         todo!()
     }
 
-    // These two's return types don't use use 'a so it's not okay
+    // These two's return types don't use 'a so it's not okay
     fn cow_bad_ret_ty_1<'a>(input: &'a Cow<'a, str>) -> &'static str {
         //~^ ERROR: using a reference to `Cow` is not recommended
         todo!()
@@ -308,5 +307,27 @@ mod issue_11181 {
 
     trait T {
         extern "C" fn allowed(_v: &Vec<u32>) {}
+    }
+}
+
+mod issue_13308 {
+    use std::ops::Deref;
+
+    fn repro(source: &str, destination: &mut String) {
+        source.clone_into(destination);
+    }
+    fn repro2(source: &str, destination: &mut String) {
+        ToOwned::clone_into(source, destination);
+    }
+
+    fn h1(_: &<String as Deref>::Target) {}
+    fn h2<T: Deref>(_: T, _: &T::Target) {}
+
+    // Other cases that are still ok to lint and ideally shouldn't regress
+    fn good(v1: &String, v2: &String) {
+        //~^ ERROR: writing `&String` instead of `&str`
+        //~^^ ERROR: writing `&String` instead of `&str`
+        h1(v1);
+        h2(String::new(), v2);
     }
 }

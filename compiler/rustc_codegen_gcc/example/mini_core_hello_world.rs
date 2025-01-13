@@ -99,9 +99,7 @@ fn start<T: Termination + 'static>(
 
 static mut NUM: u8 = 6 * 7;
 
-// FIXME: Use `SyncUnsafeCell` instead of allowing `static_mut_refs` lint
-#[allow(static_mut_refs)]
-static NUM_REF: &'static u8 = unsafe { &NUM };
+static NUM_REF: &'static u8 = unsafe { &* &raw const NUM };
 
 macro_rules! assert {
     ($e:expr) => {
@@ -432,6 +430,7 @@ pub enum E2<X> {
     V4,
 }
 
+#[allow(unreachable_patterns)]
 fn check_niche_behavior () {
     if let E1::V2 { .. } = (E1::V1 { f: true }) {
         intrinsics::abort();

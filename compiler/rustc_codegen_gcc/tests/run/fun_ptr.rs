@@ -28,6 +28,7 @@ impl Copy for i32 {}
 impl Copy for u8 {}
 impl Copy for i8 {}
 impl Copy for i16 {}
+impl<T: ?Sized> Copy for *mut T {}
 
 #[lang = "receiver"]
 trait Receiver {
@@ -102,9 +103,11 @@ fn panic_bounds_check(index: usize, len: usize) -> ! {
 }
 
 mod intrinsics {
-    extern "rust-intrinsic" {
-        #[rustc_safe_intrinsic]
-        pub fn abort() -> !;
+    #[rustc_nounwind]
+    #[rustc_intrinsic]
+    #[rustc_intrinsic_must_be_overridden]
+    pub fn abort() -> ! {
+        loop {}
     }
 }
 

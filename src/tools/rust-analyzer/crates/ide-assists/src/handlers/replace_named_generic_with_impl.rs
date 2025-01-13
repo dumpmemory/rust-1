@@ -1,9 +1,9 @@
-use hir::Semantics;
+use hir::{FileRange, Semantics};
+use ide_db::text_edit::TextRange;
 use ide_db::{
-    base_db::{FileId, FileRange},
     defs::Definition,
     search::{SearchScope, UsageSearchResult},
-    RootDatabase,
+    EditionedFileId, RootDatabase,
 };
 use syntax::{
     ast::{
@@ -12,7 +12,6 @@ use syntax::{
     },
     match_ast, ted, AstNode,
 };
-use text_edit::TextRange;
 
 use crate::{AssistContext, AssistId, AssistKind, Assists};
 
@@ -157,7 +156,7 @@ fn find_usages(
     sema: &Semantics<'_, RootDatabase>,
     fn_: &ast::Fn,
     type_param_def: Definition,
-    file_id: FileId,
+    file_id: EditionedFileId,
 ) -> UsageSearchResult {
     let file_range = FileRange { file_id, range: fn_.syntax().text_range() };
     type_param_def.usages(sema).in_scope(&SearchScope::file_range(file_range)).all()

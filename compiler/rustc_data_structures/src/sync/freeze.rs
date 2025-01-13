@@ -1,14 +1,11 @@
-use crate::sync::{AtomicBool, ReadGuard, RwLock, WriteGuard};
-#[cfg(parallel_compiler)]
-use crate::sync::{DynSend, DynSync};
-use std::{
-    cell::UnsafeCell,
-    intrinsics::likely,
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-    ptr::NonNull,
-    sync::atomic::Ordering,
-};
+use std::cell::UnsafeCell;
+use std::intrinsics::likely;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
+
+use crate::sync::{AtomicBool, DynSend, DynSync, ReadGuard, RwLock, WriteGuard};
 
 /// A type which allows mutation using a lock until
 /// the value is frozen and can be accessed lock-free.
@@ -23,7 +20,6 @@ pub struct FreezeLock<T> {
     lock: RwLock<()>,
 }
 
-#[cfg(parallel_compiler)]
 unsafe impl<T: DynSync + DynSend> DynSync for FreezeLock<T> {}
 
 impl<T> FreezeLock<T> {

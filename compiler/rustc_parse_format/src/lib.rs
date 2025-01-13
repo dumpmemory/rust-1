@@ -4,24 +4,25 @@
 //! Parsing does not happen at runtime: structures of `std::fmt::rt` are
 //! generated instead.
 
+// tidy-alphabetical-start
+// We want to be able to build this crate with a stable compiler,
+// so no `#![feature]` attributes should be added.
+#![deny(unstable_features)]
 #![doc(
     html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     html_playground_url = "https://play.rust-lang.org/",
     test(attr(deny(warnings)))
 )]
-// We want to be able to build this crate with a stable compiler,
-// so no `#![feature]` attributes should be added.
-#![deny(unstable_features)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
-use rustc_lexer::unescape;
+use std::{iter, str, string};
+
 pub use Alignment::*;
 pub use Count::*;
 pub use Piece::*;
 pub use Position::*;
-
-use std::iter;
-use std::str;
-use std::string;
+use rustc_lexer::unescape;
 
 // Note: copied from rustc_span
 /// Range inside of a `Span` used for diagnostics when we only have access to relative positions.
@@ -220,6 +221,11 @@ pub enum Suggestion {
     /// Remove `r#` from identifier:
     /// `format!("{r#foo}")` -> `format!("{foo}")`
     RemoveRawIdent(InnerSpan),
+    /// Reorder format parameter:
+    /// `format!("{foo:?#}")` -> `format!("{foo:#?}")`
+    /// `format!("{foo:?x}")` -> `format!("{foo:x?}")`
+    /// `format!("{foo:?X}")` -> `format!("{foo:X?}")`
+    ReorderFormatParameter(InnerSpan, string::String),
 }
 
 /// The parser structure for interpreting the input format string. This is
@@ -286,13 +292,11 @@ impl<'a> Iterator for Parser<'a> {
                                     lbrace_byte_pos.to(InnerOffset(rbrace_byte_pos.0 + width)),
                                 );
                             }
-                        } else {
-                            if let Some(&(_, maybe)) = self.cur.peek() {
-                                match maybe {
-                                    '?' => self.suggest_format_debug(),
-                                    '<' | '^' | '>' => self.suggest_format_align(maybe),
-                                    _ => self.suggest_positional_arg_instead_of_captured_arg(arg),
-                                }
+                        } else if let Some(&(_, maybe)) = self.cur.peek() {
+                            match maybe {
+                                '?' => self.suggest_format_debug(),
+                                '<' | '^' | '>' => self.suggest_format_align(maybe),
+                                _ => self.suggest_positional_arg_instead_of_captured_arg(arg),
                             }
                         }
                         Some(NextArgument(Box::new(arg)))
@@ -474,19 +478,19 @@ impl<'a> Parser<'a> {
             }
 
             pos = peek_pos;
-            description = format!("expected `'}}'`, found `{maybe:?}`");
+            description = format!("expected `}}`, found `{}`", maybe.escape_debug());
         } else {
-            description = "expected `'}'` but string was terminated".to_owned();
+            description = "expected `}` but string was terminated".to_owned();
             // point at closing `"`
             pos = self.input.len() - if self.append_newline { 1 } else { 0 };
         }
 
         let pos = self.to_span_index(pos);
 
-        let label = "expected `'}'`".to_owned();
+        let label = "expected `}`".to_owned();
         let (note, secondary_label) = if arg.format.fill == Some('}') {
             (
-                Some("the character `'}'` is interpreted as a fill character because of the `:` that precedes it".to_owned()),
+                Some("the character `}` is interpreted as a fill character because of the `:` that precedes it".to_owned()),
                 arg.format.fill_span.map(|sp| ("this is not interpreted as a formatting closing brace".to_owned(), sp)),
             )
         } else {
@@ -732,6 +736,12 @@ impl<'a> Parser<'a> {
             }
         } else if self.consume('?') {
             spec.ty = "?";
+            if let Some(&(_, maybe)) = self.cur.peek() {
+                match maybe {
+                    '#' | 'x' | 'X' => self.suggest_format_parameter(maybe),
+                    _ => (),
+                }
+            }
         } else {
             spec.ty = self.word();
             if !spec.ty.is_empty() {
@@ -871,34 +881,28 @@ impl<'a> Parser<'a> {
         if let (Some(pos), Some(_)) = (self.consume_pos('?'), self.consume_pos(':')) {
             let word = self.word();
             let pos = self.to_span_index(pos);
-            self.errors.insert(
-                0,
-                ParseError {
-                    description: "expected format parameter to occur after `:`".to_owned(),
-                    note: Some(format!("`?` comes after `:`, try `{}:{}` instead", word, "?")),
-                    label: "expected `?` to occur after `:`".to_owned(),
-                    span: pos.to(pos),
-                    secondary_label: None,
-                    suggestion: Suggestion::None,
-                },
-            );
+            self.errors.insert(0, ParseError {
+                description: "expected format parameter to occur after `:`".to_owned(),
+                note: Some(format!("`?` comes after `:`, try `{}:{}` instead", word, "?")),
+                label: "expected `?` to occur after `:`".to_owned(),
+                span: pos.to(pos),
+                secondary_label: None,
+                suggestion: Suggestion::None,
+            });
         }
     }
 
     fn suggest_format_align(&mut self, alignment: char) {
         if let Some(pos) = self.consume_pos(alignment) {
             let pos = self.to_span_index(pos);
-            self.errors.insert(
-                0,
-                ParseError {
-                    description: "expected format parameter to occur after `:`".to_owned(),
-                    note: None,
-                    label: format!("expected `{}` to occur after `:`", alignment),
-                    span: pos.to(pos),
-                    secondary_label: None,
-                    suggestion: Suggestion::None,
-                },
-            );
+            self.errors.insert(0, ParseError {
+                description: "expected format parameter to occur after `:`".to_owned(),
+                note: None,
+                label: format!("expected `{}` to occur after `:`", alignment),
+                span: pos.to(pos),
+                secondary_label: None,
+                suggestion: Suggestion::None,
+            });
         }
     }
 
@@ -907,27 +911,61 @@ impl<'a> Parser<'a> {
             let byte_pos = self.to_span_index(end);
             let start = InnerOffset(byte_pos.0 + 1);
             let field = self.argument(start);
-            // We can only parse `foo.bar` field access, any deeper nesting,
-            // or another type of expression, like method calls, are not supported
+            // We can only parse simple `foo.bar` field access or `foo.0` tuple index access, any
+            // deeper nesting, or another type of expression, like method calls, are not supported
             if !self.consume('}') {
                 return;
             }
             if let ArgumentNamed(_) = arg.position {
-                if let ArgumentNamed(_) = field.position {
-                    self.errors.insert(
-                        0,
-                        ParseError {
+                match field.position {
+                    ArgumentNamed(_) => {
+                        self.errors.insert(0, ParseError {
                             description: "field access isn't supported".to_string(),
                             note: None,
                             label: "not supported".to_string(),
                             span: InnerSpan::new(arg.position_span.start, field.position_span.end),
                             secondary_label: None,
                             suggestion: Suggestion::UsePositional,
-                        },
-                    );
-                }
+                        });
+                    }
+                    ArgumentIs(_) => {
+                        self.errors.insert(0, ParseError {
+                            description: "tuple index access isn't supported".to_string(),
+                            note: None,
+                            label: "not supported".to_string(),
+                            span: InnerSpan::new(arg.position_span.start, field.position_span.end),
+                            secondary_label: None,
+                            suggestion: Suggestion::UsePositional,
+                        });
+                    }
+                    _ => {}
+                };
             }
         }
+    }
+
+    fn suggest_format_parameter(&mut self, c: char) {
+        let replacement = match c {
+            '#' => "#?",
+            'x' => "x?",
+            'X' => "X?",
+            _ => return,
+        };
+        let Some(pos) = self.consume_pos(c) else {
+            return;
+        };
+
+        let span = self.span(pos - 1, pos + 1);
+        let pos = self.to_span_index(pos);
+
+        self.errors.insert(0, ParseError {
+            description: format!("expected `}}`, found `{c}`"),
+            note: None,
+            label: "expected `'}'`".into(),
+            span: pos.to(pos),
+            secondary_label: None,
+            suggestion: Suggestion::ReorderFormatParameter(span, format!("{replacement}")),
+        })
     }
 }
 
@@ -1006,7 +1044,7 @@ fn find_width_map_from_snippet(
                     if next_c == '{' {
                         // consume up to 6 hexanumeric chars
                         let digits_len =
-                            s.clone().take(6).take_while(|(_, c)| c.is_digit(16)).count();
+                            s.clone().take(6).take_while(|(_, c)| c.is_ascii_hexdigit()).count();
 
                         let len_utf8 = s
                             .as_str()
@@ -1025,14 +1063,14 @@ fn find_width_map_from_snippet(
                         width += required_skips + 2;
 
                         s.nth(digits_len);
-                    } else if next_c.is_digit(16) {
+                    } else if next_c.is_ascii_hexdigit() {
                         width += 1;
 
                         // We suggest adding `{` and `}` when appropriate, accept it here as if
                         // it were correct
                         let mut i = 0; // consume up to 6 hexanumeric chars
                         while let (Some((_, c)), _) = (s.next(), i < 6) {
-                            if c.is_digit(16) {
+                            if c.is_ascii_hexdigit() {
                                 width += 1;
                             } else {
                                 break;
@@ -1065,7 +1103,7 @@ fn unescape_string(string: &str) -> Option<string::String> {
 }
 
 // Assert a reasonable size for `Piece`
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 rustc_index::static_assert_size!(Piece<'_>, 16);
 
 #[cfg(test)]

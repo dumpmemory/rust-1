@@ -89,8 +89,8 @@ fn Foo() {}
 
 These prefixes will be stripped when displayed in the documentation, so `[struct@Foo]` will be
 rendered as `Foo`. The following prefixes are available: `struct`, `enum`, `trait`, `union`,
-`mod`, `module`, `const`, `constant`, `fn`, `function`, `method`, `derive`, `type`, `value`,
-`macro`, `prim` or `primitive`.
+`mod`, `module`, `const`, `constant`, `fn`, `function`, `field`, `variant`, `method`, `derive`,
+`type`, `value`, `macro`, `prim` or `primitive`.
 
 You can also disambiguate for functions by adding `()` after the function name,
 or for macros by adding `!` after the macro name. The macro `!` can be followed by `()`, `{}`,
@@ -168,4 +168,4 @@ render differently in this case:
 ```
 
 `1.` and `2.` will be displayed as is in the rendered documentation (ie, `[a]` and `[b][c]`)
-whereas `3.` and `4.` will be replaced by a link targetting `e` for `[d](e)` and `g` for `[f]`.
+whereas `3.` and `4.` will be replaced by a link targeting `e` for `[d](e)` and `g` for `[f]`.

@@ -1,19 +1,18 @@
 use either::Either;
 use hir::{
     db::{ExpandDatabase, HirDatabase},
-    known, AssocItem, HirDisplay, HirFileIdExt, InFile, Type,
+    sym, AssocItem, HirDisplay, HirFileIdExt, ImportPathConfig, InFile, Type,
 };
 use ide_db::{
     assists::Assist, famous_defs::FamousDefs, imports::import_assets::item_for_path_search,
-    source_change::SourceChange, use_trivial_constructor::use_trivial_constructor, FxHashMap,
+    source_change::SourceChange, syntax_helpers::tree_diff::diff, text_edit::TextEdit,
+    use_trivial_constructor::use_trivial_constructor, FxHashMap,
 };
 use stdx::format_to;
 use syntax::{
-    algo,
     ast::{self, make},
-    AstNode, SyntaxNode, SyntaxNodePtr,
+    AstNode, Edition, SyntaxNode, SyntaxNodePtr, ToSmolStr,
 };
-use text_edit::TextEdit;
 
 use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
 
@@ -31,7 +30,7 @@ use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
 pub(crate) fn missing_fields(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Diagnostic {
     let mut message = String::from("missing structure fields:\n");
     for field in &d.missed_fields {
-        format_to!(message, "- {}\n", field.display(ctx.sema.db));
+        format_to!(message, "- {}\n", field.display(ctx.sema.db, ctx.edition));
     }
 
     let ptr = InFile::new(
@@ -77,7 +76,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                 // FIXME: this also currently discards a lot of whitespace in the input... we really need a formatter here
                 builder.replace(old_range.range, new_syntax.to_string());
             } else {
-                algo::diff(old_syntax, new_syntax).into_text_edit(&mut builder);
+                diff(old_syntax, new_syntax).into_text_edit(&mut builder);
             }
             builder.finish()
         };
@@ -122,17 +121,21 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                     let expr = (|| -> Option<ast::Expr> {
                         let item_in_ns = hir::ItemInNs::from(hir::ModuleDef::from(ty.as_adt()?));
 
-                        let type_path = current_module?.find_use_path(
+                        let type_path = current_module?.find_path(
                             ctx.sema.db,
                             item_for_path_search(ctx.sema.db, item_in_ns)?,
-                            ctx.config.prefer_no_std,
-                            ctx.config.prefer_prelude,
+                            ImportPathConfig {
+                                prefer_no_std: ctx.config.prefer_no_std,
+                                prefer_prelude: ctx.config.prefer_prelude,
+                                prefer_absolute: ctx.config.prefer_absolute,
+                            },
                         )?;
 
                         use_trivial_constructor(
                             ctx.sema.db,
-                            ide_db::helpers::mod_path_to_ast(&type_path),
+                            ide_db::helpers::mod_path_to_ast(&type_path, ctx.edition),
                             ty,
+                            ctx.edition,
                         )
                     })();
 
@@ -143,7 +146,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                     }
                 };
                 let field = make::record_expr_field(
-                    make::name_ref(&f.name(ctx.sema.db).to_smol_str()),
+                    make::name_ref(&f.name(ctx.sema.db).display_no_db(ctx.edition).to_smolstr()),
                     field_expr,
                 );
                 new_field_list.add_field(field.clone_for_update());
@@ -157,7 +160,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
             let new_field_list = old_field_list.clone_for_update();
             for (f, _) in missing_fields.iter() {
                 let field = make::record_pat_field_shorthand(make::name_ref(
-                    &f.name(ctx.sema.db).to_smol_str(),
+                    &f.name(ctx.sema.db).display_no_db(ctx.edition).to_smolstr(),
                 ));
                 new_field_list.add_field(field.clone_for_update());
             }
@@ -166,9 +169,14 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
     }
 }
 
-fn make_ty(ty: &hir::Type, db: &dyn HirDatabase, module: hir::Module) -> ast::Type {
+fn make_ty(
+    ty: &hir::Type,
+    db: &dyn HirDatabase,
+    module: hir::Module,
+    edition: Edition,
+) -> ast::Type {
     let ty_str = match ty.as_adt() {
-        Some(adt) => adt.name(db).display(db.upcast()).to_string(),
+        Some(adt) => adt.name(db).display(db.upcast(), edition).to_string(),
         None => {
             ty.display_source_code(db, module.into(), false).ok().unwrap_or_else(|| "_".to_owned())
         }
@@ -207,7 +215,7 @@ fn get_default_constructor(
     let has_new_func = ty
         .iterate_assoc_items(ctx.sema.db, krate, |assoc_item| {
             if let AssocItem::Function(func) = assoc_item {
-                if func.name(ctx.sema.db) == known::new
+                if func.name(ctx.sema.db) == sym::new.clone()
                     && func.assoc_fn_params(ctx.sema.db).is_empty()
                 {
                     return Some(());
@@ -220,13 +228,13 @@ fn get_default_constructor(
 
     let famous_defs = FamousDefs(&ctx.sema, krate);
     if has_new_func {
-        Some(make::ext::expr_ty_new(&make_ty(ty, ctx.sema.db, module)))
+        Some(make::ext::expr_ty_new(&make_ty(ty, ctx.sema.db, module, ctx.edition)))
     } else if ty.as_adt() == famous_defs.core_option_Option()?.ty(ctx.sema.db).as_adt() {
         Some(make::ext::option_none())
     } else if !ty.is_array()
         && ty.impls_trait(ctx.sema.db, famous_defs.core_default_Default()?, &[])
     {
-        Some(make::ext::expr_ty_default(&make_ty(ty, ctx.sema.db, module)))
+        Some(make::ext::expr_ty_default(&make_ty(ty, ctx.sema.db, module, ctx.edition)))
     } else {
         None
     }
@@ -299,22 +307,27 @@ struct T(S);
 fn regular(a: S) {
     let s;
     S { s, .. } = a;
+    _ = s;
 }
 fn nested(a: S2) {
     let s;
     S2 { s: S { s, .. }, .. } = a;
+    _ = s;
 }
 fn in_tuple(a: (S,)) {
     let s;
     (S { s, .. },) = a;
+    _ = s;
 }
 fn in_array(a: [S;1]) {
     let s;
     [S { s, .. },] = a;
+    _ = s;
 }
 fn in_tuple_struct(a: T) {
     let s;
     T(S { s, .. }) = a;
+    _ = s;
 }
             ",
         );

@@ -1,18 +1,34 @@
-error: higher-ranked lifetime error
+error: implementation of `Trait` is not general enough
   --> $DIR/issue-59311.rs:17:5
    |
-LL |     v.t(|| {});
-   |     ^^^^^^^^^^
+LL | / pub fn crash<V>(v: &V)
+LL | | where
+LL | |     for<'a> &'a V: Trait + 'static,
+   | |____________________-----__________- due to a where-clause on `crash`...
+   |                      |
+   |                      doesn't satisfy where-clause
+LL |   {
+LL |       v.t(|| {});
+   |       ^^^^^^^^^^
    |
-   = note: could not prove `{closure@$DIR/issue-59311.rs:17:9: 17:11} well-formed`
+   = note: ...`Trait` would have to be implemented for the type `&'a V`
+   = note: ...but `Trait` is actually implemented for the type `&'0 V`, for some specific lifetime `'0`
 
-error: higher-ranked lifetime error
+error: implementation of `Trait` is not general enough
   --> $DIR/issue-59311.rs:17:5
    |
-LL |     v.t(|| {});
-   |     ^^^^^^^^^^
+LL | / pub fn crash<V>(v: &V)
+LL | | where
+LL | |     for<'a> &'a V: Trait + 'static,
+   | |____________________-----__________- due to a where-clause on `crash`...
+   |                      |
+   |                      doesn't satisfy where-clause
+LL |   {
+LL |       v.t(|| {});
+   |       ^^^^^^^^^^
    |
-   = note: could not prove `{closure@$DIR/issue-59311.rs:17:9: 17:11} well-formed`
+   = note: ...`Trait` would have to be implemented for the type `&'a V`
+   = note: ...but `Trait` is actually implemented for the type `&'0 V`, for some specific lifetime `'0`
    = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
 
 error: higher-ranked lifetime error

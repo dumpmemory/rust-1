@@ -122,7 +122,7 @@ impl Parse for Newtype {
                 #gate_rustc_only
                 impl ::std::iter::Step for #name {
                     #[inline]
-                    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+                    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>) {
                         <usize as ::std::iter::Step>::steps_between(
                             &Self::index(*start),
                             &Self::index(*end),
@@ -139,10 +139,6 @@ impl Parse for Newtype {
                         Self::index(start).checked_sub(u).map(Self::from_usize)
                     }
                 }
-
-                // Safety: The implementation of `Step` upholds all invariants.
-                #gate_rustc_only
-                unsafe impl ::std::iter::TrustedStep for #name {}
             }
         } else {
             quote! {}
@@ -154,32 +150,6 @@ impl Parse for Newtype {
                     write!(fmt, #debug_format, self.as_u32())
                 }
             }
-        };
-
-        let spec_partial_eq_impl = if let Lit::Int(max) = &max {
-            if let Ok(max_val) = max.base10_parse::<u32>() {
-                quote! {
-                    #gate_rustc_only
-                    impl core::option::SpecOptionPartialEq for #name {
-                        #[inline]
-                        fn eq(l: &Option<Self>, r: &Option<Self>) -> bool {
-                            if #max_val < u32::MAX {
-                                l.map(|i| i.as_u32()).unwrap_or(#max_val+1) == r.map(|i| i.as_u32()).unwrap_or(#max_val+1)
-                            } else {
-                                match (l, r) {
-                                    (Some(l), Some(r)) => r == l,
-                                    (None, None) => true,
-                                    _ => false
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                quote! {}
-            }
-        } else {
-            quote! {}
         };
 
         Ok(Self(quote! {
@@ -199,6 +169,9 @@ impl Parse for Newtype {
 
                 /// Maximum value the index can take.
                 #vis const MAX: Self = Self::from_u32(#max);
+
+                /// Zero value of the index.
+                #vis const ZERO: Self = Self::from_u32(0);
 
                 /// Creates a new index from a given `usize`.
                 ///
@@ -221,6 +194,21 @@ impl Parse for Newtype {
                 /// Will panic if `value` exceeds `MAX`.
                 #[inline]
                 #vis const fn from_u32(value: u32) -> Self {
+                    assert!(value <= #max);
+                    // SAFETY: We just checked that `value <= max`.
+                    unsafe {
+                        Self::from_u32_unchecked(value)
+                    }
+                }
+
+                /// Creates a new index from a given `u16`.
+                ///
+                /// # Panics
+                ///
+                /// Will panic if `value` exceeds `MAX`.
+                #[inline]
+                #vis const fn from_u16(value: u16) -> Self {
+                    let value = value as u32;
                     assert!(value <= #max);
                     // SAFETY: We just checked that `value <= max`.
                     unsafe {
@@ -282,8 +270,6 @@ impl Parse for Newtype {
             }
 
             #step
-
-            #spec_partial_eq_impl
 
             impl From<#name> for u32 {
                 #[inline]

@@ -1,19 +1,25 @@
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
 
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{Applicability, Diag};
+use rustc_hir::intravisit::Visitor;
+use rustc_hir::{self as hir, CaptureBy, ExprKind, HirId, Node};
+use rustc_middle::bug;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty};
 use rustc_mir_dataflow::move_paths::{LookupResult, MovePathIndex};
 use rustc_span::{BytePos, ExpnKind, MacroKind, Span};
+use rustc_trait_selection::error_reporting::traits::FindExprBySpan;
+use rustc_trait_selection::infer::InferCtxtExt;
+use tracing::debug;
 
-use crate::diagnostics::CapturedMessageOpt;
-use crate::diagnostics::{DescribePlaceOpt, UseSpans};
-use crate::prefixes::PrefixSet;
 use crate::MirBorrowckCtxt;
+use crate::diagnostics::{CapturedMessageOpt, DescribePlaceOpt, UseSpans};
+use crate::prefixes::PrefixSet;
 
 #[derive(Debug)]
-pub enum IllegalMoveOriginKind<'tcx> {
+pub(crate) enum IllegalMoveOriginKind<'tcx> {
     /// Illegal move due to attempt to move from behind a reference.
     BorrowedContent {
         /// The place the reference refers to: if erroneous code was trying to
@@ -89,7 +95,7 @@ enum GroupedMoveError<'tcx> {
     },
 }
 
-impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
+impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     pub(crate) fn report_move_errors(&mut self) {
         let grouped_errors = self.group_move_errors();
         for error in grouped_errors {
@@ -263,6 +269,15 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                 kind,
                 self.is_upvar_field_projection(original_path.as_ref())
             );
+            if self.has_ambiguous_copy(original_path.ty(self.body, self.infcx.tcx).ty) {
+                // If the type may implement Copy, skip the error.
+                // It's an error with the Copy implementation (e.g. duplicate Copy) rather than borrow check
+                self.dcx().span_delayed_bug(
+                    span,
+                    "Type may implement copy, but there is no other error.",
+                );
+                return;
+            }
             (
                 match kind {
                     &IllegalMoveOriginKind::BorrowedContent { target_place } => self
@@ -287,7 +302,14 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
         self.buffer_error(err);
     }
 
-    fn report_cannot_move_from_static(&mut self, place: Place<'tcx>, span: Span) -> Diag<'tcx> {
+    fn has_ambiguous_copy(&mut self, ty: Ty<'tcx>) -> bool {
+        let Some(copy_trait_def) = self.infcx.tcx.lang_items().copy_trait() else { return false };
+        // This is only going to be ambiguous if there are incoherent impls, because otherwise
+        // ambiguity should never happen in MIR.
+        self.infcx.type_implements_trait(copy_trait_def, [ty], self.infcx.param_env).may_apply()
+    }
+
+    fn report_cannot_move_from_static(&mut self, place: Place<'tcx>, span: Span) -> Diag<'infcx> {
         let description = if place.projection.len() == 1 {
             format!("static item {}", self.describe_any_place(place.as_ref()))
         } else {
@@ -303,17 +325,133 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
         self.cannot_move_out_of(span, &description)
     }
 
+    fn suggest_clone_of_captured_var_in_move_closure(
+        &self,
+        err: &mut Diag<'_>,
+        upvar_hir_id: HirId,
+        upvar_name: &str,
+        use_spans: Option<UseSpans<'tcx>>,
+    ) {
+        let tcx = self.infcx.tcx;
+        let typeck_results = tcx.typeck(self.mir_def_id());
+        let Some(use_spans) = use_spans else { return };
+        // We only care about the case where a closure captured a binding.
+        let UseSpans::ClosureUse { args_span, .. } = use_spans else { return };
+        let Some(body_id) = tcx.hir_node(self.mir_hir_id()).body_id() else { return };
+        // Fetch the type of the expression corresponding to the closure-captured binding.
+        let Some(captured_ty) = typeck_results.node_type_opt(upvar_hir_id) else { return };
+        if !self.implements_clone(captured_ty) {
+            // We only suggest cloning the captured binding if the type can actually be cloned.
+            return;
+        };
+        // Find the closure that captured the binding.
+        let mut expr_finder = FindExprBySpan::new(args_span, tcx);
+        expr_finder.include_closures = true;
+        expr_finder.visit_expr(tcx.hir().body(body_id).value);
+        let Some(closure_expr) = expr_finder.result else { return };
+        let ExprKind::Closure(closure) = closure_expr.kind else { return };
+        // We'll only suggest cloning the binding if it's a `move` closure.
+        let CaptureBy::Value { .. } = closure.capture_clause else { return };
+        // Find the expression within the closure where the binding is consumed.
+        let mut suggested = false;
+        let use_span = use_spans.var_or_use();
+        let mut expr_finder = FindExprBySpan::new(use_span, tcx);
+        expr_finder.include_closures = true;
+        expr_finder.visit_expr(tcx.hir().body(body_id).value);
+        let Some(use_expr) = expr_finder.result else { return };
+        let parent = tcx.parent_hir_node(use_expr.hir_id);
+        if let Node::Expr(expr) = parent
+            && let ExprKind::Assign(lhs, ..) = expr.kind
+            && lhs.hir_id == use_expr.hir_id
+        {
+            // Cloning the value being assigned makes no sense:
+            //
+            // error[E0507]: cannot move out of `var`, a captured variable in an `FnMut` closure
+            //   --> $DIR/option-content-move2.rs:11:9
+            //    |
+            // LL |     let mut var = None;
+            //    |         ------- captured outer variable
+            // LL |     func(|| {
+            //    |          -- captured by this `FnMut` closure
+            // LL |         // Shouldn't suggest `move ||.as_ref()` here
+            // LL |         move || {
+            //    |         ^^^^^^^ `var` is moved here
+            // LL |
+            // LL |             var = Some(NotCopyable);
+            //    |             ---
+            //    |             |
+            //    |             variable moved due to use in closure
+            //    |             move occurs because `var` has type `Option<NotCopyable>`, which does not implement the `Copy` trait
+            //    |
+            return;
+        }
+
+        // Search for an appropriate place for the structured `.clone()` suggestion to be applied.
+        // If we encounter a statement before the borrow error, we insert a statement there.
+        for (_, node) in tcx.hir().parent_iter(closure_expr.hir_id) {
+            if let Node::Stmt(stmt) = node {
+                let padding = tcx
+                    .sess
+                    .source_map()
+                    .indentation_before(stmt.span)
+                    .unwrap_or_else(|| "    ".to_string());
+                err.multipart_suggestion_verbose(
+                    "clone the value before moving it into the closure",
+                    vec![
+                        (
+                            stmt.span.shrink_to_lo(),
+                            format!("let value = {upvar_name}.clone();\n{padding}"),
+                        ),
+                        (use_span, "value".to_string()),
+                    ],
+                    Applicability::MachineApplicable,
+                );
+                suggested = true;
+                break;
+            } else if let Node::Expr(expr) = node
+                && let ExprKind::Closure(_) = expr.kind
+            {
+                // We want to suggest cloning only on the first closure, not
+                // subsequent ones (like `ui/suggestions/option-content-move2.rs`).
+                break;
+            }
+        }
+        if !suggested {
+            // If we couldn't find a statement for us to insert a new `.clone()` statement before,
+            // we have a bare expression, so we suggest the creation of a new block inline to go
+            // from `move || val` to `{ let value = val.clone(); move || value }`.
+            let padding = tcx
+                .sess
+                .source_map()
+                .indentation_before(closure_expr.span)
+                .unwrap_or_else(|| "    ".to_string());
+            err.multipart_suggestion_verbose(
+                "clone the value before moving it into the closure",
+                vec![
+                    (
+                        closure_expr.span.shrink_to_lo(),
+                        format!("{{\n{padding}let value = {upvar_name}.clone();\n{padding}"),
+                    ),
+                    (use_spans.var_or_use(), "value".to_string()),
+                    (closure_expr.span.shrink_to_hi(), format!("\n{padding}}}")),
+                ],
+                Applicability::MachineApplicable,
+            );
+        }
+    }
+
     fn report_cannot_move_from_borrowed_content(
         &mut self,
         move_place: Place<'tcx>,
         deref_target_place: Place<'tcx>,
         span: Span,
         use_spans: Option<UseSpans<'tcx>>,
-    ) -> Diag<'tcx> {
+    ) -> Diag<'infcx> {
+        let tcx = self.infcx.tcx;
         // Inspect the type of the content behind the
         // borrow to provide feedback about why this
         // was a move rather than a copy.
-        let ty = deref_target_place.ty(self.body, self.infcx.tcx).ty;
+        let ty = deref_target_place.ty(self.body, tcx).ty;
         let upvar_field = self
             .prefixes(move_place.as_ref(), PrefixSet::All)
             .find_map(|p| self.is_upvar_field_projection(p));
@@ -363,8 +501,8 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
                 let upvar = &self.upvars[upvar_field.unwrap().index()];
                 let upvar_hir_id = upvar.get_root_variable();
-                let upvar_name = upvar.to_string(self.infcx.tcx);
-                let upvar_span = self.infcx.tcx.hir().span(upvar_hir_id);
+                let upvar_name = upvar.to_string(tcx);
+                let upvar_span = tcx.hir().span(upvar_hir_id);
 
                 let place_name = self.describe_any_place(move_place.as_ref());
 
@@ -380,12 +518,21 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     closure_kind_ty, closure_kind, place_description,
                 );
 
-                self.cannot_move_out_of(span, &place_description)
+                let closure_span = tcx.def_span(def_id);
+                let mut err = self
+                    .cannot_move_out_of(span, &place_description)
                     .with_span_label(upvar_span, "captured outer variable")
                     .with_span_label(
-                        self.infcx.tcx.def_span(def_id),
+                        closure_span,
                         format!("captured by this `{closure_kind}` closure"),
-                    )
+                    );
+                self.suggest_clone_of_captured_var_in_move_closure(
+                    &mut err,
+                    upvar_hir_id,
+                    &upvar_name,
+                    use_spans,
+                );
+                err
             }
             _ => {
                 let source = self.borrowed_content_source(deref_base);
@@ -415,7 +562,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     ),
                     (_, _, _) => self.cannot_move_out_of(
                         span,
-                        &source.describe_for_unnamed_place(self.infcx.tcx),
+                        &source.describe_for_unnamed_place(tcx),
                     ),
                 }
             }
@@ -425,6 +572,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             is_loop_message: false,
             is_move_msg: false,
             is_loop_move: false,
+            has_suggest_reborrow: false,
             maybe_reinitialized_locations_is_empty: true,
         };
         if let Some(use_spans) = use_spans {
@@ -444,15 +592,16 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                         None => "value".to_string(),
                     };
 
-                    err.subdiagnostic(
-                        self.dcx(),
-                        crate::session_diagnostics::TypeNoCopy::Label {
-                            is_partial_move: false,
-                            ty: place_ty,
-                            place: &place_desc,
-                            span,
-                        },
-                    );
+                    if let Some(expr) = self.find_expr(span) {
+                        self.suggest_cloning(err, place_ty, expr, None);
+                    }
+
+                    err.subdiagnostic(crate::session_diagnostics::TypeNoCopy::Label {
+                        is_partial_move: false,
+                        ty: place_ty,
+                        place: &place_desc,
+                        span,
+                    });
                 } else {
                     binds_to.sort();
                     binds_to.dedup();
@@ -468,23 +617,25 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             }
             // No binding. Nothing to suggest.
             GroupedMoveError::OtherIllegalMove { ref original_path, use_spans, .. } => {
-                let span = use_spans.var_or_use();
+                let use_span = use_spans.var_or_use();
                 let place_ty = original_path.ty(self.body, self.infcx.tcx).ty;
                 let place_desc = match self.describe_place(original_path.as_ref()) {
                     Some(desc) => format!("`{desc}`"),
                     None => "value".to_string(),
                 };
-                err.subdiagnostic(
-                    self.dcx(),
-                    crate::session_diagnostics::TypeNoCopy::Label {
-                        is_partial_move: false,
-                        ty: place_ty,
-                        place: &place_desc,
-                        span,
-                    },
-                );
 
-                use_spans.args_subdiag(self.dcx(), err, |args_span| {
+                if let Some(expr) = self.find_expr(use_span) {
+                    self.suggest_cloning(err, place_ty, expr, Some(use_spans));
+                }
+
+                err.subdiagnostic(crate::session_diagnostics::TypeNoCopy::Label {
+                    is_partial_move: false,
+                    ty: place_ty,
+                    place: &place_desc,
+                    span: use_span,
+                });
+
+                use_spans.args_subdiag(err, |args_span| {
                     crate::session_diagnostics::CaptureArgLabel::MoveOutPlace {
                         place: place_desc,
                         args_span,
@@ -499,12 +650,27 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     fn add_borrow_suggestions(&self, err: &mut Diag<'_>, span: Span) {
         match self.infcx.tcx.sess.source_map().span_to_snippet(span) {
             Ok(snippet) if snippet.starts_with('*') => {
-                err.span_suggestion_verbose(
-                    span.with_hi(span.lo() + BytePos(1)),
-                    "consider removing the dereference here",
-                    String::new(),
-                    Applicability::MaybeIncorrect,
-                );
+                let sp = span.with_lo(span.lo() + BytePos(1));
+                let inner = self.find_expr(sp);
+                let mut is_raw_ptr = false;
+                if let Some(inner) = inner {
+                    let typck_result = self.infcx.tcx.typeck(self.mir_def_id());
+                    if let Some(inner_type) = typck_result.node_type_opt(inner.hir_id) {
+                        if matches!(inner_type.kind(), ty::RawPtr(..)) {
+                            is_raw_ptr = true;
+                        }
+                    }
+                }
+                // If the `inner` is a raw pointer, do not suggest removing the "*", see #126863
+                // FIXME: need to check whether the assigned object can be a raw pointer, see `tests/ui/borrowck/issue-20801.rs`.
+                if !is_raw_ptr {
+                    err.span_suggestion_verbose(
+                        span.with_hi(span.lo() + BytePos(1)),
+                        "consider removing the dereference here",
+                        String::new(),
+                        Applicability::MaybeIncorrect,
+                    );
+                }
             }
             _ => {
                 err.span_suggestion_verbose(
@@ -518,48 +684,126 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     }
 
     fn add_move_error_suggestions(&self, err: &mut Diag<'_>, binds_to: &[Local]) {
-        let mut suggestions: Vec<(Span, String, String)> = Vec::new();
+        /// A HIR visitor to associate each binding with a `&` or `&mut` that could be removed to
+        /// make it bind by reference instead (if possible)
+        struct BindingFinder<'tcx> {
+            typeck_results: &'tcx ty::TypeckResults<'tcx>,
+            hir: rustc_middle::hir::map::Map<'tcx>,
+            /// Input: the span of the pattern we're finding bindings in
+            pat_span: Span,
+            /// Input: the spans of the bindings we're providing suggestions for
+            binding_spans: Vec<Span>,
+            /// Internal state: have we reached the pattern we're finding bindings in?
+            found_pat: bool,
+            /// Internal state: the innermost `&` or `&mut` "above" the visitor
+            ref_pat: Option<&'tcx hir::Pat<'tcx>>,
+            /// Internal state: could removing a `&` give bindings unexpected types?
+            has_adjustments: bool,
+            /// Output: for each input binding, the `&` or `&mut` to remove to make it by-ref
+            ref_pat_for_binding: Vec<(Span, Option<&'tcx hir::Pat<'tcx>>)>,
+            /// Output: ref patterns that can't be removed straightforwardly
+            cannot_remove: FxHashSet<HirId>,
+        }
+        impl<'tcx> Visitor<'tcx> for BindingFinder<'tcx> {
+            type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+            fn nested_visit_map(&mut self) -> Self::Map {
+                self.hir
+            }
+
+            fn visit_expr(&mut self, ex: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                // Don't walk into const patterns or anything else that might confuse this
+                if !self.found_pat {
+                    hir::intravisit::walk_expr(self, ex)
+                }
+            }
+
+            fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
+                if p.span == self.pat_span {
+                    self.found_pat = true;
+                }
+
+                let parent_has_adjustments = self.has_adjustments;
+                self.has_adjustments |=
+                    self.typeck_results.pat_adjustments().contains_key(p.hir_id);
+
+                // Track the innermost `&` or `&mut` enclosing bindings, to suggest removing it.
+                let parent_ref_pat = self.ref_pat;
+                if let hir::PatKind::Ref(..) = p.kind {
+                    self.ref_pat = Some(p);
+                    // To avoid edition-dependent logic to figure out how many refs this `&` can
+                    // peel off, simply don't remove the "parent" `&`.
+                    self.cannot_remove.extend(parent_ref_pat.map(|r| r.hir_id));
+                    if self.has_adjustments {
+                        // Removing this `&` could give child bindings unexpected types, so don't.
+                        self.cannot_remove.insert(p.hir_id);
+                        // As long the `&` stays, child patterns' types should be as expected.
+                        self.has_adjustments = false;
+                    }
+                }
+
+                if let hir::PatKind::Binding(_, _, ident, _) = p.kind {
+                    // the spans in `binding_spans` encompass both the ident and binding mode
+                    if let Some(&bind_sp) =
+                        self.binding_spans.iter().find(|bind_sp| bind_sp.contains(ident.span))
+                    {
+                        self.ref_pat_for_binding.push((bind_sp, self.ref_pat));
+                    } else {
+                        // we've encountered a binding that we're not reporting a move error for.
+                        // we don't want to change its type, so don't remove the surrounding `&`.
+                        if let Some(ref_pat) = self.ref_pat {
+                            self.cannot_remove.insert(ref_pat.hir_id);
+                        }
+                    }
+                }
+
+                hir::intravisit::walk_pat(self, p);
+                self.ref_pat = parent_ref_pat;
+                self.has_adjustments = parent_has_adjustments;
+            }
+        }
+        let mut pat_span = None;
+        let mut binding_spans = Vec::new();
         for local in binds_to {
             let bind_to = &self.body.local_decls[*local];
-            if let LocalInfo::User(BindingForm::Var(VarBindingForm { pat_span, .. })) =
+            if let LocalInfo::User(BindingForm::Var(VarBindingForm { pat_span: pat_sp, .. })) =
                 *bind_to.local_info()
             {
-                let Ok(pat_snippet) = self.infcx.tcx.sess.source_map().span_to_snippet(pat_span)
-                else {
-                    continue;
-                };
-                let Some(stripped) = pat_snippet.strip_prefix('&') else {
-                    suggestions.push((
-                        bind_to.source_info.span.shrink_to_lo(),
-                        "consider borrowing the pattern binding".to_string(),
-                        "ref ".to_string(),
-                    ));
-                    continue;
-                };
-                let inner_pat_snippet = stripped.trim_start();
-                let (pat_span, suggestion, to_remove) = if inner_pat_snippet.starts_with("mut")
-                    && inner_pat_snippet["mut".len()..].starts_with(rustc_lexer::is_whitespace)
-                {
-                    let inner_pat_snippet = inner_pat_snippet["mut".len()..].trim_start();
-                    let pat_span = pat_span.with_hi(
-                        pat_span.lo()
-                            + BytePos((pat_snippet.len() - inner_pat_snippet.len()) as u32),
-                    );
-                    (pat_span, String::new(), "mutable borrow")
-                } else {
-                    let pat_span = pat_span.with_hi(
-                        pat_span.lo()
-                            + BytePos(
-                                (pat_snippet.len() - inner_pat_snippet.trim_start().len()) as u32,
-                            ),
-                    );
-                    (pat_span, String::new(), "borrow")
-                };
-                suggestions.push((
-                    pat_span,
-                    format!("consider removing the {to_remove}"),
-                    suggestion.to_string(),
-                ));
+                pat_span = Some(pat_sp);
+                binding_spans.push(bind_to.source_info.span);
+            }
+        }
+        let Some(pat_span) = pat_span else { return };
+
+        let hir = self.infcx.tcx.hir();
+        let Some(body) = hir.maybe_body_owned_by(self.mir_def_id()) else { return };
+        let typeck_results = self.infcx.tcx.typeck(self.mir_def_id());
+        let mut finder = BindingFinder {
+            typeck_results,
+            hir,
+            pat_span,
+            binding_spans,
+            found_pat: false,
+            ref_pat: None,
+            has_adjustments: false,
+            ref_pat_for_binding: Vec::new(),
+            cannot_remove: FxHashSet::default(),
+        };
+        finder.visit_body(body);
+
+        let mut suggestions = Vec::new();
+        for (binding_span, opt_ref_pat) in finder.ref_pat_for_binding {
+            if let Some(ref_pat) = opt_ref_pat
+                && !finder.cannot_remove.contains(&ref_pat.hir_id)
+                && let hir::PatKind::Ref(subpat, mutbl) = ref_pat.kind
+                && let Some(ref_span) = ref_pat.span.trim_end(subpat.span)
+            {
+                let mutable_str = if mutbl.is_mut() { "mutable " } else { "" };
+                let msg = format!("consider removing the {mutable_str}borrow");
+                suggestions.push((ref_span, msg, "".to_string()));
+            } else {
+                let msg = "consider borrowing the pattern binding".to_string();
+                suggestions.push((binding_span.shrink_to_lo(), msg, "ref ".to_string()));
             }
         }
         suggestions.sort_unstable_by_key(|&(span, _, _)| span);
@@ -582,15 +826,17 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
             if binds_to.len() == 1 {
                 let place_desc = &format!("`{}`", self.local_names[*local].unwrap());
-                err.subdiagnostic(
-                    self.dcx(),
-                    crate::session_diagnostics::TypeNoCopy::Label {
-                        is_partial_move: false,
-                        ty: bind_to.ty,
-                        place: place_desc,
-                        span: binding_span,
-                    },
-                );
+
+                if let Some(expr) = self.find_expr(binding_span) {
+                    self.suggest_cloning(err, bind_to.ty, expr, None);
+                }
+
+                err.subdiagnostic(crate::session_diagnostics::TypeNoCopy::Label {
+                    is_partial_move: false,
+                    ty: bind_to.ty,
+                    place: place_desc,
+                    span: binding_span,
+                });
             }
         }
 

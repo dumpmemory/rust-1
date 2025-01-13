@@ -1,8 +1,9 @@
-use crate::environment::{executable_extension, Environment};
-use crate::exec::cmd;
-use crate::utils::io::{copy_directory, find_file_in_dir, unpack_archive};
 use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
+
+use crate::environment::{Environment, executable_extension};
+use crate::exec::cmd;
+use crate::utils::io::{copy_directory, find_file_in_dir, unpack_archive};
 
 /// Run tests on optimized dist artifacts.
 pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
@@ -21,8 +22,10 @@ pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
         assert!(extracted_path.is_dir());
         Ok(extracted_path)
     };
-    let host_triple = env.host_triple();
+    let host_triple = env.host_tuple();
     let version = find_dist_version(&dist_dir)?;
+
+    let channel = version_to_channel(&version);
 
     // Extract rustc, libstd, cargo and src archives to create the optimized sysroot
     let rustc_dir = extract_dist_dir(&format!("rustc-{version}-{host_triple}"))?.join("rustc");
@@ -60,12 +63,17 @@ pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
     assert!(llvm_config.is_file());
 
     let config_content = format!(
-        r#"profile = "user"
+        r#"
+profile = "user"
 change-id = 115898
+
+[rust]
+channel = "{channel}"
 
 [build]
 rustc = "{rustc}"
 cargo = "{cargo}"
+local-rebuild = true
 
 [target.{host_triple}]
 llvm-config = "{llvm_config}"
@@ -85,7 +93,7 @@ llvm-config = "{llvm_config}"
         x_py.as_str(),
         "test",
         "--build",
-        env.host_triple(),
+        env.host_tuple(),
         "--stage",
         "0",
         "tests/assembly",
@@ -94,8 +102,8 @@ llvm-config = "{llvm_config}"
         "tests/incremental",
         "tests/mir-opt",
         "tests/pretty",
-        "tests/run-pass-valgrind",
         "tests/ui",
+        "tests/crashes",
     ];
     for test_path in env.skipped_tests() {
         args.extend(["--skip", test_path]);
@@ -113,4 +121,14 @@ fn find_dist_version(directory: &Utf8Path) -> anyhow::Result<String> {
     let (version, _) =
         archive.strip_prefix("reproducible-artifacts-").unwrap().split_once('-').unwrap();
     Ok(version.to_string())
+}
+
+/// Roughly convert a version string (`nightly`, `beta`, or `1.XY.Z`) to channel string (`nightly`,
+/// `beta` or `stable`).
+fn version_to_channel(version_str: &str) -> &'static str {
+    match version_str {
+        "nightly" => "nightly",
+        "beta" => "beta",
+        _ => "stable",
+    }
 }

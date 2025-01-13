@@ -50,7 +50,7 @@ pub fn check(
         super::MANUAL_SATURATING_ARITHMETIC,
         expr.span,
         "manual saturating arithmetic",
-        &format!("consider using `saturating_{arith}`"),
+        format!("consider using `saturating_{arith}`"),
         format!(
             "{}.saturating_{arith}({})",
             snippet_with_applicability(cx, arith_lhs.span, "..", &mut applicability),
@@ -68,8 +68,7 @@ enum MinMax {
 
 fn is_min_or_max(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<MinMax> {
     // `T::max_value()` `T::min_value()` inherent methods
-    if let hir::ExprKind::Call(func, args) = &expr.kind
-        && args.is_empty()
+    if let hir::ExprKind::Call(func, []) = &expr.kind
         && let hir::ExprKind::Path(hir::QPath::TypeRelative(_, segment)) = &func.kind
     {
         match segment.ident.as_str() {

@@ -1,10 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use rustc_ast::ast::{BindingAnnotation, ByRef, Lifetime, Mutability, Param, PatKind, Path, TyKind};
+use clippy_utils::source::snippet_with_applicability;
+use rustc_ast::ast::{BindingMode, ByRef, Lifetime, Mutability, Param, PatKind, Path, TyKind};
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::symbol::kw;
 use rustc_span::Span;
+use rustc_span::symbol::kw;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -80,7 +81,8 @@ fn check_param_inner(cx: &EarlyContext<'_>, path: &Path, span: Span, binding_mod
                     applicability = Applicability::HasPlaceholders;
                     "&'_ mut self".to_string()
                 } else {
-                    format!("&{} mut self", &lifetime.ident.name)
+                    let lt_name = snippet_with_applicability(cx, lifetime.ident.span, "..", &mut applicability);
+                    format!("&{lt_name} mut self")
                 }
             },
             (Mode::Ref(None), Mutability::Not) => "&self".to_string(),
@@ -89,7 +91,8 @@ fn check_param_inner(cx: &EarlyContext<'_>, path: &Path, span: Span, binding_mod
                     applicability = Applicability::HasPlaceholders;
                     "&'_ self".to_string()
                 } else {
-                    format!("&{} self", &lifetime.ident.name)
+                    let lt_name = snippet_with_applicability(cx, lifetime.ident.span, "..", &mut applicability);
+                    format!("&{lt_name} self")
                 }
             },
             (Mode::Value, Mutability::Mut) => "mut self".to_string(),
@@ -117,13 +120,13 @@ impl EarlyLintPass for NeedlessArbitrarySelfType {
 
         match &p.ty.kind {
             TyKind::Path(None, path) => {
-                if let PatKind::Ident(BindingAnnotation(ByRef::No, mutbl), _, _) = p.pat.kind {
+                if let PatKind::Ident(BindingMode(ByRef::No, mutbl), _, _) = p.pat.kind {
                     check_param_inner(cx, path, p.span.to(p.ty.span), &Mode::Value, mutbl);
                 }
             },
             TyKind::Ref(lifetime, mut_ty) => {
                 if let TyKind::Path(None, path) = &mut_ty.ty.kind
-                    && let PatKind::Ident(BindingAnnotation::NONE, _, _) = p.pat.kind
+                    && let PatKind::Ident(BindingMode::NONE, _, _) = p.pat.kind
                 {
                     check_param_inner(cx, path, p.span.to(p.ty.span), &Mode::Ref(*lifetime), mut_ty.mutbl);
                 }

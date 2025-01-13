@@ -9,9 +9,13 @@
 //@ compile-flags:-g -Copt-level=0 -Cllvm-args=-enable-tail-merge=0
 //@ compile-flags:-Cforce-frame-pointers=yes
 //@ compile-flags:-Cstrip=none
-//@ ignore-emscripten spawning processes is not supported
+//@ ignore-wasm32 spawning processes is not supported
 //@ ignore-sgx no processes
 //@ ignore-fuchsia Backtrace not symbolized, trace different line alignment
+
+// FIXME(#117097): backtrace (possibly unwinding mechanism) seems to be different on at least
+// `i686-mingw` (32-bit windows-gnu)? cc #128911.
+//@ ignore-windows-gnu
 
 use std::env;
 

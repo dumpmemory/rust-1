@@ -4,7 +4,7 @@
 //! Expansion, and Definition Contexts,” *Journal of Functional Programming* 22, no. 2
 //! (March 1, 2012): 181–216, <https://doi.org/10.1017/S0956796812000093>.
 //!
-//! Also see https://rustc-dev-guide.rust-lang.org/macro-expansion.html#hygiene-and-hierarchies
+//! Also see <https://rustc-dev-guide.rust-lang.org/macro-expansion.html#hygiene-and-hierarchies>
 //!
 //! # The Expansion Order Hierarchy
 //!
@@ -21,19 +21,33 @@
 //! `ExpnData::call_site` in rustc, [`MacroCallLoc::call_site`] in rust-analyzer.
 use std::fmt;
 
-use salsa::{InternId, InternValue};
+#[cfg(not(feature = "ra-salsa"))]
+use crate::InternId;
+#[cfg(feature = "ra-salsa")]
+use ra_salsa::{InternId, InternValue};
 
 use crate::MacroCallId;
 
 /// Interned [`SyntaxContextData`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SyntaxContextId(InternId);
 
-impl salsa::InternKey for SyntaxContextId {
-    fn from_intern_id(v: salsa::InternId) -> Self {
+impl fmt::Debug for SyntaxContextId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            write!(f, "{}", self.0.as_u32())
+        } else {
+            f.debug_tuple("SyntaxContextId").field(&self.0).finish()
+        }
+    }
+}
+
+#[cfg(feature = "ra-salsa")]
+impl ra_salsa::InternKey for SyntaxContextId {
+    fn from_intern_id(v: ra_salsa::InternId) -> Self {
         SyntaxContextId(v)
     }
-    fn as_intern_id(&self) -> salsa::InternId {
+    fn as_intern_id(&self) -> ra_salsa::InternId {
         self.0
     }
 }
@@ -69,6 +83,10 @@ impl SyntaxContextId {
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct SyntaxContextData {
     /// Invariant: Only [`SyntaxContextId::ROOT`] has a [`None`] outer expansion.
+    // FIXME: The None case needs to encode the context crate id. We can encode that as the MSB of
+    // MacroCallId is reserved anyways so we can do bit tagging here just fine.
+    // The bigger issue is that this will cause interning to now create completely separate chains
+    // per crate. Though that is likely not a problem as `MacroCallId`s are already crate calling dependent.
     pub outer_expn: Option<MacroCallId>,
     pub outer_transparency: Transparency,
     pub parent: SyntaxContextId,
@@ -78,6 +96,7 @@ pub struct SyntaxContextData {
     pub opaque_and_semitransparent: SyntaxContextId,
 }
 
+#[cfg(feature = "ra-salsa")]
 impl InternValue for SyntaxContextData {
     type Key = (SyntaxContextId, Option<MacroCallId>, Transparency);
 
@@ -127,4 +146,13 @@ pub enum Transparency {
     /// Identifier produced by an opaque expansion is always resolved at definition-site.
     /// Def-site spans in procedural macros, identifiers from `macro` by default use this.
     Opaque,
+}
+
+impl Transparency {
+    /// Returns `true` if the transparency is [`Opaque`].
+    ///
+    /// [`Opaque`]: Transparency::Opaque
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Opaque)
+    }
 }

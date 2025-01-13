@@ -10,10 +10,7 @@ pub fn test()
 where
     (): Test<{ 1 + (<() as Elide(&())>::call) }>,
     //~^ ERROR cannot capture late-bound lifetime in constant
-    //~| ERROR associated type bindings are not allowed here
-    //~| ERROR the trait bound `(): Elide<(&(),)>` is not satisfied
-    //~| ERROR the trait bound `(): Elide<(&(),)>` is not satisfied
-    //~| ERROR cannot add
+    //~| ERROR associated item constraints are not allowed here
 {
 }
 

@@ -1,13 +1,11 @@
-use crate::error;
-use crate::fmt;
+use super::abi::usercalls;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
 use crate::sync::Arc;
 use crate::sys::fd::FileDesc;
-use crate::sys::{sgx_ineffective, unsupported, AsInner, FromInner, IntoInner, TryIntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner, TryIntoInner, sgx_ineffective, unsupported};
 use crate::time::Duration;
-
-use super::abi::usercalls;
+use crate::{error, fmt};
 
 const DEFAULT_FAKE_TTL: u32 = 64;
 
@@ -80,9 +78,8 @@ fn io_err_to_addr(result: io::Result<&SocketAddr>) -> io::Result<String> {
     }
 }
 
-fn addr_to_sockaddr(addr: &Option<String>) -> io::Result<SocketAddr> {
-    addr.as_ref()
-        .ok_or(io::ErrorKind::AddrNotAvailable)?
+fn addr_to_sockaddr(addr: Option<&str>) -> io::Result<SocketAddr> {
+    addr.ok_or(io::ErrorKind::AddrNotAvailable)?
         .to_socket_addrs()
         // unwrap OK: if an iterator is returned, we're guaranteed to get exactly one entry
         .map(|mut it| it.next().unwrap())
@@ -97,10 +94,7 @@ impl TcpStream {
 
     pub fn connect_timeout(addr: &SocketAddr, dur: Duration) -> io::Result<TcpStream> {
         if dur == Duration::default() {
-            return Err(io::const_io_error!(
-                io::ErrorKind::InvalidInput,
-                "cannot set a 0 duration timeout",
-            ));
+            return Err(io::Error::ZERO_TIMEOUT);
         }
         Self::connect(Ok(addr)) // FIXME: ignoring timeout
     }
@@ -108,10 +102,7 @@ impl TcpStream {
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match dur {
             Some(dur) if dur == Duration::default() => {
-                return Err(io::const_io_error!(
-                    io::ErrorKind::InvalidInput,
-                    "cannot set a 0 duration timeout",
-                ));
+                return Err(io::Error::ZERO_TIMEOUT);
             }
             _ => sgx_ineffective(()),
         }
@@ -120,10 +111,7 @@ impl TcpStream {
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match dur {
             Some(dur) if dur == Duration::default() => {
-                return Err(io::const_io_error!(
-                    io::ErrorKind::InvalidInput,
-                    "cannot set a 0 duration timeout",
-                ));
+                return Err(io::Error::ZERO_TIMEOUT);
             }
             _ => sgx_ineffective(()),
         }
@@ -172,11 +160,11 @@ impl TcpStream {
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        addr_to_sockaddr(&self.peer_addr)
+        addr_to_sockaddr(self.peer_addr.as_deref())
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        addr_to_sockaddr(&self.inner.local_addr)
+        addr_to_sockaddr(self.inner.local_addr.as_deref())
     }
 
     pub fn shutdown(&self, _: Shutdown) -> io::Result<()> {
@@ -266,13 +254,14 @@ impl TcpListener {
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        addr_to_sockaddr(&self.inner.local_addr)
+        addr_to_sockaddr(self.inner.local_addr.as_deref())
     }
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (fd, local_addr, peer_addr) = usercalls::accept_stream(self.inner.inner.raw())?;
         let peer_addr = Some(peer_addr);
-        let ret_peer = addr_to_sockaddr(&peer_addr).unwrap_or_else(|_| ([0; 4], 0).into());
+        let ret_peer =
+            addr_to_sockaddr(peer_addr.as_deref()).unwrap_or_else(|_| ([0; 4], 0).into());
         Ok((TcpStream { inner: Socket::new(fd, local_addr), peer_addr }, ret_peer))
     }
 
@@ -524,6 +513,7 @@ pub mod netc {
 
     #[derive(Copy, Clone)]
     pub struct sockaddr_in {
+        #[allow(dead_code)]
         pub sin_family: sa_family_t,
         pub sin_port: u16,
         pub sin_addr: in_addr,
@@ -536,6 +526,7 @@ pub mod netc {
 
     #[derive(Copy, Clone)]
     pub struct sockaddr_in6 {
+        #[allow(dead_code)]
         pub sin6_family: sa_family_t,
         pub sin6_port: u16,
         pub sin6_addr: in6_addr,

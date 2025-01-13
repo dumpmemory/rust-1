@@ -1,5 +1,5 @@
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-//@ unit-test: GVN
+//@ test-mir-pass: GVN
 
 // EMIT_MIR mutable_variable_aggregate_partial_read.main.GVN.diff
 fn main() {
@@ -9,7 +9,7 @@ fn main() {
     // CHECK: [[x]] = foo()
     // CHECK: ([[x]].1: i32) = const 99_i32;
     // CHECK: ([[x]].0: i32) = const 42_i32;
-    // CHECK: [[y]] = ([[x]].1: i32);
+    // CHECK: [[y]] = copy ([[x]].1: i32);
     let mut x: (i32, i32) = foo();
     x.1 = 99;
     x.0 = 42;

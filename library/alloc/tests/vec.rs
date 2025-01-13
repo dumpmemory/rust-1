@@ -1,3 +1,6 @@
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
+
 use core::alloc::{Allocator, Layout};
 use core::num::NonZero;
 use core::ptr::NonNull;
@@ -8,15 +11,14 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::TryReserveErrorKind::*;
 use std::fmt::Debug;
-use std::hint;
 use std::iter::InPlaceIterable;
-use std::mem;
 use std::mem::{size_of, swap};
 use std::ops::Bound::*;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::vec::{Drain, IntoIter};
+use std::{hint, mem};
 
 struct DropCounter<'a> {
     count: &'a mut u32,
@@ -1202,22 +1204,16 @@ fn test_from_iter_specialization_with_iterator_adapters() {
 #[test]
 fn test_in_place_specialization_step_up_down() {
     fn assert_in_place_trait<T: InPlaceIterable>(_: &T) {}
-    let src = vec![[0u8; 4]; 256];
-    let srcptr = src.as_ptr();
-    let src_cap = src.capacity();
-    let iter = src.into_iter().flatten();
-    assert_in_place_trait(&iter);
-    let sink = iter.collect::<Vec<_>>();
-    let sinkptr = sink.as_ptr();
-    assert_eq!(srcptr as *const u8, sinkptr);
-    assert_eq!(src_cap * 4, sink.capacity());
 
-    let iter = sink.into_iter().array_chunks::<4>();
+    let src = vec![0u8; 1024];
+    let srcptr = src.as_ptr();
+    let src_bytes = src.capacity();
+    let iter = src.into_iter().array_chunks::<4>();
     assert_in_place_trait(&iter);
     let sink = iter.collect::<Vec<_>>();
     let sinkptr = sink.as_ptr();
-    assert_eq!(srcptr, sinkptr);
-    assert_eq!(src_cap, sink.capacity());
+    assert_eq!(srcptr.addr(), sinkptr.addr());
+    assert_eq!(src_bytes, sink.capacity() * 4);
 
     let mut src: Vec<u8> = Vec::with_capacity(17);
     let src_bytes = src.capacity();
@@ -1234,13 +1230,6 @@ fn test_in_place_specialization_step_up_down() {
     let sink: Vec<[u8; 2]> = iter.collect();
     assert_eq!(sink.len(), 8);
     assert!(sink.capacity() <= 25);
-
-    let src = vec![[0u8; 4]; 256];
-    let srcptr = src.as_ptr();
-    let iter = src.into_iter().flat_map(|a| a.into_iter().map(|b| b.wrapping_add(1)));
-    assert_in_place_trait(&iter);
-    let sink = iter.collect::<Vec<_>>();
-    assert_eq!(srcptr as *const u8, sink.as_ptr());
 }
 
 #[test]
@@ -1285,6 +1274,8 @@ fn test_from_iter_specialization_panic_during_iteration_drops() {
 
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#[allow(static_mut_refs)]
 fn test_from_iter_specialization_panic_during_drop_doesnt_leak() {
     static mut DROP_COUNTER_OLD: [usize; 5] = [0; 5];
     static mut DROP_COUNTER_NEW: [usize; 2] = [0; 2];
@@ -1346,6 +1337,20 @@ fn test_collect_after_iterator_clone() {
     assert_eq!(v, [1, 1, 1, 1, 1]);
     assert!(v.len() <= v.capacity());
 }
+
+// regression test for #135103, similar to the one above Flatten/FlatMap had an unsound InPlaceIterable
+// implementation.
+#[test]
+fn test_flatten_clone() {
+    const S: String = String::new();
+
+    let v = vec![[S, "Hello World!".into()], [S, S]];
+    let mut i = v.into_iter().flatten();
+    let _ = i.next();
+    let result: Vec<String> = i.clone().collect();
+    assert_eq!(result, ["Hello World!", "", ""]);
+}
+
 #[test]
 fn test_cow_from() {
     let borrowed: &[_] = &["borrowed", "(slice)"];
@@ -1410,7 +1415,7 @@ fn extract_if_empty() {
     let mut vec: Vec<i32> = vec![];
 
     {
-        let mut iter = vec.extract_if(|_| true);
+        let mut iter = vec.extract_if(.., |_| true);
         assert_eq!(iter.size_hint(), (0, Some(0)));
         assert_eq!(iter.next(), None);
         assert_eq!(iter.size_hint(), (0, Some(0)));
@@ -1427,7 +1432,7 @@ fn extract_if_zst() {
     let initial_len = vec.len();
     let mut count = 0;
     {
-        let mut iter = vec.extract_if(|_| true);
+        let mut iter = vec.extract_if(.., |_| true);
         assert_eq!(iter.size_hint(), (0, Some(initial_len)));
         while let Some(_) = iter.next() {
             count += 1;
@@ -1450,7 +1455,7 @@ fn extract_if_false() {
     let initial_len = vec.len();
     let mut count = 0;
     {
-        let mut iter = vec.extract_if(|_| false);
+        let mut iter = vec.extract_if(.., |_| false);
         assert_eq!(iter.size_hint(), (0, Some(initial_len)));
         for _ in iter.by_ref() {
             count += 1;
@@ -1472,7 +1477,7 @@ fn extract_if_true() {
     let initial_len = vec.len();
     let mut count = 0;
     {
-        let mut iter = vec.extract_if(|_| true);
+        let mut iter = vec.extract_if(.., |_| true);
         assert_eq!(iter.size_hint(), (0, Some(initial_len)));
         while let Some(_) = iter.next() {
             count += 1;
@@ -1489,6 +1494,31 @@ fn extract_if_true() {
 }
 
 #[test]
+fn extract_if_ranges() {
+    let mut vec = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+    let mut count = 0;
+    let it = vec.extract_if(1..=3, |_| {
+        count += 1;
+        true
+    });
+    assert_eq!(it.collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(vec, vec![0, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(count, 3);
+
+    let it = vec.extract_if(1..=3, |_| false);
+    assert_eq!(it.collect::<Vec<_>>(), vec![]);
+    assert_eq!(vec, vec![0, 4, 5, 6, 7, 8, 9, 10]);
+}
+
+#[test]
+#[should_panic]
+fn extract_if_out_of_bounds() {
+    let mut vec = vec![0, 1];
+    let _ = vec.extract_if(5.., |_| true).for_each(drop);
+}
+
+#[test]
 fn extract_if_complex() {
     {
         //                [+xxx++++++xxxxx++++x+x++]
@@ -1497,7 +1527,7 @@ fn extract_if_complex() {
             39,
         ];
 
-        let removed = vec.extract_if(|x| *x % 2 == 0).collect::<Vec<_>>();
+        let removed = vec.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
         assert_eq!(removed.len(), 10);
         assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
 
@@ -1511,7 +1541,7 @@ fn extract_if_complex() {
             2, 4, 6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36, 37, 39,
         ];
 
-        let removed = vec.extract_if(|x| *x % 2 == 0).collect::<Vec<_>>();
+        let removed = vec.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
         assert_eq!(removed.len(), 10);
         assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
 
@@ -1524,7 +1554,7 @@ fn extract_if_complex() {
         let mut vec =
             vec![2, 4, 6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36];
 
-        let removed = vec.extract_if(|x| *x % 2 == 0).collect::<Vec<_>>();
+        let removed = vec.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
         assert_eq!(removed.len(), 10);
         assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
 
@@ -1536,7 +1566,7 @@ fn extract_if_complex() {
         //                [xxxxxxxxxx+++++++++++]
         let mut vec = vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
 
-        let removed = vec.extract_if(|x| *x % 2 == 0).collect::<Vec<_>>();
+        let removed = vec.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
         assert_eq!(removed.len(), 10);
         assert_eq!(removed, vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
 
@@ -1548,7 +1578,7 @@ fn extract_if_complex() {
         //                [+++++++++++xxxxxxxxxx]
         let mut vec = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20];
 
-        let removed = vec.extract_if(|x| *x % 2 == 0).collect::<Vec<_>>();
+        let removed = vec.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
         assert_eq!(removed.len(), 10);
         assert_eq!(removed, vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
 
@@ -1596,7 +1626,7 @@ fn extract_if_consumed_panic() {
             }
             c.index < 6
         };
-        let drain = data.extract_if(filter);
+        let drain = data.extract_if(.., filter);
 
         // NOTE: The ExtractIf is explicitly consumed
         drain.for_each(drop);
@@ -1649,7 +1679,7 @@ fn extract_if_unconsumed_panic() {
             }
             c.index < 6
         };
-        let _drain = data.extract_if(filter);
+        let _drain = data.extract_if(.., filter);
 
         // NOTE: The ExtractIf is dropped without being consumed
     });
@@ -1665,7 +1695,7 @@ fn extract_if_unconsumed_panic() {
 #[test]
 fn extract_if_unconsumed() {
     let mut vec = vec![1, 2, 3, 4];
-    let drain = vec.extract_if(|&mut x| x % 2 != 0);
+    let drain = vec.extract_if(.., |&mut x| x % 2 != 0);
     drop(drain);
     assert_eq!(vec, [1, 2, 3, 4]);
 }
@@ -1696,7 +1726,6 @@ fn test_reserve_exact() {
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
-#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_with_capacity() {
     let mut vec: Vec<u32> = Vec::try_with_capacity(5).unwrap();
     assert_eq!(0, vec.len());
@@ -1708,7 +1737,6 @@ fn test_try_with_capacity() {
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
-#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_reserve() {
     // These are the interesting cases:
     // * exactly isize::MAX should never trigger a CapacityOverflow (can be OOM)
@@ -1804,7 +1832,6 @@ fn test_try_reserve() {
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
-#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_reserve_exact() {
     // This is exactly the same as test_try_reserve with the method changed.
     // See that test for comments.
@@ -2572,7 +2599,8 @@ fn test_into_flattened_size_overflow() {
 
 #[test]
 fn test_box_zero_allocator() {
-    use core::{alloc::AllocError, cell::RefCell};
+    use core::alloc::AllocError;
+    use core::cell::RefCell;
     use std::collections::HashSet;
 
     // Track ZST allocations and ensure that they all have a matching free.
@@ -2642,4 +2670,85 @@ fn test_vec_from_array_ref() {
 #[test]
 fn test_vec_from_array_mut_ref() {
     assert_eq!(Vec::from(&mut [1, 2, 3]), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_pop_if() {
+    let mut v = vec![1, 2, 3, 4];
+    let pred = |x: &mut i32| *x % 2 == 0;
+
+    assert_eq!(v.pop_if(pred), Some(4));
+    assert_eq!(v, [1, 2, 3]);
+
+    assert_eq!(v.pop_if(pred), None);
+    assert_eq!(v, [1, 2, 3]);
+}
+
+#[test]
+fn test_pop_if_empty() {
+    let mut v = Vec::<i32>::new();
+    assert_eq!(v.pop_if(|_| true), None);
+    assert!(v.is_empty());
+}
+
+#[test]
+fn test_pop_if_mutates() {
+    let mut v = vec![1];
+    let pred = |x: &mut i32| {
+        *x += 1;
+        false
+    };
+    assert_eq!(v.pop_if(pred), None);
+    assert_eq!(v, [2]);
+}
+
+/// This assortment of tests, in combination with miri, verifies we handle UB on fishy arguments
+/// in the stdlib. Draining and extending the allocation are fairly well-tested earlier, but
+/// `vec.insert(usize::MAX, val)` once slipped by!
+///
+/// All code that manipulates the collection types should be tested with "trivially wrong" args.
+#[test]
+fn max_dont_panic() {
+    let mut v = vec![0];
+    let _ = v.get(usize::MAX);
+    v.shrink_to(usize::MAX);
+    v.truncate(usize::MAX);
+}
+
+#[test]
+#[should_panic]
+fn max_insert() {
+    let mut v = vec![0];
+    v.insert(usize::MAX, 1);
+}
+
+#[test]
+#[should_panic]
+fn max_remove() {
+    let mut v = vec![0];
+    v.remove(usize::MAX);
+}
+
+#[test]
+#[should_panic]
+fn max_splice() {
+    let mut v = vec![0];
+    v.splice(usize::MAX.., core::iter::once(1));
+}
+
+#[test]
+#[should_panic]
+fn max_swap_remove() {
+    let mut v = vec![0];
+    v.swap_remove(usize::MAX);
+}
+
+// Regression test for #135338
+#[test]
+fn vec_null_ptr_roundtrip() {
+    let ptr = std::ptr::from_ref(&42);
+    let zero = ptr.with_addr(0);
+    let roundtripped = vec![zero; 1].pop().unwrap();
+    let new = roundtripped.with_addr(ptr.addr());
+    unsafe { new.read() };
 }

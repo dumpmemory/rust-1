@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::is_ty_alias;
-use hir::def::Res;
 use hir::ExprKind;
+use hir::def::Res;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
@@ -56,7 +56,7 @@ fn is_alias(ty: hir::Ty<'_>) -> bool {
 
 impl LateLintPass<'_> for DefaultConstructedUnitStructs {
     fn check_expr<'tcx>(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
-        if let hir::ExprKind::Call(fn_expr, &[]) = expr.kind
+        if let ExprKind::Call(fn_expr, &[]) = expr.kind
             // make sure we have a call to `Default::default`
             && let ExprKind::Path(ref qpath @ hir::QPath::TypeRelative(base, _)) = fn_expr.kind
             // make sure this isn't a type alias:

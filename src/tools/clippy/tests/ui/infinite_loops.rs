@@ -137,7 +137,7 @@ fn can_break_both_inner_and_outer(cond: bool) {
 }
 
 fn break_wrong_loop(cond: bool) {
-    // 'inner has statement to break 'outer loop, but it was breaked early by a labeled child loop
+    // 'inner has statement to break 'outer loop, but it was broken out of early by a labeled child loop
     'outer: loop {
         loop {
             //~^ ERROR: infinite loop detected
@@ -387,6 +387,63 @@ fn span_inside_fn() {
         loop {
             do_nothing();
         }
+    }
+}
+
+fn continue_outer() {
+    // Should not lint (issue #13511)
+    let mut count = 0;
+    'outer: loop {
+        if count != 0 {
+            break;
+        }
+
+        loop {
+            count += 1;
+            continue 'outer;
+        }
+    }
+
+    // This should lint as we continue the loop itself
+    'infinite: loop {
+        //~^ ERROR: infinite loop detected
+        loop {
+            continue 'infinite;
+        }
+    }
+    // This should lint as we continue an inner loop
+    loop {
+        //~^ ERROR: infinite loop detected
+        'inner: loop {
+            loop {
+                continue 'inner;
+            }
+        }
+    }
+
+    // This should lint as we continue the loop itself
+    loop {
+        //~^ ERROR: infinite loop detected
+        continue;
+    }
+}
+
+// don't suggest adding `-> !` to async fn/closure that already returning `-> !`
+mod issue_12338 {
+    use super::do_something;
+
+    async fn foo() -> ! {
+        loop {
+            do_something();
+        }
+    }
+
+    fn bar() {
+        let _ = async || -> ! {
+            loop {
+                do_something();
+            }
+        };
     }
 }
 

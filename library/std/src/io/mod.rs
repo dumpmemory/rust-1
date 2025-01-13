@@ -266,7 +266,7 @@
 //! its file descriptors with no operations being performed by any other part of the program.
 //!
 //! Note that exclusive ownership of a file descriptor does *not* imply exclusive ownership of the
-//! underlying kernel object that the file descriptor references (also called "file description" on
+//! underlying kernel object that the file descriptor references (also called "open file description" on
 //! some operating systems). File descriptors basically work like [`Arc`]: when you receive an owned
 //! file descriptor, you cannot know whether there are any other file descriptors that reference the
 //! same kernel object. However, when you create a new kernel object, you know that you are holding
@@ -297,41 +297,40 @@
 #[cfg(test)]
 mod tests;
 
-use crate::cmp;
-use crate::fmt;
-use crate::mem::take;
-use crate::ops::{Deref, DerefMut};
-use crate::slice;
-use crate::str;
-use crate::sys;
+#[unstable(feature = "read_buf", issue = "78485")]
+pub use core::io::{BorrowedBuf, BorrowedCursor};
 use core::slice::memchr;
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
 pub use self::buffered::WriterPanicked;
 #[unstable(feature = "raw_os_error_ty", issue = "107792")]
 pub use self::error::RawOsError;
-pub(crate) use self::stdio::attempt_print_to_stderr;
-#[unstable(feature = "internal_output_capture", issue = "none")]
-#[doc(no_inline, hidden)]
-pub use self::stdio::set_output_capture;
+#[doc(hidden)]
+#[unstable(feature = "io_const_error_internals", issue = "none")]
+pub use self::error::SimpleMessage;
+#[unstable(feature = "io_const_error", issue = "133448")]
+pub use self::error::const_error;
 #[stable(feature = "is_terminal", since = "1.70.0")]
 pub use self::stdio::IsTerminal;
+pub(crate) use self::stdio::attempt_print_to_stderr;
 #[unstable(feature = "print_internals", issue = "none")]
 #[doc(hidden)]
 pub use self::stdio::{_eprint, _print};
+#[unstable(feature = "internal_output_capture", issue = "none")]
+#[doc(no_inline, hidden)]
+pub use self::stdio::{set_output_capture, try_set_output_capture};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::{
     buffered::{BufReader, BufWriter, IntoInnerError, LineWriter},
     copy::copy,
     cursor::Cursor,
     error::{Error, ErrorKind, Result},
-    stdio::{stderr, stdin, stdout, Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock},
-    util::{empty, repeat, sink, Empty, Repeat, Sink},
+    stdio::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin, stdout},
+    util::{Empty, Repeat, Sink, empty, repeat, sink},
 };
-
-#[unstable(feature = "read_buf", issue = "78485")]
-pub use core::io::{BorrowedBuf, BorrowedCursor};
-pub(crate) use error::const_io_error;
+use crate::mem::take;
+use crate::ops::{Deref, DerefMut};
+use crate::{cmp, fmt, slice, str, sys};
 
 mod buffered;
 pub(crate) mod copy;
@@ -382,15 +381,13 @@ pub(crate) unsafe fn append_to_string<F>(buf: &mut String, f: F) -> Result<usize
 where
     F: FnOnce(&mut Vec<u8>) -> Result<usize>,
 {
-    let mut g = Guard { len: buf.len(), buf: buf.as_mut_vec() };
+    let mut g = Guard { len: buf.len(), buf: unsafe { buf.as_mut_vec() } };
     let ret = f(g.buf);
-    if str::from_utf8(&g.buf[g.len..]).is_err() {
-        ret.and_then(|_| {
-            Err(error::const_io_error!(
-                ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8"
-            ))
-        })
+
+    // SAFETY: the caller promises to only append data to `buf`
+    let appended = unsafe { g.buf.get_unchecked(g.len..) };
+    if str::from_utf8(appended).is_err() {
+        ret.and_then(|_| Err(Error::INVALID_UTF8))
     } else {
         g.len = g.buf.len();
         ret
@@ -404,8 +401,7 @@ where
 // - avoid passing large buffers to readers that always initialize the free capacity if they perform short reads (#23815, #23820)
 // - pass large buffers to readers that do not initialize the spare capacity. this can amortize per-call overheads
 // - and finally pass not-too-small and not-too-large buffers to Windows read APIs because they manage to suffer from both problems
-//   at the same time, i.e. small reads suffer from syscall overhead, all reads incur initialization cost
-//   proportional to buffer size (#110650)
+//   at the same time, i.e. small reads suffer from syscall overhead, all reads incur costs proportional to buffer size (#110650)
 //
 pub(crate) fn default_read_to_end<R: Read + ?Sized>(
     r: &mut R,
@@ -450,6 +446,8 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
         }
     }
 
+    let mut consecutive_short_reads = 0;
+
     loop {
         if buf.len() == buf.capacity() && buf.capacity() == start_cap {
             // The buffer might be an exact fit. Let's read into a probe buffer
@@ -479,24 +477,18 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
         }
 
         let mut cursor = read_buf.unfilled();
-        loop {
+        let result = loop {
             match r.read_buf(cursor.reborrow()) {
-                Ok(()) => break,
                 Err(e) if e.is_interrupted() => continue,
-                Err(e) => return Err(e),
+                // Do not stop now in case of error: we might have received both data
+                // and an error
+                res => break res,
             }
-        }
+        };
 
         let unfilled_but_initialized = cursor.init_ref().len();
         let bytes_read = cursor.written();
         let was_fully_initialized = read_buf.init_len() == buf_len;
-
-        if bytes_read == 0 {
-            return Ok(buf.len() - start_len);
-        }
-
-        // store how much was initialized but not filled
-        initialized = unfilled_but_initialized;
 
         // SAFETY: BorrowedBuf's invariants mean this much memory is initialized.
         unsafe {
@@ -504,12 +496,31 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
             buf.set_len(new_len);
         }
 
+        // Now that all data is pushed to the vector, we can fail without data loss
+        result?;
+
+        if bytes_read == 0 {
+            return Ok(buf.len() - start_len);
+        }
+
+        if bytes_read < buf_len {
+            consecutive_short_reads += 1;
+        } else {
+            consecutive_short_reads = 0;
+        }
+
+        // store how much was initialized but not filled
+        initialized = unfilled_but_initialized;
+
         // Use heuristics to determine the max read size if no initial size hint was provided
         if size_hint.is_none() {
             // The reader is returning short reads but it doesn't call ensure_init().
             // In that case we no longer need to restrict read sizes to avoid
             // initialization costs.
-            if !was_fully_initialized {
+            // When reading from disk we usually don't get any short reads except at EOF.
+            // So we wait for at least 2 short reads before uncapping the read buffer;
+            // this helps with the Windows issue.
+            if !was_fully_initialized && consecutive_short_reads > 1 {
                 max_read_size = usize::MAX;
             }
 
@@ -566,11 +577,7 @@ pub(crate) fn default_read_exact<R: Read + ?Sized>(this: &mut R, mut buf: &mut [
             Err(e) => return Err(e),
         }
     }
-    if !buf.is_empty() {
-        Err(error::const_io_error!(ErrorKind::UnexpectedEof, "failed to fill whole buffer"))
-    } else {
-        Ok(())
-    }
+    if !buf.is_empty() { Err(Error::READ_EXACT_EOF) } else { Ok(()) }
 }
 
 pub(crate) fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_>) -> Result<()>
@@ -579,6 +586,26 @@ where
 {
     let n = read(cursor.ensure_init().init_mut())?;
     cursor.advance(n);
+    Ok(())
+}
+
+pub(crate) fn default_read_buf_exact<R: Read + ?Sized>(
+    this: &mut R,
+    mut cursor: BorrowedCursor<'_>,
+) -> Result<()> {
+    while cursor.capacity() > 0 {
+        let prev_written = cursor.written();
+        match this.read_buf(cursor.reborrow()) {
+            Ok(()) => {}
+            Err(e) if e.is_interrupted() => continue,
+            Err(e) => return Err(e),
+        }
+
+        if cursor.written() == prev_written {
+            return Err(Error::READ_EXACT_EOF);
+        }
+    }
+
     Ok(())
 }
 
@@ -768,7 +795,7 @@ pub trait Read {
         false
     }
 
-    /// Read all bytes until EOF in this source, placing them into `buf`.
+    /// Reads all bytes until EOF in this source, placing them into `buf`.
     ///
     /// All bytes read from this source will be appended to the specified buffer
     /// `buf`. This function will continuously call [`read()`] to append more data to
@@ -852,7 +879,7 @@ pub trait Read {
         default_read_to_end(self, buf, None)
     }
 
-    /// Read all bytes until EOF in this source, appending them to `buf`.
+    /// Reads all bytes until EOF in this source, appending them to `buf`.
     ///
     /// If successful, this function returns the number of bytes which were read
     /// and appended to `buf`.
@@ -895,7 +922,7 @@ pub trait Read {
         default_read_to_string(self, buf, None)
     }
 
-    /// Read the exact number of bytes required to fill `buf`.
+    /// Reads the exact number of bytes required to fill `buf`.
     ///
     /// This function reads as many bytes as necessary to completely fill the
     /// specified buffer `buf`.
@@ -954,12 +981,14 @@ pub trait Read {
     /// with uninitialized buffers. The new data will be appended to any existing contents of `buf`.
     ///
     /// The default implementation delegates to `read`.
+    ///
+    /// This method makes it possible to return both data and an error but it is advised against.
     #[unstable(feature = "read_buf", issue = "78485")]
     fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> Result<()> {
         default_read_buf(|b| self.read(b), buf)
     }
 
-    /// Read the exact number of bytes required to fill `cursor`.
+    /// Reads the exact number of bytes required to fill `cursor`.
     ///
     /// This is similar to the [`read_exact`](Read::read_exact) method, except
     /// that it is passed a [`BorrowedCursor`] rather than `[u8]` to allow use
@@ -978,24 +1007,8 @@ pub trait Read {
     ///
     /// If this function returns an error, all bytes read will be appended to `cursor`.
     #[unstable(feature = "read_buf", issue = "78485")]
-    fn read_buf_exact(&mut self, mut cursor: BorrowedCursor<'_>) -> Result<()> {
-        while cursor.capacity() > 0 {
-            let prev_written = cursor.written();
-            match self.read_buf(cursor.reborrow()) {
-                Ok(()) => {}
-                Err(e) if e.is_interrupted() => continue,
-                Err(e) => return Err(e),
-            }
-
-            if cursor.written() == prev_written {
-                return Err(error::const_io_error!(
-                    ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer"
-                ));
-            }
-        }
-
-        Ok(())
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> Result<()> {
+        default_read_buf_exact(self, cursor)
     }
 
     /// Creates a "by reference" adaptor for this instance of `Read`.
@@ -1070,7 +1083,7 @@ pub trait Read {
     ///     let f = BufReader::new(File::open("foo.txt")?);
     ///
     ///     for byte in f.bytes() {
-    ///         println!("{}", byte.unwrap());
+    ///         println!("{}", byte?);
     ///     }
     ///     Ok(())
     /// }
@@ -1161,7 +1174,7 @@ pub trait Read {
     }
 }
 
-/// Read all bytes from a [reader][Read] into a new [`String`].
+/// Reads all bytes from a [reader][Read] into a new [`String`].
 ///
 /// This is a convenience function for [`Read::read_to_string`]. Using this
 /// function avoids having to create a variable first and provides more type
@@ -1214,7 +1227,7 @@ pub fn read_to_string<R: Read>(mut reader: R) -> Result<String> {
 
 /// A buffer type used with `Read::read_vectored`.
 ///
-/// It is semantically a wrapper around an `&mut [u8]`, but is guaranteed to be
+/// It is semantically a wrapper around a `&mut [u8]`, but is guaranteed to be
 /// ABI compatible with the `iovec` type on Unix platforms and `WSABUF` on
 /// Windows.
 #[stable(feature = "iovec", since = "1.36.0")]
@@ -1258,8 +1271,6 @@ impl<'a> IoSliceMut<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSliceMut;
     /// use std::ops::Deref;
     ///
@@ -1270,7 +1281,7 @@ impl<'a> IoSliceMut<'a> {
     /// buf.advance(3);
     /// assert_eq!(buf.deref(), [1; 5].as_ref());
     /// ```
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "1.81.0")]
     #[inline]
     pub fn advance(&mut self, n: usize) {
         self.0.advance(n)
@@ -1292,8 +1303,6 @@ impl<'a> IoSliceMut<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSliceMut;
     /// use std::ops::Deref;
     ///
@@ -1311,7 +1320,7 @@ impl<'a> IoSliceMut<'a> {
     /// assert_eq!(bufs[0].deref(), [2; 14].as_ref());
     /// assert_eq!(bufs[1].deref(), [3; 8].as_ref());
     /// ```
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "1.81.0")]
     #[inline]
     pub fn advance_slices(bufs: &mut &mut [IoSliceMut<'a>], n: usize) {
         // Number of buffers to remove.
@@ -1333,6 +1342,25 @@ impl<'a> IoSliceMut<'a> {
         } else {
             bufs[0].advance(left);
         }
+    }
+
+    /// Get the underlying bytes as a mutable slice with the original lifetime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(io_slice_as_bytes)]
+    /// use std::io::IoSliceMut;
+    ///
+    /// let mut data = *b"abcdef";
+    /// let io_slice = IoSliceMut::new(&mut data);
+    /// io_slice.into_slice()[0] = b'A';
+    ///
+    /// assert_eq!(&data, b"Abcdef");
+    /// ```
+    #[unstable(feature = "io_slice_as_bytes", issue = "132818")]
+    pub const fn into_slice(self) -> &'a mut [u8] {
+        self.0.into_slice()
     }
 }
 
@@ -1402,8 +1430,6 @@ impl<'a> IoSlice<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSlice;
     /// use std::ops::Deref;
     ///
@@ -1414,7 +1440,7 @@ impl<'a> IoSlice<'a> {
     /// buf.advance(3);
     /// assert_eq!(buf.deref(), [1; 5].as_ref());
     /// ```
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "1.81.0")]
     #[inline]
     pub fn advance(&mut self, n: usize) {
         self.0.advance(n)
@@ -1436,8 +1462,6 @@ impl<'a> IoSlice<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSlice;
     /// use std::ops::Deref;
     ///
@@ -1454,7 +1478,7 @@ impl<'a> IoSlice<'a> {
     /// IoSlice::advance_slices(&mut bufs, 10);
     /// assert_eq!(bufs[0].deref(), [2; 14].as_ref());
     /// assert_eq!(bufs[1].deref(), [3; 8].as_ref());
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "1.81.0")]
     #[inline]
     pub fn advance_slices(bufs: &mut &mut [IoSlice<'a>], n: usize) {
         // Number of buffers to remove.
@@ -1479,6 +1503,32 @@ impl<'a> IoSlice<'a> {
         } else {
             bufs[0].advance(left);
         }
+    }
+
+    /// Get the underlying bytes as a slice with the original lifetime.
+    ///
+    /// This doesn't borrow from `self`, so is less restrictive than calling
+    /// `.deref()`, which does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(io_slice_as_bytes)]
+    /// use std::io::IoSlice;
+    ///
+    /// let data = b"abcdef";
+    ///
+    /// let mut io_slice = IoSlice::new(data);
+    /// let tail = &io_slice.as_slice()[3..];
+    ///
+    /// // This works because `tail` doesn't borrow `io_slice`
+    /// io_slice = IoSlice::new(tail);
+    ///
+    /// assert_eq!(io_slice.as_slice(), b"def");
+    /// ```
+    #[unstable(feature = "io_slice_as_bytes", issue = "132818")]
+    pub const fn as_slice(self) -> &'a [u8] {
+        self.0.as_slice()
     }
 }
 
@@ -1541,7 +1591,7 @@ impl<'a> Deref for IoSlice<'a> {
 #[doc(notable_trait)]
 #[cfg_attr(not(test), rustc_diagnostic_item = "IoWrite")]
 pub trait Write {
-    /// Write a buffer into this writer, returning how many bytes were written.
+    /// Writes a buffer into this writer, returning how many bytes were written.
     ///
     /// This function will attempt to write the entire contents of `buf`, but
     /// the entire write might not succeed, or the write may also generate an
@@ -1640,7 +1690,7 @@ pub trait Write {
         false
     }
 
-    /// Flush this output stream, ensuring that all intermediately buffered
+    /// Flushes this output stream, ensuring that all intermediately buffered
     /// contents reach their destination.
     ///
     /// # Errors
@@ -1702,10 +1752,7 @@ pub trait Write {
         while !buf.is_empty() {
             match self.write(buf) {
                 Ok(0) => {
-                    return Err(error::const_io_error!(
-                        ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ));
+                    return Err(Error::WRITE_ALL_EOF);
                 }
                 Ok(n) => buf = &buf[n..],
                 Err(ref e) if e.is_interrupted() => {}
@@ -1770,10 +1817,7 @@ pub trait Write {
         while !bufs.is_empty() {
             match self.write_vectored(bufs) {
                 Ok(0) => {
-                    return Err(error::const_io_error!(
-                        ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ));
+                    return Err(Error::WRITE_ALL_EOF);
                 }
                 Ok(n) => IoSlice::advance_slices(&mut bufs, n),
                 Err(ref e) if e.is_interrupted() => {}
@@ -1847,7 +1891,11 @@ pub trait Write {
                 if output.error.is_err() {
                     output.error
                 } else {
-                    Err(error::const_io_error!(ErrorKind::Uncategorized, "formatter error"))
+                    // This shouldn't happen: the underlying stream did not error, but somehow
+                    // the formatter still errored?
+                    panic!(
+                        "a formatting trait implementation returned an error when the underlying stream did not"
+                    );
                 }
             }
         }
@@ -1947,15 +1995,16 @@ pub trait Seek {
     ///     .write(true)
     ///     .read(true)
     ///     .create(true)
-    ///     .open("foo.txt").unwrap();
+    ///     .open("foo.txt")?;
     ///
     /// let hello = "Hello!\n";
-    /// write!(f, "{hello}").unwrap();
-    /// f.rewind().unwrap();
+    /// write!(f, "{hello}")?;
+    /// f.rewind()?;
     ///
     /// let mut buf = String::new();
-    /// f.read_to_string(&mut buf).unwrap();
+    /// f.read_to_string(&mut buf)?;
     /// assert_eq!(&buf, hello);
+    /// # std::io::Result::Ok(())
     /// ```
     #[stable(feature = "seek_rewind", since = "1.55.0")]
     fn rewind(&mut self) -> Result<()> {
@@ -2048,7 +2097,6 @@ pub trait Seek {
     /// # Example
     ///
     /// ```no_run
-    /// #![feature(seek_seek_relative)]
     /// use std::{
     ///     io::{self, Seek},
     ///     fs::File,
@@ -2063,7 +2111,7 @@ pub trait Seek {
     /// ```
     ///
     /// [`BufReader`]: crate::io::BufReader
-    #[unstable(feature = "seek_seek_relative", issue = "117374")]
+    #[stable(feature = "seek_seek_relative", since = "1.80.0")]
     fn seek_relative(&mut self, offset: i64) -> Result<()> {
         self.seek(SeekFrom::Current(offset))?;
         Ok(())
@@ -2075,6 +2123,7 @@ pub trait Seek {
 /// It is used by the [`Seek`] trait.
 #[derive(Copy, PartialEq, Eq, Clone, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "SeekFrom")]
 pub enum SeekFrom {
     /// Sets the offset to the provided number of bytes.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -2164,8 +2213,9 @@ fn skip_until<R: BufRead + ?Sized>(r: &mut R, delim: u8) -> Result<usize> {
 ///
 /// let stdin = io::stdin();
 /// for line in stdin.lock().lines() {
-///     println!("{}", line.unwrap());
+///     println!("{}", line?);
 /// }
+/// # std::io::Result::Ok(())
 /// ```
 ///
 /// If you have something that implements [`Read`], you can use the [`BufReader`
@@ -2188,7 +2238,8 @@ fn skip_until<R: BufRead + ?Sized>(r: &mut R, delim: u8) -> Result<usize> {
 ///     let f = BufReader::new(f);
 ///
 ///     for line in f.lines() {
-///         println!("{}", line.unwrap());
+///         let line = line?;
+///         println!("{line}");
 ///     }
 ///
 ///     Ok(())
@@ -2226,7 +2277,7 @@ pub trait BufRead: Read {
     /// let stdin = io::stdin();
     /// let mut stdin = stdin.lock();
     ///
-    /// let buffer = stdin.fill_buf().unwrap();
+    /// let buffer = stdin.fill_buf()?;
     ///
     /// // work with buffer
     /// println!("{buffer:?}");
@@ -2234,6 +2285,7 @@ pub trait BufRead: Read {
     /// // ensure the bytes we worked with aren't returned again later
     /// let length = buffer.len();
     /// stdin.consume(length);
+    /// # std::io::Result::Ok(())
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fill_buf(&mut self) -> Result<&[u8]>;
@@ -2260,7 +2312,7 @@ pub trait BufRead: Read {
     #[stable(feature = "rust1", since = "1.0.0")]
     fn consume(&mut self, amt: usize);
 
-    /// Check if the underlying `Read` has any data left to be read.
+    /// Checks if the underlying `Read` has any data left to be read.
     ///
     /// This function may fill the buffer to check for data,
     /// so this functions returns `Result<bool>`, not `bool`.
@@ -2279,19 +2331,20 @@ pub trait BufRead: Read {
     /// let stdin = io::stdin();
     /// let mut stdin = stdin.lock();
     ///
-    /// while stdin.has_data_left().unwrap() {
+    /// while stdin.has_data_left()? {
     ///     let mut line = String::new();
-    ///     stdin.read_line(&mut line).unwrap();
+    ///     stdin.read_line(&mut line)?;
     ///     // work with line
     ///     println!("{line:?}");
     /// }
+    /// # std::io::Result::Ok(())
     /// ```
     #[unstable(feature = "buf_read_has_data_left", reason = "recently added", issue = "86423")]
     fn has_data_left(&mut self) -> Result<bool> {
         self.fill_buf().map(|b| !b.is_empty())
     }
 
-    /// Read all bytes into `buf` until the delimiter `byte` or EOF is reached.
+    /// Reads all bytes into `buf` until the delimiter `byte` or EOF is reached.
     ///
     /// This function will read bytes from the underlying stream until the
     /// delimiter or EOF is found. Once found, all bytes up to, and including,
@@ -2350,7 +2403,7 @@ pub trait BufRead: Read {
         read_until(self, byte, buf)
     }
 
-    /// Skip all bytes until the delimiter `byte` or EOF is reached.
+    /// Skips all bytes until the delimiter `byte` or EOF is reached.
     ///
     /// This function will read (and discard) bytes from the underlying stream until the
     /// delimiter or EOF is found.
@@ -2382,8 +2435,6 @@ pub trait BufRead: Read {
     /// about Ferris from a binary string, skipping the fun fact:
     ///
     /// ```
-    /// #![feature(bufread_skip_until)]
-    ///
     /// use std::io::{self, BufRead};
     ///
     /// let mut cursor = io::Cursor::new(b"Ferris\0Likes long walks on the beach\0Crustacean\0");
@@ -2407,12 +2458,12 @@ pub trait BufRead: Read {
     /// assert_eq!(num_bytes, 11);
     /// assert_eq!(animal, b"Crustacean\0");
     /// ```
-    #[unstable(feature = "bufread_skip_until", issue = "111735")]
+    #[stable(feature = "bufread_skip_until", since = "1.83.0")]
     fn skip_until(&mut self, byte: u8) -> Result<usize> {
         skip_until(self, byte)
     }
 
-    /// Read all bytes until a newline (the `0xA` byte) is reached, and append
+    /// Reads all bytes until a newline (the `0xA` byte) is reached, and append
     /// them to the provided `String` buffer.
     ///
     /// Previous content of the buffer will be preserved. To avoid appending to
@@ -2947,7 +2998,7 @@ impl<T: Read> Read for Take<T> {
             }
 
             let mut cursor = sliced_buf.unfilled();
-            self.inner.read_buf(cursor.reborrow())?;
+            let result = self.inner.read_buf(cursor.reborrow());
 
             let new_init = cursor.init_ref().len();
             let filled = sliced_buf.len();
@@ -2962,13 +3013,14 @@ impl<T: Read> Read for Take<T> {
             }
 
             self.limit -= filled as u64;
+
+            result
         } else {
             let written = buf.written();
-            self.inner.read_buf(buf.reborrow())?;
+            let result = self.inner.read_buf(buf.reborrow());
             self.limit -= (buf.written() - written) as u64;
+            result
         }
-
-        Ok(())
     }
 }
 
@@ -3051,7 +3103,7 @@ where
     }
 }
 
-/// Read a single byte in a slow, generic way. This is used by the default
+/// Reads a single byte in a slow, generic way. This is used by the default
 /// `spec_read_byte`.
 #[inline]
 fn inlined_slow_read_byte<R: Read>(reader: &mut R) -> Option<Result<u8>> {

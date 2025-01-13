@@ -1,22 +1,16 @@
-#[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use std::fmt;
 
-use crate::{DebruijnIndex, DebugWithInfcx, InferCtxtLike, Interner, WithInfcx};
+use derive_where::derive_where;
+#[cfg(feature = "nightly")]
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+#[cfg(feature = "nightly")]
+use rustc_macros::{HashStable_NoContext, TyDecodable, TyEncodable};
+use rustc_type_ir_macros::{Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic};
 
-use self::ConstKind::*;
+use crate::{self as ty, DebruijnIndex, Interner};
 
 /// Represents a constant in Rust.
-#[derive(derivative::Derivative)]
-#[derivative(
-    Clone(bound = ""),
-    Copy(bound = ""),
-    PartialOrd(bound = ""),
-    PartialOrd = "feature_allow_slow_enum",
-    Ord(bound = ""),
-    Ord = "feature_allow_slow_enum",
-    Hash(bound = "")
-)]
+#[derive_where(Clone, Copy, Hash, PartialEq, Eq; I: Interner)]
 #[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable, HashStable_NoContext))]
 pub enum ConstKind<I: Interner> {
     /// A const generic parameter.
@@ -34,10 +28,10 @@ pub enum ConstKind<I: Interner> {
     /// An unnormalized const item such as an anon const or assoc const or free const item.
     /// Right now anything other than anon consts does not actually work properly but this
     /// should
-    Unevaluated(I::AliasConst),
+    Unevaluated(ty::UnevaluatedConst<I>),
 
     /// Used to hold computed value.
-    Value(I::ValueConst),
+    Value(I::Ty, I::ValueConst),
 
     /// A placeholder for a const which could not be computed; this is
     /// propagated to avoid useless error messages.
@@ -48,49 +42,36 @@ pub enum ConstKind<I: Interner> {
     Expr(I::ExprConst),
 }
 
-impl<I: Interner> PartialEq for ConstKind<I> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Param(l0), Param(r0)) => l0 == r0,
-            (Infer(l0), Infer(r0)) => l0 == r0,
-            (Bound(l0, l1), Bound(r0, r1)) => l0 == r0 && l1 == r1,
-            (Placeholder(l0), Placeholder(r0)) => l0 == r0,
-            (Unevaluated(l0), Unevaluated(r0)) => l0 == r0,
-            (Value(l0), Value(r0)) => l0 == r0,
-            (Error(l0), Error(r0)) => l0 == r0,
-            (Expr(l0), Expr(r0)) => l0 == r0,
-            _ => false,
-        }
-    }
-}
-
-impl<I: Interner> Eq for ConstKind<I> {}
-
 impl<I: Interner> fmt::Debug for ConstKind<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        WithInfcx::with_no_infcx(self).fmt(f)
+        use ConstKind::*;
+
+        match self {
+            Param(param) => write!(f, "{param:?}"),
+            Infer(var) => write!(f, "{var:?}"),
+            Bound(debruijn, var) => crate::debug_bound_var(f, *debruijn, var),
+            Placeholder(placeholder) => write!(f, "{placeholder:?}"),
+            Unevaluated(uv) => write!(f, "{uv:?}"),
+            Value(ty, valtree) => write!(f, "({valtree:?}: {ty:?})"),
+            Error(_) => write!(f, "{{const error}}"),
+            Expr(expr) => write!(f, "{expr:?}"),
+        }
     }
 }
 
-impl<I: Interner> DebugWithInfcx<I> for ConstKind<I> {
-    fn fmt<Infcx: InferCtxtLike<Interner = I>>(
-        this: WithInfcx<'_, Infcx, &Self>,
-        f: &mut core::fmt::Formatter<'_>,
-    ) -> core::fmt::Result {
-        use ConstKind::*;
+/// An unevaluated (potentially generic) constant used in the type-system.
+#[derive_where(Clone, Copy, Debug, Hash, PartialEq, Eq; I: Interner)]
+#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[cfg_attr(feature = "nightly", derive(TyDecodable, TyEncodable, HashStable_NoContext))]
+pub struct UnevaluatedConst<I: Interner> {
+    pub def: I::DefId,
+    pub args: I::GenericArgs,
+}
 
-        match this.data {
-            Param(param) => write!(f, "{param:?}"),
-            Infer(var) => write!(f, "{:?}", &this.wrap(var)),
-            Bound(debruijn, var) => crate::debug_bound_var(f, *debruijn, var),
-            Placeholder(placeholder) => write!(f, "{placeholder:?}"),
-            Unevaluated(uv) => {
-                write!(f, "{:?}", &this.wrap(uv))
-            }
-            Value(valtree) => write!(f, "{valtree:?}"),
-            Error(_) => write!(f, "{{const error}}"),
-            Expr(expr) => write!(f, "{:?}", &this.wrap(expr)),
-        }
+impl<I: Interner> UnevaluatedConst<I> {
+    #[inline]
+    pub fn new(def: I::DefId, args: I::GenericArgs) -> UnevaluatedConst<I> {
+        UnevaluatedConst { def, args }
     }
 }
 
@@ -103,32 +84,12 @@ rustc_index::newtype_index! {
     pub struct ConstVid {}
 }
 
-rustc_index::newtype_index! {
-    /// An **effect** **v**ariable **ID**.
-    ///
-    /// Handling effect infer variables happens separately from const infer variables
-    /// because we do not want to reuse any of the const infer machinery. If we try to
-    /// relate an effect variable with a normal one, we would ICE, which can catch bugs
-    /// where we are not correctly using the effect var for an effect param. Fallback
-    /// is also implemented on top of having separate effect and normal const variables.
-    #[encodable]
-    #[orderable]
-    #[debug_format = "?{}e"]
-    #[gate_rustc_only]
-    pub struct EffectVid {}
-}
-
 /// An inference variable for a const, for use in const generics.
 #[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable))]
 pub enum InferConst {
     /// Infer the value of the const.
     Var(ConstVid),
-    /// Infer the value of the effect.
-    ///
-    /// For why this is separate from the `Var` variant above, see the
-    /// documentation on `EffectVid`.
-    EffectVar(EffectVid),
     /// A fresh const variable. See `infer::freshen` for more details.
     Fresh(u32),
 }
@@ -137,25 +98,7 @@ impl fmt::Debug for InferConst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InferConst::Var(var) => write!(f, "{var:?}"),
-            InferConst::EffectVar(var) => write!(f, "{var:?}"),
             InferConst::Fresh(var) => write!(f, "Fresh({var:?})"),
-        }
-    }
-}
-impl<I: Interner> DebugWithInfcx<I> for InferConst {
-    fn fmt<Infcx: InferCtxtLike<Interner = I>>(
-        this: WithInfcx<'_, Infcx, &Self>,
-        f: &mut core::fmt::Formatter<'_>,
-    ) -> core::fmt::Result {
-        match *this.data {
-            InferConst::Var(vid) => match this.infcx.universe_of_ct(vid) {
-                None => write!(f, "{:?}", this.data),
-                Some(universe) => write!(f, "?{}_{}c", vid.index(), universe.index()),
-            },
-            InferConst::EffectVar(vid) => write!(f, "?{}e", vid.index()),
-            InferConst::Fresh(_) => {
-                unreachable!()
-            }
         }
     }
 }
@@ -164,7 +107,7 @@ impl<I: Interner> DebugWithInfcx<I> for InferConst {
 impl<CTX> HashStable<CTX> for InferConst {
     fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
         match self {
-            InferConst::Var(_) | InferConst::EffectVar(_) => {
+            InferConst::Var(_) => {
                 panic!("const variables should not be hashed: {self:?}")
             }
             InferConst::Fresh(i) => i.hash_stable(hcx, hasher),

@@ -1,9 +1,11 @@
-use crate::{fmt, iter::FusedIterator};
+use crate::fmt;
+use crate::iter::FusedIterator;
 
 /// Creates a new iterator where each successive item is computed based on the preceding one.
 ///
 /// The iterator starts with the given first item (if any)
 /// and calls the given `FnMut(&T) -> Option<T>` closure to compute each item’s successor.
+/// The iterator will yield the `T`s returned from the closure.
 ///
 /// ```
 /// use std::iter::successors;

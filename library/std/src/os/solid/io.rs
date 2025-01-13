@@ -44,18 +44,18 @@
 //!
 //! [`BorrowedFd<'a>`]: crate::os::solid::io::BorrowedFd
 
-#![deny(unsafe_op_in_unsafe_fn)]
 #![unstable(feature = "solid_ext", issue = "none")]
 
-use crate::fmt;
 use crate::marker::PhantomData;
-use crate::mem::forget;
-use crate::net;
-use crate::sys;
+use crate::mem::ManuallyDrop;
 use crate::sys_common::{self, AsInner, FromInner, IntoInner};
+use crate::{fmt, net, sys};
 
 /// Raw file descriptors.
 pub type RawFd = i32;
+
+// The max of this is -2, in two's complement. -1 is `SOLID_NET_INVALID_FD`.
+type ValidRawFd = core::num::niche_types::NotAllOnes<RawFd>;
 
 /// A borrowed SOLID Sockets file descriptor.
 ///
@@ -72,12 +72,9 @@ pub type RawFd = i32;
 /// socket, which is then borrowed under the same lifetime.
 #[derive(Copy, Clone)]
 #[repr(transparent)]
-#[rustc_layout_scalar_valid_range_start(0)]
-// This is -2, in two's complement. -1 is `SOLID_NET_INVALID_FD`.
-#[rustc_layout_scalar_valid_range_end(0xFF_FF_FF_FE)]
 #[rustc_nonnull_optimization_guaranteed]
 pub struct BorrowedFd<'socket> {
-    fd: RawFd,
+    fd: ValidRawFd,
     _phantom: PhantomData<&'socket OwnedFd>,
 }
 
@@ -90,16 +87,13 @@ pub struct BorrowedFd<'socket> {
 /// an argument, it is not captured or consumed, and it never has the value
 /// `SOLID_NET_INVALID_FD`.
 #[repr(transparent)]
-#[rustc_layout_scalar_valid_range_start(0)]
-// This is -2, in two's complement. -1 is `SOLID_NET_INVALID_FD`.
-#[rustc_layout_scalar_valid_range_end(0xFF_FF_FF_FE)]
 #[rustc_nonnull_optimization_guaranteed]
 pub struct OwnedFd {
-    fd: RawFd,
+    fd: ValidRawFd,
 }
 
 impl BorrowedFd<'_> {
-    /// Return a `BorrowedFd` holding the given raw file descriptor.
+    /// Returns a `BorrowedFd` holding the given raw file descriptor.
     ///
     /// # Safety
     ///
@@ -111,7 +105,8 @@ impl BorrowedFd<'_> {
         assert!(fd != -1 as RawFd);
         // SAFETY: we just asserted that the value is in the valid range and
         // isn't `-1` (the only value bigger than `0xFF_FF_FF_FE` unsigned)
-        unsafe { Self { fd, _phantom: PhantomData } }
+        let fd = unsafe { ValidRawFd::new_unchecked(fd) };
+        Self { fd, _phantom: PhantomData }
     }
 }
 
@@ -135,23 +130,21 @@ impl BorrowedFd<'_> {
 impl AsRawFd for BorrowedFd<'_> {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_inner()
     }
 }
 
 impl AsRawFd for OwnedFd {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_inner()
     }
 }
 
 impl IntoRawFd for OwnedFd {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
-        let fd = self.fd;
-        forget(self);
-        fd
+        ManuallyDrop::new(self).fd.as_inner()
     }
 }
 
@@ -167,14 +160,15 @@ impl FromRawFd for OwnedFd {
         assert_ne!(fd, -1 as RawFd);
         // SAFETY: we just asserted that the value is in the valid range and
         // isn't `-1` (the only value bigger than `0xFF_FF_FF_FE` unsigned)
-        unsafe { Self { fd } }
+        let fd = unsafe { ValidRawFd::new_unchecked(fd) };
+        Self { fd }
     }
 }
 
 impl Drop for OwnedFd {
     #[inline]
     fn drop(&mut self) {
-        unsafe { sys::net::netc::close(self.fd) };
+        unsafe { sys::net::netc::close(self.fd.as_inner()) };
     }
 }
 
@@ -347,6 +341,7 @@ pub trait IntoRawFd {
     /// This function **transfers ownership** of the underlying file descriptor
     /// to the caller. Callers are then the unique owners of the file descriptor
     /// and must close the descriptor once it's no longer needed.
+    #[must_use = "losing the raw file descriptor may leak resources"]
     fn into_raw_fd(self) -> RawFd;
 }
 

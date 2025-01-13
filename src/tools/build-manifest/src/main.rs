@@ -4,13 +4,13 @@ mod checksum;
 mod manifest;
 mod versions;
 
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::{env, fs};
+
 use crate::checksum::Checksums;
 use crate::manifest::{Component, Manifest, Package, Rename, Target};
 use crate::versions::{PkgType, Versions};
-use std::collections::{BTreeMap, HashSet};
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 static HOSTS: &[&str] = &[
     "aarch64-apple-darwin",
@@ -25,6 +25,7 @@ static HOSTS: &[&str] = &[
     "i686-pc-windows-msvc",
     "i686-unknown-linux-gnu",
     "loongarch64-unknown-linux-gnu",
+    "loongarch64-unknown-linux-musl",
     "mips-unknown-linux-gnu",
     "mips64-unknown-linux-gnuabi64",
     "mips64el-unknown-linux-gnuabi64",
@@ -36,6 +37,7 @@ static HOSTS: &[&str] = &[
     "powerpc-unknown-linux-gnu",
     "powerpc64-unknown-linux-gnu",
     "powerpc64le-unknown-linux-gnu",
+    "powerpc64le-unknown-linux-musl",
     "riscv64gc-unknown-linux-gnu",
     "s390x-unknown-linux-gnu",
     "x86_64-apple-darwin",
@@ -50,12 +52,12 @@ static HOSTS: &[&str] = &[
 
 static TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
-    "arm64e-apple-darwin",
     "aarch64-apple-ios",
-    "arm64e-apple-ios",
+    "aarch64-apple-ios-macabi",
     "aarch64-apple-ios-sim",
     "aarch64-unknown-fuchsia",
     "aarch64-linux-android",
+    "aarch64-pc-windows-gnullvm",
     "aarch64-pc-windows-msvc",
     "aarch64-unknown-hermit",
     "aarch64-unknown-linux-gnu",
@@ -65,11 +67,15 @@ static TARGETS: &[&str] = &[
     "aarch64-unknown-none-softfloat",
     "aarch64-unknown-redox",
     "aarch64-unknown-uefi",
+    "arm64e-apple-darwin",
+    "arm64e-apple-ios",
+    "arm64e-apple-tvos",
     "arm-linux-androideabi",
     "arm-unknown-linux-gnueabi",
     "arm-unknown-linux-gnueabihf",
     "arm-unknown-linux-musleabi",
     "arm-unknown-linux-musleabihf",
+    "arm64ec-pc-windows-msvc",
     "armv5te-unknown-linux-gnueabi",
     "armv5te-unknown-linux-musleabi",
     "armv7-linux-androideabi",
@@ -96,15 +102,19 @@ static TARGETS: &[&str] = &[
     "i686-apple-darwin",
     "i686-linux-android",
     "i686-pc-windows-gnu",
+    "i686-pc-windows-gnullvm",
     "i686-pc-windows-msvc",
     "i686-unknown-freebsd",
     "i686-unknown-linux-gnu",
     "i686-unknown-linux-musl",
+    "i686-unknown-redox",
     "i686-unknown-uefi",
     "loongarch64-unknown-linux-gnu",
+    "loongarch64-unknown-linux-musl",
     "loongarch64-unknown-none",
     "loongarch64-unknown-none-softfloat",
     "m68k-unknown-linux-gnu",
+    "m68k-unknown-none-elf",
     "csky-unknown-linux-gnuabiv2",
     "csky-unknown-linux-gnuabiv2hf",
     "mips-unknown-linux-gnu",
@@ -119,13 +129,17 @@ static TARGETS: &[&str] = &[
     "mipsisa64r6el-unknown-linux-gnuabi64",
     "mipsel-unknown-linux-gnu",
     "mipsel-unknown-linux-musl",
+    "mips-mti-none-elf",
+    "mipsel-mti-none-elf",
     "nvptx64-nvidia-cuda",
     "powerpc-unknown-linux-gnu",
     "powerpc64-unknown-linux-gnu",
     "powerpc64le-unknown-linux-gnu",
+    "powerpc64le-unknown-linux-musl",
     "riscv32i-unknown-none-elf",
     "riscv32im-risc0-zkvm-elf",
     "riscv32im-unknown-none-elf",
+    "riscv32ima-unknown-none-elf",
     "riscv32imc-unknown-none-elf",
     "riscv32imac-unknown-none-elf",
     "riscv32imafc-unknown-none-elf",
@@ -134,6 +148,7 @@ static TARGETS: &[&str] = &[
     "riscv64gc-unknown-hermit",
     "riscv64gc-unknown-none-elf",
     "riscv64gc-unknown-linux-gnu",
+    "riscv64gc-unknown-linux-musl",
     "s390x-unknown-linux-gnu",
     "sparc64-unknown-linux-gnu",
     "sparcv9-sun-solaris",
@@ -147,15 +162,18 @@ static TARGETS: &[&str] = &[
     "thumbv8m.main-none-eabihf",
     "wasm32-unknown-emscripten",
     "wasm32-unknown-unknown",
-    "wasm32-wasi",
     "wasm32-wasip1",
-    "wasm32-wasi-preview1-threads",
+    "wasm32-wasip1-threads",
+    "wasm32-wasip2",
+    "wasm32v1-none",
     "x86_64-apple-darwin",
     "x86_64-apple-ios",
+    "x86_64-apple-ios-macabi",
     "x86_64-fortanix-unknown-sgx",
     "x86_64-unknown-fuchsia",
     "x86_64-linux-android",
     "x86_64-pc-windows-gnu",
+    "x86_64-pc-windows-gnullvm",
     "x86_64-pc-windows-msvc",
     "x86_64-pc-solaris",
     "x86_64-unikraft-linux-musl",
@@ -232,7 +250,7 @@ fn main() {
     let num_threads = if let Some(num) = env::var_os("BUILD_MANIFEST_NUM_THREADS") {
         num.to_str().unwrap().parse().expect("invalid number for BUILD_MANIFEST_NUM_THREADS")
     } else {
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     };
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -463,7 +481,8 @@ impl Builder {
                 | PkgType::LlvmTools
                 | PkgType::RustAnalysis
                 | PkgType::JsonDocs
-                | PkgType::RustcCodegenCranelift => {
+                | PkgType::RustcCodegenCranelift
+                | PkgType::LlvmBitcodeLinker => {
                     extensions.push(host_component(pkg));
                 }
                 PkgType::RustcDev | PkgType::RustcDocs => {
@@ -489,7 +508,7 @@ impl Builder {
                 Some(p) => p,
                 None => return false,
             };
-            pkg.target.get(&c.target).is_some()
+            pkg.target.contains_key(&c.target)
         };
         extensions.retain(&has_component);
         components.retain(&has_component);
@@ -584,14 +603,11 @@ impl Builder {
             })
             .collect();
 
-        dst.insert(
-            pkg.manifest_component_name(),
-            Package {
-                version: version_info.version.unwrap_or_default(),
-                git_commit_hash: version_info.git_commit,
-                target: targets,
-            },
-        );
+        dst.insert(pkg.manifest_component_name(), Package {
+            version: version_info.version.unwrap_or_default(),
+            git_commit_hash: version_info.git_commit,
+            target: targets,
+        });
     }
 
     fn url(&self, path: &Path) -> String {

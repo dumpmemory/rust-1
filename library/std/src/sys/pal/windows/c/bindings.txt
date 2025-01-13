@@ -1,5 +1,5 @@
 --out windows_sys.rs
---config flatten std
+--config flatten sys
 --filter
 !Windows.Win32.Foundation.INVALID_HANDLE_VALUE
 Windows.Wdk.Storage.FileSystem.FILE_COMPLETE_IF_OPLOCKED
@@ -34,6 +34,7 @@ Windows.Wdk.Storage.FileSystem.FILE_WRITE_THROUGH
 Windows.Wdk.Storage.FileSystem.NtCreateFile
 Windows.Wdk.Storage.FileSystem.NTCREATEFILE_CREATE_DISPOSITION
 Windows.Wdk.Storage.FileSystem.NTCREATEFILE_CREATE_OPTIONS
+Windows.Wdk.Storage.FileSystem.NtOpenFile
 Windows.Wdk.Storage.FileSystem.NtReadFile
 Windows.Wdk.Storage.FileSystem.NtWriteFile
 Windows.Wdk.Storage.FileSystem.SYMLINK_FLAG_RELATIVE
@@ -1931,10 +1932,14 @@ Windows.Win32.Foundation.RtlNtStatusToDosError
 Windows.Win32.Foundation.SetHandleInformation
 Windows.Win32.Foundation.SetLastError
 Windows.Win32.Foundation.STATUS_DELETE_PENDING
+Windows.Win32.Foundation.STATUS_DIRECTORY_NOT_EMPTY
 Windows.Win32.Foundation.STATUS_END_OF_FILE
+Windows.Win32.Foundation.STATUS_FILE_DELETED
+Windows.Win32.Foundation.STATUS_INVALID_HANDLE
 Windows.Win32.Foundation.STATUS_INVALID_PARAMETER
 Windows.Win32.Foundation.STATUS_NOT_IMPLEMENTED
 Windows.Win32.Foundation.STATUS_PENDING
+Windows.Win32.Foundation.STATUS_SHARING_VIOLATION
 Windows.Win32.Foundation.STATUS_SUCCESS
 Windows.Win32.Foundation.TRUE
 Windows.Win32.Foundation.UNICODE_STRING
@@ -2059,6 +2064,7 @@ Windows.Win32.Networking.WinSock.SOCK_RDM
 Windows.Win32.Networking.WinSock.SOCK_SEQPACKET
 Windows.Win32.Networking.WinSock.SOCK_STREAM
 Windows.Win32.Networking.WinSock.SOCKADDR
+Windows.Win32.Networking.WinSock.SOCKADDR_STORAGE
 Windows.Win32.Networking.WinSock.SOCKADDR_UN
 Windows.Win32.Networking.WinSock.SOCKET
 Windows.Win32.Networking.WinSock.SOCKET_ERROR
@@ -2175,6 +2181,7 @@ Windows.Win32.Networking.WinSock.WSARecv
 Windows.Win32.Networking.WinSock.WSASend
 Windows.Win32.Networking.WinSock.WSASERVICE_NOT_FOUND
 Windows.Win32.Networking.WinSock.WSASocketW
+Windows.Win32.Networking.WinSock.WSAStartup
 Windows.Win32.Networking.WinSock.WSASYSCALLFAILURE
 Windows.Win32.Networking.WinSock.WSASYSNOTREADY
 Windows.Win32.Networking.WinSock.WSATRY_AGAIN
@@ -2288,6 +2295,7 @@ Windows.Win32.Storage.FileSystem.FILE_NAME_OPENED
 Windows.Win32.Storage.FileSystem.FILE_READ_ATTRIBUTES
 Windows.Win32.Storage.FileSystem.FILE_READ_DATA
 Windows.Win32.Storage.FileSystem.FILE_READ_EA
+Windows.Win32.Storage.FileSystem.FILE_RENAME_INFO
 Windows.Win32.Storage.FileSystem.FILE_SHARE_DELETE
 Windows.Win32.Storage.FileSystem.FILE_SHARE_MODE
 Windows.Win32.Storage.FileSystem.FILE_SHARE_NONE
@@ -2330,7 +2338,9 @@ Windows.Win32.Storage.FileSystem.FileStandardInfo
 Windows.Win32.Storage.FileSystem.FileStorageInfo
 Windows.Win32.Storage.FileSystem.FileStreamInfo
 Windows.Win32.Storage.FileSystem.FindClose
-Windows.Win32.Storage.FileSystem.FindFirstFileW
+Windows.Win32.Storage.FileSystem.FindExInfoBasic
+Windows.Win32.Storage.FileSystem.FindExSearchNameMatch
+Windows.Win32.Storage.FileSystem.FindFirstFileExW
 Windows.Win32.Storage.FileSystem.FindNextFileW
 Windows.Win32.Storage.FileSystem.FlushFileBuffers
 Windows.Win32.Storage.FileSystem.GetFileAttributesW
@@ -2342,6 +2352,9 @@ Windows.Win32.Storage.FileSystem.GetFinalPathNameByHandleW
 Windows.Win32.Storage.FileSystem.GetFullPathNameW
 Windows.Win32.Storage.FileSystem.GetTempPathW
 Windows.Win32.Storage.FileSystem.INVALID_FILE_ATTRIBUTES
+Windows.Win32.Storage.FileSystem.LOCKFILE_EXCLUSIVE_LOCK
+Windows.Win32.Storage.FileSystem.LOCKFILE_FAIL_IMMEDIATELY
+Windows.Win32.Storage.FileSystem.LockFileEx
 Windows.Win32.Storage.FileSystem.LPPROGRESS_ROUTINE
 Windows.Win32.Storage.FileSystem.LPPROGRESS_ROUTINE_CALLBACK_REASON
 Windows.Win32.Storage.FileSystem.MAXIMUM_REPARSE_DATA_BUFFER_SIZE
@@ -2387,6 +2400,7 @@ Windows.Win32.Storage.FileSystem.SYMBOLIC_LINK_FLAG_DIRECTORY
 Windows.Win32.Storage.FileSystem.SYMBOLIC_LINK_FLAGS
 Windows.Win32.Storage.FileSystem.SYNCHRONIZE
 Windows.Win32.Storage.FileSystem.TRUNCATE_EXISTING
+Windows.Win32.Storage.FileSystem.UnlockFile
 Windows.Win32.Storage.FileSystem.VOLUME_NAME_DOS
 Windows.Win32.Storage.FileSystem.VOLUME_NAME_GUID
 Windows.Win32.Storage.FileSystem.VOLUME_NAME_NONE
@@ -2412,6 +2426,7 @@ Windows.Win32.System.Console.ENABLE_VIRTUAL_TERMINAL_PROCESSING
 Windows.Win32.System.Console.ENABLE_WINDOW_INPUT
 Windows.Win32.System.Console.ENABLE_WRAP_AT_EOL_OUTPUT
 Windows.Win32.System.Console.GetConsoleMode
+Windows.Win32.System.Console.GetConsoleOutputCP
 Windows.Win32.System.Console.GetStdHandle
 Windows.Win32.System.Console.ReadConsoleW
 Windows.Win32.System.Console.STD_ERROR_HANDLE
@@ -2419,6 +2434,7 @@ Windows.Win32.System.Console.STD_HANDLE
 Windows.Win32.System.Console.STD_INPUT_HANDLE
 Windows.Win32.System.Console.STD_OUTPUT_HANDLE
 Windows.Win32.System.Console.WriteConsoleW
+Windows.Win32.System.Diagnostics.Debug.AddVectoredExceptionHandler
 Windows.Win32.System.Diagnostics.Debug.ARM64_NT_NEON128
 Windows.Win32.System.Diagnostics.Debug.CONTEXT
 Windows.Win32.System.Diagnostics.Debug.EXCEPTION_RECORD
@@ -2462,6 +2478,7 @@ Windows.Win32.System.LibraryLoader.GetProcAddress
 Windows.Win32.System.Performance.QueryPerformanceCounter
 Windows.Win32.System.Performance.QueryPerformanceFrequency
 Windows.Win32.System.Pipes.CreateNamedPipeW
+Windows.Win32.System.Pipes.CreatePipe
 Windows.Win32.System.Pipes.NAMED_PIPE_MODE
 Windows.Win32.System.Pipes.PIPE_ACCEPT_REMOTE_CLIENTS
 Windows.Win32.System.Pipes.PIPE_CLIENT_END
@@ -2476,6 +2493,7 @@ Windows.Win32.System.Pipes.PIPE_WAIT
 Windows.Win32.System.SystemInformation.GetSystemDirectoryW
 Windows.Win32.System.SystemInformation.GetSystemInfo
 Windows.Win32.System.SystemInformation.GetSystemTimeAsFileTime
+Windows.Win32.System.SystemInformation.GetSystemTimePreciseAsFileTime
 Windows.Win32.System.SystemInformation.GetWindowsDirectoryW
 Windows.Win32.System.SystemInformation.PROCESSOR_ARCHITECTURE
 Windows.Win32.System.SystemInformation.SYSTEM_INFO
@@ -2587,5 +2605,7 @@ Windows.Win32.System.Threading.WaitForMultipleObjects
 Windows.Win32.System.Threading.WaitForSingleObject
 Windows.Win32.System.Threading.WakeAllConditionVariable
 Windows.Win32.System.Threading.WakeConditionVariable
+Windows.Win32.System.WindowsProgramming.FILE_RENAME_FLAG_POSIX_SEMANTICS
+Windows.Win32.System.WindowsProgramming.FILE_RENAME_FLAG_REPLACE_IF_EXISTS
 Windows.Win32.System.WindowsProgramming.PROGRESS_CONTINUE
 Windows.Win32.UI.Shell.GetUserProfileDirectoryW

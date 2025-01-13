@@ -36,7 +36,7 @@
 //! variant argument) that does not require visiting.
 
 use crate::mir::*;
-use crate::ty::{Const, GenericArgs, Region, Ty};
+use crate::ty::{GenericArgs, MirConst, Region, Ty, TyConst};
 use crate::{Error, Opaque, Span};
 
 pub trait MirVisitor {
@@ -76,9 +76,9 @@ pub trait MirVisitor {
         self.super_place(place, ptx, location)
     }
 
-    fn visit_projection_elem<'a>(
+    fn visit_projection_elem(
         &mut self,
-        place_ref: PlaceRef<'a>,
+        place_ref: PlaceRef<'_>,
         elem: &ProjectionElem,
         ptx: PlaceContext,
         location: Location,
@@ -108,12 +108,17 @@ pub trait MirVisitor {
         self.super_ty(ty)
     }
 
-    fn visit_constant(&mut self, constant: &Constant, location: Location) {
-        self.super_constant(constant, location)
+    fn visit_const_operand(&mut self, constant: &ConstOperand, location: Location) {
+        self.super_const_operand(constant, location)
     }
 
-    fn visit_const(&mut self, constant: &Const, location: Location) {
-        self.super_const(constant, location)
+    fn visit_mir_const(&mut self, constant: &MirConst, location: Location) {
+        self.super_mir_const(constant, location)
+    }
+
+    fn visit_ty_const(&mut self, constant: &TyConst, location: Location) {
+        let _ = location;
+        self.super_ty_const(constant)
     }
 
     fn visit_region(&mut self, region: &Region, location: Location) {
@@ -189,26 +194,16 @@ pub trait MirVisitor {
                 self.visit_place(place, PlaceContext::MUTATING, location);
                 self.visit_rvalue(rvalue, location);
             }
-            StatementKind::FakeRead(_, place) => {
+            StatementKind::FakeRead(_, place) | StatementKind::PlaceMention(place) => {
                 self.visit_place(place, PlaceContext::NON_MUTATING, location);
             }
-            StatementKind::SetDiscriminant { place, .. } => {
+            StatementKind::SetDiscriminant { place, .. }
+            | StatementKind::Deinit(place)
+            | StatementKind::Retag(_, place) => {
                 self.visit_place(place, PlaceContext::MUTATING, location);
             }
-            StatementKind::Deinit(place) => {
-                self.visit_place(place, PlaceContext::MUTATING, location);
-            }
-            StatementKind::StorageLive(local) => {
+            StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
                 self.visit_local(local, PlaceContext::NON_USE, location);
-            }
-            StatementKind::StorageDead(local) => {
-                self.visit_local(local, PlaceContext::NON_USE, location);
-            }
-            StatementKind::Retag(_, place) => {
-                self.visit_place(place, PlaceContext::MUTATING, location);
-            }
-            StatementKind::PlaceMention(place) => {
-                self.visit_place(place, PlaceContext::NON_MUTATING, location);
             }
             StatementKind::AscribeUserType { place, projections, variance: _ } => {
                 self.visit_place(place, PlaceContext::NON_USE, location);
@@ -229,8 +224,7 @@ pub trait MirVisitor {
                     self.visit_operand(count, location);
                 }
             },
-            StatementKind::ConstEvalCounter => {}
-            StatementKind::Nop => {}
+            StatementKind::ConstEvalCounter | StatementKind::Nop => {}
         }
     }
 
@@ -299,14 +293,15 @@ pub trait MirVisitor {
         location: Location,
     ) {
         match elem {
-            ProjectionElem::Deref => {}
+            ProjectionElem::Downcast(_idx) => {}
+            ProjectionElem::ConstantIndex { offset: _, min_length: _, from_end: _ }
+            | ProjectionElem::Deref
+            | ProjectionElem::Subslice { from: _, to: _, from_end: _ } => {}
             ProjectionElem::Field(_idx, ty) => self.visit_ty(ty, location),
             ProjectionElem::Index(local) => self.visit_local(local, ptx, location),
-            ProjectionElem::ConstantIndex { offset: _, min_length: _, from_end: _ } => {}
-            ProjectionElem::Subslice { from: _, to: _, from_end: _ } => {}
-            ProjectionElem::Downcast(_idx) => {}
-            ProjectionElem::OpaqueCast(ty) => self.visit_ty(ty, location),
-            ProjectionElem::Subtype(ty) => self.visit_ty(ty, location),
+            ProjectionElem::OpaqueCast(ty) | ProjectionElem::Subtype(ty) => {
+                self.visit_ty(ty, location)
+            }
         }
     }
 
@@ -339,7 +334,7 @@ pub trait MirVisitor {
             }
             Rvalue::Repeat(op, constant) => {
                 self.visit_operand(op, location);
-                self.visit_const(constant, location);
+                self.visit_ty_const(constant, location);
             }
             Rvalue::ShallowInitBox(op, ty) => {
                 self.visit_ty(ty, location);
@@ -361,7 +356,7 @@ pub trait MirVisitor {
                 self.visit_place(place, PlaceContext::NON_MUTATING, location)
             }
             Operand::Constant(constant) => {
-                self.visit_constant(constant, location);
+                self.visit_const_operand(constant, location);
             }
         }
     }
@@ -375,15 +370,19 @@ pub trait MirVisitor {
         let _ = ty;
     }
 
-    fn super_constant(&mut self, constant: &Constant, location: Location) {
-        let Constant { span, user_ty: _, literal } = constant;
+    fn super_const_operand(&mut self, constant: &ConstOperand, location: Location) {
+        let ConstOperand { span, user_ty: _, const_ } = constant;
         self.visit_span(span);
-        self.visit_const(literal, location);
+        self.visit_mir_const(const_, location);
     }
 
-    fn super_const(&mut self, constant: &Const, location: Location) {
-        let Const { kind: _, ty, id: _ } = constant;
+    fn super_mir_const(&mut self, constant: &MirConst, location: Location) {
+        let MirConst { kind: _, ty, id: _ } = constant;
         self.visit_ty(ty, location);
+    }
+
+    fn super_ty_const(&mut self, constant: &TyConst) {
+        let _ = constant;
     }
 
     fn super_region(&mut self, region: &Region) {
@@ -407,7 +406,7 @@ pub trait MirVisitor {
                 self.visit_place(place, PlaceContext::NON_USE, location);
             }
             VarDebugInfoContents::Const(constant) => {
-                self.visit_const(&constant.const_, location);
+                self.visit_mir_const(&constant.const_, location);
             }
         }
     }
@@ -456,13 +455,29 @@ impl Location {
     }
 }
 
+/// Location of the statement at the given index for a given basic block. Assumes that `stmt_idx`
+/// and `bb_idx` are valid for a given body.
+pub fn statement_location(body: &Body, bb_idx: &BasicBlockIdx, stmt_idx: usize) -> Location {
+    let bb = &body.blocks[*bb_idx];
+    let stmt = &bb.statements[stmt_idx];
+    Location(stmt.span)
+}
+
+/// Location of the terminator for a given basic block. Assumes that `bb_idx` is valid for a given
+/// body.
+pub fn terminator_location(body: &Body, bb_idx: &BasicBlockIdx) -> Location {
+    let bb = &body.blocks[*bb_idx];
+    let terminator = &bb.terminator;
+    Location(terminator.span)
+}
+
 /// Reference to a place used to represent a partial projection.
 pub struct PlaceRef<'a> {
     pub local: Local,
     pub projection: &'a [ProjectionElem],
 }
 
-impl<'a> PlaceRef<'a> {
+impl PlaceRef<'_> {
     /// Get the type of this place.
     pub fn ty(&self, locals: &[LocalDecl]) -> Result<Ty, Error> {
         self.projection.iter().fold(Ok(locals[self.local].ty), |place_ty, elem| elem.ty(place_ty?))

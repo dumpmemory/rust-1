@@ -1,13 +1,14 @@
 use rustc_data_structures::fx::FxHashSet;
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{def::DefKind, def_id::LocalDefId};
-use rustc_hir::{intravisit, CRATE_HIR_ID};
+use rustc_hir::{CRATE_HIR_ID, intravisit};
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::util::{CheckRegions, NotUniqueParam};
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
 use rustc_span::Span;
-use rustc_trait_selection::traits::check_args_compatible;
+use tracing::{instrument, trace};
 
 use crate::errors::{DuplicateArg, NotParam};
 
@@ -54,7 +55,7 @@ impl<'tcx> OpaqueTypeCollector<'tcx> {
         self.span = old;
     }
 
-    fn parent_trait_ref(&self) -> Option<ty::TraitRef<'tcx>> {
+    fn parent_impl_trait_ref(&self) -> Option<ty::TraitRef<'tcx>> {
         let parent = self.parent()?;
         if matches!(self.tcx.def_kind(parent), DefKind::Impl { .. }) {
             Some(self.tcx.impl_trait_ref(parent)?.instantiate_identity())
@@ -108,7 +109,7 @@ impl<'tcx> OpaqueTypeCollector<'tcx> {
 
     #[instrument(level = "trace", skip(self))]
     fn collect_taits_declared_in_body(&mut self) {
-        let body = self.tcx.hir().body(self.tcx.hir().body_owned_by(self.item)).value;
+        let body = self.tcx.hir().body_owned_by(self.item).value;
         struct TaitInBodyFinder<'a, 'tcx> {
             collector: &'a mut OpaqueTypeCollector<'tcx>,
         }
@@ -131,21 +132,21 @@ impl<'tcx> OpaqueTypeCollector<'tcx> {
         TaitInBodyFinder { collector: self }.visit_expr(body);
     }
 
-    fn visit_opaque_ty(&mut self, alias_ty: &ty::AliasTy<'tcx>) {
+    #[instrument(level = "debug", skip(self))]
+    fn visit_opaque_ty(&mut self, alias_ty: ty::AliasTy<'tcx>) {
         if !self.seen.insert(alias_ty.def_id.expect_local()) {
             return;
         }
 
         // TAITs outside their defining scopes are ignored.
-        let origin = self.tcx.opaque_type_origin(alias_ty.def_id.expect_local());
+        let origin = self.tcx.local_opaque_ty_origin(alias_ty.def_id.expect_local());
         trace!(?origin);
         match origin {
-            rustc_hir::OpaqueTyOrigin::FnReturn(_) | rustc_hir::OpaqueTyOrigin::AsyncFn(_) => {}
+            rustc_hir::OpaqueTyOrigin::FnReturn { .. }
+            | rustc_hir::OpaqueTyOrigin::AsyncFn { .. } => {}
             rustc_hir::OpaqueTyOrigin::TyAlias { in_assoc_ty, .. } => {
-                if !in_assoc_ty {
-                    if !self.check_tait_defining_scope(alias_ty.def_id.expect_local()) {
-                        return;
-                    }
+                if !in_assoc_ty && !self.check_tait_defining_scope(alias_ty.def_id.expect_local()) {
+                    return;
                 }
             }
         }
@@ -168,10 +169,8 @@ impl<'tcx> OpaqueTypeCollector<'tcx> {
                 // Collect opaque types nested within the associated type bounds of this opaque type.
                 // We use identity args here, because we already know that the opaque type uses
                 // only generic parameters, and thus instantiating would not give us more information.
-                for (pred, span) in self
-                    .tcx
-                    .explicit_item_bounds(alias_ty.def_id)
-                    .instantiate_identity_iter_copied()
+                for (pred, span) in
+                    self.tcx.explicit_item_bounds(alias_ty.def_id).iter_identity_copied()
                 {
                     trace!(?pred);
                     self.visit_spanned(span, pred);
@@ -206,10 +205,11 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for OpaqueTypeCollector<'tcx> {
     #[instrument(skip(self), ret, level = "trace")]
     fn visit_ty(&mut self, t: Ty<'tcx>) {
         t.super_visit_with(self);
-        match t.kind() {
+        match *t.kind() {
             ty::Alias(ty::Opaque, alias_ty) if alias_ty.def_id.is_local() => {
                 self.visit_opaque_ty(alias_ty);
             }
+            // Skips type aliases, as they are meant to be transparent.
             ty::Alias(ty::Weak, alias_ty) if alias_ty.def_id.is_local() => {
                 self.tcx
                     .type_of(alias_ty.def_id)
@@ -220,11 +220,11 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for OpaqueTypeCollector<'tcx> {
                 // This avoids having to do normalization of `Self::AssocTy` by only
                 // supporting the case of a method defining opaque types from assoc types
                 // in the same impl block.
-                if let Some(parent_trait_ref) = self.parent_trait_ref() {
+                if let Some(impl_trait_ref) = self.parent_impl_trait_ref() {
                     // If the trait ref of the associated item and the impl differs,
                     // then we can't use the impl's identity args below, so
                     // just skip.
-                    if alias_ty.trait_ref(self.tcx) == parent_trait_ref {
+                    if alias_ty.trait_ref(self.tcx) == impl_trait_ref {
                         let parent = self.parent().expect("we should have a parent here");
 
                         for &assoc in self.tcx.associated_items(parent).in_definition_order() {
@@ -239,13 +239,17 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for OpaqueTypeCollector<'tcx> {
                                 continue;
                             }
 
+                            if !self.seen.insert(assoc.def_id.expect_local()) {
+                                return;
+                            }
+
                             let impl_args = alias_ty.args.rebase_onto(
                                 self.tcx,
-                                parent_trait_ref.def_id,
+                                impl_trait_ref.def_id,
                                 ty::GenericArgs::identity_for_item(self.tcx, parent),
                             );
 
-                            if check_args_compatible(self.tcx, assoc, impl_args) {
+                            if self.tcx.check_args_compatible(assoc.def_id, impl_args) {
                                 self.tcx
                                     .type_of(assoc.def_id)
                                     .instantiate(self.tcx, impl_args)
@@ -259,6 +263,24 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for OpaqueTypeCollector<'tcx> {
                             }
                         }
                     }
+                } else if let Some(ty::ImplTraitInTraitData::Trait { fn_def_id, .. }) =
+                    self.tcx.opt_rpitit_info(alias_ty.def_id)
+                    && fn_def_id == self.item.into()
+                {
+                    // RPITIT in trait definitions get desugared to an associated type. For
+                    // default methods we also create an opaque type this associated type
+                    // normalizes to. The associated type is only known to normalize to the
+                    // opaque if it is fully concrete. There could otherwise be an impl
+                    // overwriting the default method.
+                    //
+                    // However, we have to be able to normalize the associated type while inside
+                    // of the default method. This is normally handled by adding an unchecked
+                    // `Projection(<Self as Trait>::synthetic_assoc_ty, trait_def::opaque)`
+                    // assumption to the `param_env` of the default method. We also separately
+                    // rely on that assumption here.
+                    let ty = self.tcx.type_of(alias_ty.def_id).instantiate(self.tcx, alias_ty.args);
+                    let ty::Alias(ty::Opaque, alias_ty) = *ty.kind() else { bug!("{ty:?}") };
+                    self.visit_opaque_ty(alias_ty);
                 }
             }
             ty::Adt(def, _) if def.did().is_local() => {
@@ -299,7 +321,7 @@ fn opaque_types_defined_by<'tcx>(
     match kind {
         DefKind::AssocFn
         | DefKind::Fn
-        | DefKind::Static(_)
+        | DefKind::Static { .. }
         | DefKind::Const
         | DefKind::AssocConst
         | DefKind::AnonConst => {
@@ -326,7 +348,8 @@ fn opaque_types_defined_by<'tcx>(
         | DefKind::Field
         | DefKind::LifetimeParam
         | DefKind::GlobalAsm
-        | DefKind::Impl { .. } => {}
+        | DefKind::Impl { .. }
+        | DefKind::SyntheticCoroutineBody => {}
         // Closures and coroutines are type checked with their parent, so we need to allow all
         // opaques from the closure signature *and* from the parent body.
         DefKind::Closure | DefKind::InlineConst => {

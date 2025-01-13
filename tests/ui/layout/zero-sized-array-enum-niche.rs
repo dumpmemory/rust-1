@@ -1,6 +1,6 @@
-//@ normalize-stderr-test "pref: Align\([1-8] bytes\)" -> "pref: $$PREF_ALIGN"
+//@ normalize-stderr: "pref: Align\([1-8] bytes\)" -> "pref: $$PREF_ALIGN"
+//@ normalize-stderr: "randomization_seed: \d+" -> "randomization_seed: $$SEED"
 #![crate_type = "lib"]
-#![feature(generic_nonzero)]
 #![feature(rustc_attrs)]
 
 // Various tests around the behavior of zero-sized arrays and

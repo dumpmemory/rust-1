@@ -9,7 +9,7 @@ declare_clippy_lint! {
     /// Checks for misuses of the serde API.
     ///
     /// ### Why is this bad?
-    /// Serde is very finnicky about how its API should be
+    /// Serde is very finicky about how its API should be
     /// used, but the type system can't be used to enforce it (yet?).
     ///
     /// ### Example
@@ -26,13 +26,13 @@ declare_lint_pass!(SerdeApi => [SERDE_API_MISUSE]);
 impl<'tcx> LateLintPass<'tcx> for SerdeApi {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
         if let ItemKind::Impl(Impl {
-            of_trait: Some(ref trait_ref),
+            of_trait: Some(trait_ref),
             items,
             ..
         }) = item.kind
         {
             let did = trait_ref.path.res.def_id();
-            if let Some(visit_did) = get_trait_def_id(cx, &paths::SERDE_DE_VISITOR) {
+            if let Some(visit_did) = get_trait_def_id(cx.tcx, &paths::SERDE_DE_VISITOR) {
                 if did == visit_did {
                     let mut seen_str = None;
                     let mut seen_string = None;

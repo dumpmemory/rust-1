@@ -5,8 +5,7 @@ LL |   pub fn complex_return_triggers_the_lint() -> i32 {
    |  __________________________________________________-
 LL | |     fn foo() -> i32 {
 LL | |         1
-LL | |     }
-LL | |     let mutex = Mutex::new(1);
+...  |
 LL | |     let lock = mutex.lock().unwrap();
    | |         ^^^^
 ...  |
@@ -60,11 +59,7 @@ help: merge the temporary construction with its single usage
    |
 LL ~         
 LL +         let rslt0 = mutex.lock().unwrap().abs();
-   |
-help: remove separated single usage
-   |
-LL -         let rslt0 = lock.abs();
-LL +         
+LL ~         
    |
 
 error: temporary with significant `Drop` can be early dropped
@@ -84,11 +79,7 @@ help: merge the temporary construction with its single usage
    |
 LL ~         
 LL +         mutex.lock().unwrap().clear();
-   |
-help: remove separated single usage
-   |
-LL -         lock.clear();
-LL +         
+LL ~         
    |
 
 error: aborting due to 4 previous errors

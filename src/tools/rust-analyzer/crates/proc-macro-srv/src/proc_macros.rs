@@ -1,18 +1,19 @@
 //! Proc macro ABI
 
-use libloading::Library;
 use proc_macro::bridge;
-use proc_macro_api::{ProcMacroKind, RustCInfo};
 
-use crate::{dylib::LoadProcMacroDylibError, ProcMacroSrvSpan};
+use libloading::Library;
 
-pub(crate) struct ProcMacros {
-    exported_macros: Vec<bridge::client::ProcMacro>,
-}
+use crate::{
+    dylib::LoadProcMacroDylibError, server_impl::TopSubtree, ProcMacroKind, ProcMacroSrvSpan,
+};
+
+#[repr(transparent)]
+pub(crate) struct ProcMacros([bridge::client::ProcMacro]);
 
 impl From<bridge::PanicMessage> for crate::PanicMessage {
     fn from(p: bridge::PanicMessage) -> Self {
-        Self { message: p.as_str().map(|s| s.to_string()) }
+        Self { message: p.as_str().map(|s| s.to_owned()) }
     }
 }
 
@@ -26,36 +27,36 @@ impl ProcMacros {
     /// *`info` - RustCInfo about the compiler that was used to compile the
     ///           macro crate. This is the information we use to figure out
     ///           which ABI to return
-    pub(crate) fn from_lib(
-        lib: &Library,
+    pub(crate) fn from_lib<'l>(
+        lib: &'l Library,
         symbol_name: String,
-        info: RustCInfo,
-    ) -> Result<ProcMacros, LoadProcMacroDylibError> {
-        if info.version_string == crate::RUSTC_VERSION_STRING {
-            let macros =
-                unsafe { lib.get::<&&[bridge::client::ProcMacro]>(symbol_name.as_bytes()) }?;
-
-            return Ok(Self { exported_macros: macros.to_vec() });
+        version_string: &str,
+    ) -> Result<&'l ProcMacros, LoadProcMacroDylibError> {
+        if version_string != crate::RUSTC_VERSION_STRING {
+            return Err(LoadProcMacroDylibError::AbiMismatch(version_string.to_owned()));
         }
-        Err(LoadProcMacroDylibError::AbiMismatch(info.version_string))
+        unsafe { lib.get::<&'l &'l ProcMacros>(symbol_name.as_bytes()) }
+            .map(|it| **it)
+            .map_err(Into::into)
     }
 
     pub(crate) fn expand<S: ProcMacroSrvSpan>(
         &self,
         macro_name: &str,
-        macro_body: tt::Subtree<S>,
-        attributes: Option<tt::Subtree<S>>,
+        macro_body: TopSubtree<S>,
+        attributes: Option<TopSubtree<S>>,
         def_site: S,
         call_site: S,
         mixed_site: S,
-    ) -> Result<tt::Subtree<S>, crate::PanicMessage> {
-        let parsed_body = crate::server::TokenStream::with_subtree(macro_body);
+    ) -> Result<TopSubtree<S>, crate::PanicMessage> {
+        let parsed_body = crate::server_impl::TokenStream::with_subtree(macro_body);
 
-        let parsed_attributes = attributes.map_or_else(crate::server::TokenStream::new, |attr| {
-            crate::server::TokenStream::with_subtree(attr)
-        });
+        let parsed_attributes = attributes
+            .map_or_else(crate::server_impl::TokenStream::new, |attr| {
+                crate::server_impl::TokenStream::with_subtree(attr)
+            });
 
-        for proc_macro in &self.exported_macros {
+        for proc_macro in &self.0 {
             match proc_macro {
                 bridge::client::ProcMacro::CustomDerive { trait_name, client, .. }
                     if *trait_name == macro_name =>
@@ -101,14 +102,14 @@ impl ProcMacros {
     }
 
     pub(crate) fn list_macros(&self) -> Vec<(String, ProcMacroKind)> {
-        self.exported_macros
+        self.0
             .iter()
             .map(|proc_macro| match proc_macro {
                 bridge::client::ProcMacro::CustomDerive { trait_name, .. } => {
                     (trait_name.to_string(), ProcMacroKind::CustomDerive)
                 }
                 bridge::client::ProcMacro::Bang { name, .. } => {
-                    (name.to_string(), ProcMacroKind::FuncLike)
+                    (name.to_string(), ProcMacroKind::Bang)
                 }
                 bridge::client::ProcMacro::Attr { name, .. } => {
                     (name.to_string(), ProcMacroKind::Attr)
@@ -116,17 +117,4 @@ impl ProcMacros {
             })
             .collect()
     }
-}
-
-#[test]
-fn test_version_check() {
-    let path = paths::AbsPathBuf::assert(crate::proc_macro_test_dylib_path());
-    let info = proc_macro_api::read_dylib_info(&path).unwrap();
-    assert_eq!(
-        info.version_string,
-        crate::RUSTC_VERSION_STRING,
-        "sysroot ABI mismatch: dylib rustc version (read from .rustc section): {:?} != proc-macro-srv version (read from 'rustc --version'): {:?}",
-        info.version_string,
-        crate::RUSTC_VERSION_STRING,
-    );
 }

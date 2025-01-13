@@ -1,11 +1,11 @@
-#![feature(lint_reasons)]
 #![allow(
     unused,
     non_local_definitions,
     clippy::uninlined_format_args,
     clippy::unnecessary_mut_passed,
     clippy::unnecessary_to_owned,
-    clippy::unnecessary_literal_unwrap
+    clippy::unnecessary_literal_unwrap,
+    clippy::needless_lifetimes
 )]
 #![warn(clippy::needless_borrow)]
 
@@ -250,4 +250,12 @@ mod issue_10253 {
     fn f() {
         (&S).f::<()>();
     }
+}
+
+fn issue_12268() {
+    let option = Some((&1,));
+    let x = (&1,);
+    option.unwrap_or((x.0,));
+    //~^ ERROR: this expression creates a reference which is immediately dereferenced by the
+    // compiler
 }

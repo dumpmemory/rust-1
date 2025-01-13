@@ -1,11 +1,12 @@
 mod buffer;
 
+use buffer::Buffer;
+
 use crate::fmt;
 use crate::io::{
-    self, uninlined_slow_read_byte, BorrowedCursor, BufRead, IoSliceMut, Read, Seek, SeekFrom,
-    SizeHint, SpecReadByte, DEFAULT_BUF_SIZE,
+    self, BorrowedCursor, BufRead, DEFAULT_BUF_SIZE, IoSliceMut, Read, Seek, SeekFrom, SizeHint,
+    SpecReadByte, uninlined_slow_read_byte,
 };
-use buffer::Buffer;
 
 /// The `BufReader<R>` struct adds buffering to any reader.
 ///
@@ -73,6 +74,14 @@ impl<R: Read> BufReader<R> {
         BufReader::with_capacity(DEFAULT_BUF_SIZE, inner)
     }
 
+    pub(crate) fn try_new_buffer() -> io::Result<Buffer> {
+        Buffer::try_with_capacity(DEFAULT_BUF_SIZE)
+    }
+
+    pub(crate) fn with_buffer(inner: R, buf: Buffer) -> Self {
+        Self { inner, buf }
+    }
+
     /// Creates a new `BufReader<R>` with the specified buffer capacity.
     ///
     /// # Examples
@@ -92,6 +101,50 @@ impl<R: Read> BufReader<R> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(capacity: usize, inner: R) -> BufReader<R> {
         BufReader { inner, buf: Buffer::with_capacity(capacity) }
+    }
+}
+
+impl<R: Read + ?Sized> BufReader<R> {
+    /// Attempt to look ahead `n` bytes.
+    ///
+    /// `n` must be less than or equal to `capacity`.
+    ///
+    /// the returned slice may be less than `n` bytes long if
+    /// end of file is reached.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// #![feature(bufreader_peek)]
+    /// use std::io::{Read, BufReader};
+    ///
+    /// let mut bytes = &b"oh, hello"[..];
+    /// let mut rdr = BufReader::with_capacity(6, &mut bytes);
+    /// assert_eq!(rdr.peek(2).unwrap(), b"oh");
+    /// let mut buf = [0; 4];
+    /// rdr.read(&mut buf[..]).unwrap();
+    /// assert_eq!(&buf, b"oh, ");
+    /// assert_eq!(rdr.peek(2).unwrap(), b"he");
+    /// let mut s = String::new();
+    /// rdr.read_to_string(&mut s).unwrap();
+    /// assert_eq!(&s, "hello");
+    /// assert_eq!(rdr.peek(1).unwrap().len(), 0);
+    /// ```
+    #[unstable(feature = "bufreader_peek", issue = "128405")]
+    pub fn peek(&mut self, n: usize) -> io::Result<&[u8]> {
+        assert!(n <= self.capacity());
+        while n > self.buf.buffer().len() {
+            if self.buf.pos() > 0 {
+                self.buf.backshift();
+            }
+            let new = self.buf.read_more(&mut self.inner)?;
+            if new == 0 {
+                // end of file, no more bytes to read
+                return Ok(&self.buf.buffer()[..]);
+            }
+            debug_assert_eq!(self.buf.pos(), 0);
+        }
+        Ok(&self.buf.buffer()[..n])
     }
 }
 
@@ -230,6 +283,7 @@ impl<R: ?Sized> BufReader<R> {
 // This is only used by a test which asserts that the initialization-tracking is correct.
 #[cfg(test)]
 impl<R: ?Sized> BufReader<R> {
+    #[allow(missing_docs)]
     pub fn initialized(&self) -> usize {
         self.buf.initialized()
     }
@@ -303,7 +357,7 @@ impl<R: ?Sized + Read> Read for BufReader<R> {
         let prev = cursor.written();
 
         let mut rem = self.fill_buf()?;
-        rem.read_buf(cursor.reborrow())?;
+        rem.read_buf(cursor.reborrow())?; // actually never fails
 
         self.consume(cursor.written() - prev); //slice impl of read_buf known to never unfill buf
 
@@ -322,16 +376,23 @@ impl<R: ?Sized + Read> Read for BufReader<R> {
         crate::io::default_read_exact(self, buf)
     }
 
+    fn read_buf_exact(&mut self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        if self.buf.consume_with(cursor.capacity(), |claimed| cursor.append(claimed)) {
+            return Ok(());
+        }
+
+        crate::io::default_read_buf_exact(self, cursor)
+    }
+
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
         if self.buf.pos() == self.buf.filled() && total_len >= self.capacity() {
             self.discard_buffer();
             return self.inner.read_vectored(bufs);
         }
-        let nread = {
-            let mut rem = self.fill_buf()?;
-            rem.read_vectored(bufs)?
-        };
+        let mut rem = self.fill_buf()?;
+        let nread = rem.read_vectored(bufs)?;
+
         self.consume(nread);
         Ok(nread)
     }
@@ -376,12 +437,7 @@ impl<R: ?Sized + Read> Read for BufReader<R> {
             // buffer.
             let mut bytes = Vec::new();
             self.read_to_end(&mut bytes)?;
-            let string = crate::str::from_utf8(&bytes).map_err(|_| {
-                io::const_io_error!(
-                    io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                )
-            })?;
+            let string = crate::str::from_utf8(&bytes).map_err(|_| io::Error::INVALID_UTF8)?;
             *buf += string;
             Ok(string.len())
         }

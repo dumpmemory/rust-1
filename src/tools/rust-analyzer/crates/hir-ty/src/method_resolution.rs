@@ -4,15 +4,16 @@
 //! and the corresponding code mostly in rustc_hir_analysis/check/method/probe.rs.
 use std::ops::ControlFlow;
 
-use base_db::{CrateId, Edition};
-use chalk_ir::{cast::Cast, Mutability, TyKind, UniverseIndex, WhereClause};
+use base_db::CrateId;
+use chalk_ir::{cast::Cast, UniverseIndex, WithKind};
 use hir_def::{
-    data::{adt::StructFlags, ImplData},
+    data::{adt::StructFlags, ImplData, TraitFlags},
     nameres::DefMap,
     AssocItemId, BlockId, ConstId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup,
     ModuleId, TraitId,
 };
 use hir_expand::name::Name;
+use intern::sym;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
 use stdx::never;
@@ -21,18 +22,20 @@ use triomphe::Arc;
 use crate::{
     autoderef::{self, AutoderefKind},
     db::HirDatabase,
-    from_chalk_trait_id, from_foreign_def_id,
+    error_lifetime, from_chalk_trait_id, from_foreign_def_id,
     infer::{unify::InferenceTable, Adjust, Adjustment, OverloadedDeref, PointerCast},
+    lang_items::is_box,
     primitive::{FloatTy, IntTy, UintTy},
-    static_lifetime, to_chalk_trait_id,
+    to_chalk_trait_id,
     utils::all_super_traits,
-    AdtId, Canonical, CanonicalVarKinds, DebruijnIndex, DynTyExt, ForeignDefId, Goal, Guidance,
-    InEnvironment, Interner, Scalar, Solution, Substitution, TraitEnvironment, TraitRef,
-    TraitRefExt, Ty, TyBuilder, TyExt,
+    AdtId, Canonical, CanonicalVarKinds, DebruijnIndex, DynTyExt, ForeignDefId, GenericArgData,
+    Goal, Guidance, InEnvironment, Interner, Mutability, Scalar, Solution, Substitution,
+    TraitEnvironment, TraitRef, TraitRefExt, Ty, TyBuilder, TyExt, TyKind, TyVariableKind,
+    VariableKind, WhereClause,
 };
 
 /// This is used as a key for indexing impls.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TyFingerprint {
     // These are lang item impls:
     Str,
@@ -126,9 +129,11 @@ pub(crate) const ALL_INT_FPS: [TyFingerprint; 12] = [
     TyFingerprint::Scalar(Scalar::Uint(UintTy::Usize)),
 ];
 
-pub(crate) const ALL_FLOAT_FPS: [TyFingerprint; 2] = [
+pub(crate) const ALL_FLOAT_FPS: [TyFingerprint; 4] = [
+    TyFingerprint::Scalar(Scalar::Float(FloatTy::F16)),
     TyFingerprint::Scalar(Scalar::Float(FloatTy::F32)),
     TyFingerprint::Scalar(Scalar::Float(FloatTy::F64)),
+    TyFingerprint::Scalar(Scalar::Float(FloatTy::F128)),
 ];
 
 type TraitFpMap = FxHashMap<TraitId, FxHashMap<Option<TyFingerprint>, Box<[ImplId]>>>;
@@ -143,8 +148,7 @@ pub struct TraitImpls {
 
 impl TraitImpls {
     pub(crate) fn trait_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "trait_impls_in_crate_query", ?krate).entered();
+        let _p = tracing::info_span!("trait_impls_in_crate_query", ?krate).entered();
         let mut impls = FxHashMap::default();
 
         Self::collect_def_map(db, &mut impls, &db.crate_def_map(krate));
@@ -156,7 +160,7 @@ impl TraitImpls {
         db: &dyn HirDatabase,
         block: BlockId,
     ) -> Option<Arc<Self>> {
-        let _p = tracing::span!(tracing::Level::INFO, "trait_impls_in_block_query").entered();
+        let _p = tracing::info_span!("trait_impls_in_block_query").entered();
         let mut impls = FxHashMap::default();
 
         Self::collect_def_map(db, &mut impls, &db.block_def_map(block));
@@ -172,8 +176,7 @@ impl TraitImpls {
         db: &dyn HirDatabase,
         krate: CrateId,
     ) -> Arc<[Arc<Self>]> {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "trait_impls_in_deps_query", ?krate).entered();
+        let _p = tracing::info_span!("trait_impls_in_deps_query", ?krate).entered();
         let crate_graph = db.crate_graph();
 
         Arc::from_iter(
@@ -199,7 +202,7 @@ impl TraitImpls {
                 // FIXME: Reservation impls should be considered during coherence checks. If we are
                 // (ever) to implement coherence checks, this filtering should be done by the trait
                 // solver.
-                if db.attrs(impl_id.into()).by_key("rustc_reservation_impl").exists() {
+                if db.attrs(impl_id.into()).by_key(&sym::rustc_reservation_impl).exists() {
                     continue;
                 }
                 let target_trait = match db.impl_trait(impl_id) {
@@ -213,7 +216,7 @@ impl TraitImpls {
 
             // To better support custom derives, collect impls in all unnamed const items.
             // const _: () = { ... };
-            for konst in module_data.scope.unnamed_consts(db.upcast()) {
+            for konst in module_data.scope.unnamed_consts() {
                 let body = db.body(konst.into());
                 for (_, block_def_map) in body.blocks(db.upcast()) {
                     Self::collect_def_map(db, map, &block_def_map);
@@ -279,8 +282,7 @@ pub struct InherentImpls {
 
 impl InherentImpls {
     pub(crate) fn inherent_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "inherent_impls_in_crate_query", ?krate).entered();
+        let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
         let mut impls = Self { map: FxHashMap::default(), invalid_impls: Vec::default() };
 
         let crate_def_map = db.crate_def_map(krate);
@@ -294,7 +296,7 @@ impl InherentImpls {
         db: &dyn HirDatabase,
         block: BlockId,
     ) -> Option<Arc<Self>> {
-        let _p = tracing::span!(tracing::Level::INFO, "inherent_impls_in_block_query").entered();
+        let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
         let mut impls = Self { map: FxHashMap::default(), invalid_impls: Vec::default() };
 
         let block_def_map = db.block_def_map(block);
@@ -337,7 +339,7 @@ impl InherentImpls {
 
             // To better support custom derives, collect impls in all unnamed const items.
             // const _: () = { ... };
-            for konst in module_data.scope.unnamed_consts(db.upcast()) {
+            for konst in module_data.scope.unnamed_consts() {
                 let body = db.body(konst.into());
                 for (_, block_def_map) in body.blocks(db.upcast()) {
                     self.collect_def_map(db, &block_def_map);
@@ -367,7 +369,7 @@ pub(crate) fn incoherent_inherent_impl_crates(
     krate: CrateId,
     fp: TyFingerprint,
 ) -> SmallVec<[CrateId; 2]> {
-    let _p = tracing::span!(tracing::Level::INFO, "inherent_impl_crates_query").entered();
+    let _p = tracing::info_span!("incoherent_inherent_impl_crates").entered();
     let mut res = SmallVec::new();
     let crate_graph = db.crate_graph();
 
@@ -375,7 +377,7 @@ pub(crate) fn incoherent_inherent_impl_crates(
 
     for krate in crate_graph.transitive_deps(krate) {
         let impls = db.inherent_impls_in_crate(krate);
-        if impls.map.get(&fp).map_or(false, |v| !v.is_empty()) {
+        if impls.map.get(&fp).is_some_and(|v| !v.is_empty()) {
             res.push(krate);
         }
     }
@@ -417,11 +419,17 @@ pub fn def_crates(
         }
         TyKind::Dyn(_) => {
             let trait_id = ty.dyn_trait()?;
-            Some(if db.trait_data(trait_id).rustc_has_incoherent_inherent_impls {
-                db.incoherent_inherent_impl_crates(cur_crate, TyFingerprint::Dyn(trait_id))
-            } else {
-                smallvec![trait_id.module(db.upcast()).krate()]
-            })
+            Some(
+                if db
+                    .trait_data(trait_id)
+                    .flags
+                    .contains(TraitFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
+                {
+                    db.incoherent_inherent_impl_crates(cur_crate, TyFingerprint::Dyn(trait_id))
+                } else {
+                    smallvec![trait_id.module(db.upcast()).krate()]
+                },
+            )
         }
         // for primitives, there may be impls in various places (core and alloc
         // mostly). We just check the whole crate graph for crates with impls
@@ -540,7 +548,8 @@ impl ReceiverAdjustments {
             }
         }
         if let Some(m) = self.autoref {
-            let a = Adjustment::borrow(m, ty);
+            let lt = table.new_lifetime_var();
+            let a = Adjustment::borrow(m, ty, lt);
             ty = a.target.clone();
             adjust.push(a);
         }
@@ -643,7 +652,7 @@ pub fn is_dyn_method(
     let ItemContainerId::TraitId(trait_id) = func.lookup(db.upcast()).container else {
         return None;
     };
-    let trait_params = db.generic_params(trait_id.into()).type_or_consts.len();
+    let trait_params = db.generic_params(trait_id.into()).len();
     let fn_params = fn_subst.len(Interner) - trait_params;
     let trait_ref = TraitRef {
         trait_id: to_chalk_trait_id(trait_id),
@@ -685,7 +694,7 @@ pub(crate) fn lookup_impl_method_query(
     let ItemContainerId::TraitId(trait_id) = func.lookup(db.upcast()).container else {
         return (func, fn_subst);
     };
-    let trait_params = db.generic_params(trait_id.into()).type_or_consts.len();
+    let trait_params = db.generic_params(trait_id.into()).len();
     let fn_params = fn_subst.len(Interner) - trait_params;
     let trait_ref = TraitRef {
         trait_id: to_chalk_trait_id(trait_id),
@@ -802,8 +811,8 @@ fn is_inherent_impl_coherent(
         | TyKind::Scalar(_) => def_map.is_rustc_coherence_is_core(),
 
         &TyKind::Adt(AdtId(adt), _) => adt.module(db.upcast()).krate() == def_map.krate(),
-        TyKind::Dyn(it) => it.principal().map_or(false, |trait_ref| {
-            from_chalk_trait_id(trait_ref.trait_id).module(db.upcast()).krate() == def_map.krate()
+        TyKind::Dyn(it) => it.principal_id().is_some_and(|trait_id| {
+            from_chalk_trait_id(trait_id).module(db.upcast()).krate() == def_map.krate()
         }),
 
         _ => true,
@@ -831,9 +840,10 @@ fn is_inherent_impl_coherent(
                     .contains(StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL),
                 hir_def::AdtId::EnumId(it) => db.enum_data(it).rustc_has_incoherent_inherent_impls,
             },
-            TyKind::Dyn(it) => it.principal().map_or(false, |trait_ref| {
-                db.trait_data(from_chalk_trait_id(trait_ref.trait_id))
-                    .rustc_has_incoherent_inherent_impls
+            TyKind::Dyn(it) => it.principal_id().is_some_and(|trait_id| {
+                db.trait_data(from_chalk_trait_id(trait_id))
+                    .flags
+                    .contains(TraitFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
             }),
 
             _ => false,
@@ -893,8 +903,8 @@ pub fn check_orphan_rules(db: &dyn HirDatabase, impl_: ImplId) -> bool {
         match unwrap_fundamental(ty).kind(Interner) {
             &TyKind::Adt(AdtId(id), _) => is_local(id.module(db.upcast()).krate()),
             TyKind::Error => true,
-            TyKind::Dyn(it) => it.principal().map_or(false, |trait_ref| {
-                is_local(from_chalk_trait_id(trait_ref.trait_id).module(db.upcast()).krate())
+            TyKind::Dyn(it) => it.principal_id().is_some_and(|trait_id| {
+                is_local(from_chalk_trait_id(trait_id).module(db.upcast()).krate())
             }),
             _ => false,
         }
@@ -911,7 +921,7 @@ pub fn iterate_path_candidates(
     traits_in_scope: &FxHashSet<TraitId>,
     visible_from_module: VisibleFromModule,
     name: Option<&Name>,
-    callback: &mut dyn FnMut(AssocItemId) -> ControlFlow<()>,
+    callback: &mut dyn MethodCandidateCallback,
 ) -> ControlFlow<()> {
     iterate_method_candidates_dyn(
         ty,
@@ -922,7 +932,7 @@ pub fn iterate_path_candidates(
         name,
         LookupMode::Path,
         // the adjustments are not relevant for path lookup
-        &mut |_, id, _| callback(id),
+        callback,
     )
 }
 
@@ -934,10 +944,9 @@ pub fn iterate_method_candidates_dyn(
     visible_from_module: VisibleFromModule,
     name: Option<&Name>,
     mode: LookupMode,
-    callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
+    callback: &mut dyn MethodCandidateCallback,
 ) -> ControlFlow<()> {
-    let _p = tracing::span!(
-        tracing::Level::INFO,
+    let _p = tracing::info_span!(
         "iterate_method_candidates_dyn",
         ?mode,
         ?name,
@@ -966,16 +975,15 @@ pub fn iterate_method_candidates_dyn(
             // the methods by autoderef order of *receiver types*, not *self
             // types*.
 
-            let mut table = InferenceTable::new(db, env.clone());
+            let mut table = InferenceTable::new(db, env);
             let ty = table.instantiate_canonical(ty.clone());
             let deref_chain = autoderef_method_receiver(&mut table, ty);
 
             deref_chain.into_iter().try_for_each(|(receiver_ty, adj)| {
                 iterate_method_candidates_with_autoref(
-                    &receiver_ty,
+                    &mut table,
+                    receiver_ty,
                     adj,
-                    db,
-                    env.clone(),
                     traits_in_scope,
                     visible_from_module,
                     name,
@@ -1000,14 +1008,13 @@ pub fn iterate_method_candidates_dyn(
 
 #[tracing::instrument(skip_all, fields(name = ?name))]
 fn iterate_method_candidates_with_autoref(
-    receiver_ty: &Canonical<Ty>,
+    table: &mut InferenceTable<'_>,
+    receiver_ty: Canonical<Ty>,
     first_adjustment: ReceiverAdjustments,
-    db: &dyn HirDatabase,
-    env: Arc<TraitEnvironment>,
     traits_in_scope: &FxHashSet<TraitId>,
     visible_from_module: VisibleFromModule,
     name: Option<&Name>,
-    mut callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
+    callback: &mut dyn MethodCandidateCallback,
 ) -> ControlFlow<()> {
     if receiver_ty.value.is_general_var(Interner, &receiver_ty.binders) {
         // don't try to resolve methods on unknown types
@@ -1016,14 +1023,13 @@ fn iterate_method_candidates_with_autoref(
 
     let mut iterate_method_candidates_by_receiver = move |receiver_ty, first_adjustment| {
         iterate_method_candidates_by_receiver(
+            table,
             receiver_ty,
             first_adjustment,
-            db,
-            env.clone(),
             traits_in_scope,
             visible_from_module,
             name,
-            &mut callback,
+            callback,
         )
     };
 
@@ -1034,74 +1040,117 @@ fn iterate_method_candidates_with_autoref(
         maybe_reborrowed.autoderefs += 1;
     }
 
-    iterate_method_candidates_by_receiver(receiver_ty, maybe_reborrowed)?;
+    iterate_method_candidates_by_receiver(receiver_ty.clone(), maybe_reborrowed)?;
 
     let refed = Canonical {
-        value: TyKind::Ref(Mutability::Not, static_lifetime(), receiver_ty.value.clone())
+        value: TyKind::Ref(Mutability::Not, error_lifetime(), receiver_ty.value.clone())
             .intern(Interner),
         binders: receiver_ty.binders.clone(),
     };
 
-    iterate_method_candidates_by_receiver(&refed, first_adjustment.with_autoref(Mutability::Not))?;
+    iterate_method_candidates_by_receiver(refed, first_adjustment.with_autoref(Mutability::Not))?;
 
     let ref_muted = Canonical {
-        value: TyKind::Ref(Mutability::Mut, static_lifetime(), receiver_ty.value.clone())
+        value: TyKind::Ref(Mutability::Mut, error_lifetime(), receiver_ty.value.clone())
             .intern(Interner),
-        binders: receiver_ty.binders.clone(),
+        binders: receiver_ty.binders,
     };
 
-    iterate_method_candidates_by_receiver(
-        &ref_muted,
-        first_adjustment.with_autoref(Mutability::Mut),
-    )
+    iterate_method_candidates_by_receiver(ref_muted, first_adjustment.with_autoref(Mutability::Mut))
+}
+
+pub trait MethodCandidateCallback {
+    fn on_inherent_method(
+        &mut self,
+        adjustments: ReceiverAdjustments,
+        item: AssocItemId,
+        is_visible: bool,
+    ) -> ControlFlow<()>;
+
+    fn on_trait_method(
+        &mut self,
+        adjustments: ReceiverAdjustments,
+        item: AssocItemId,
+        is_visible: bool,
+    ) -> ControlFlow<()>;
+}
+
+impl<F> MethodCandidateCallback for F
+where
+    F: FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
+{
+    fn on_inherent_method(
+        &mut self,
+        adjustments: ReceiverAdjustments,
+        item: AssocItemId,
+        is_visible: bool,
+    ) -> ControlFlow<()> {
+        self(adjustments, item, is_visible)
+    }
+
+    fn on_trait_method(
+        &mut self,
+        adjustments: ReceiverAdjustments,
+        item: AssocItemId,
+        is_visible: bool,
+    ) -> ControlFlow<()> {
+        self(adjustments, item, is_visible)
+    }
 }
 
 #[tracing::instrument(skip_all, fields(name = ?name))]
 fn iterate_method_candidates_by_receiver(
-    receiver_ty: &Canonical<Ty>,
+    table: &mut InferenceTable<'_>,
+    receiver_ty: Canonical<Ty>,
     receiver_adjustments: ReceiverAdjustments,
-    db: &dyn HirDatabase,
-    env: Arc<TraitEnvironment>,
     traits_in_scope: &FxHashSet<TraitId>,
     visible_from_module: VisibleFromModule,
     name: Option<&Name>,
-    mut callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
+    callback: &mut dyn MethodCandidateCallback,
 ) -> ControlFlow<()> {
-    let mut table = InferenceTable::new(db, env);
-    let receiver_ty = table.instantiate_canonical(receiver_ty.clone());
-    let snapshot = table.snapshot();
+    let receiver_ty = table.instantiate_canonical(receiver_ty);
     // We're looking for methods with *receiver* type receiver_ty. These could
     // be found in any of the derefs of receiver_ty, so we have to go through
     // that, including raw derefs.
-    let mut autoderef = autoderef::Autoderef::new(&mut table, receiver_ty.clone(), true);
-    while let Some((self_ty, _)) = autoderef.next() {
-        iterate_inherent_methods(
-            &self_ty,
-            autoderef.table,
-            name,
-            Some(&receiver_ty),
-            Some(receiver_adjustments.clone()),
-            visible_from_module,
-            &mut callback,
-        )?
-    }
+    table.run_in_snapshot(|table| {
+        let mut autoderef = autoderef::Autoderef::new_no_tracking(table, receiver_ty.clone(), true);
+        while let Some((self_ty, _)) = autoderef.next() {
+            iterate_inherent_methods(
+                &self_ty,
+                autoderef.table,
+                name,
+                Some(&receiver_ty),
+                Some(receiver_adjustments.clone()),
+                visible_from_module,
+                &mut |adjustments, item, is_visible| {
+                    callback.on_inherent_method(adjustments, item, is_visible)
+                },
+            )?
+        }
+        ControlFlow::Continue(())
+    })?;
+    table.run_in_snapshot(|table| {
+        let mut autoderef = autoderef::Autoderef::new_no_tracking(table, receiver_ty.clone(), true);
+        while let Some((self_ty, _)) = autoderef.next() {
+            if matches!(self_ty.kind(Interner), TyKind::InferenceVar(_, TyVariableKind::General)) {
+                // don't try to resolve methods on unknown types
+                return ControlFlow::Continue(());
+            }
 
-    table.rollback_to(snapshot);
-
-    let mut autoderef = autoderef::Autoderef::new(&mut table, receiver_ty.clone(), true);
-    while let Some((self_ty, _)) = autoderef.next() {
-        iterate_trait_method_candidates(
-            &self_ty,
-            autoderef.table,
-            traits_in_scope,
-            name,
-            Some(&receiver_ty),
-            Some(receiver_adjustments.clone()),
-            &mut callback,
-        )?
-    }
-
-    ControlFlow::Continue(())
+            iterate_trait_method_candidates(
+                &self_ty,
+                autoderef.table,
+                traits_in_scope,
+                name,
+                Some(&receiver_ty),
+                Some(receiver_adjustments.clone()),
+                &mut |adjustments, item, is_visible| {
+                    callback.on_trait_method(adjustments, item, is_visible)
+                },
+            )?
+        }
+        ControlFlow::Continue(())
+    })
 }
 
 #[tracing::instrument(skip_all, fields(name = ?name))]
@@ -1112,7 +1161,7 @@ fn iterate_method_candidates_for_self_ty(
     traits_in_scope: &FxHashSet<TraitId>,
     visible_from_module: VisibleFromModule,
     name: Option<&Name>,
-    mut callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
+    callback: &mut dyn MethodCandidateCallback,
 ) -> ControlFlow<()> {
     let mut table = InferenceTable::new(db, env);
     let self_ty = table.instantiate_canonical(self_ty.clone());
@@ -1123,7 +1172,9 @@ fn iterate_method_candidates_for_self_ty(
         None,
         None,
         visible_from_module,
-        &mut callback,
+        &mut |adjustments, item, is_visible| {
+            callback.on_inherent_method(adjustments, item, is_visible)
+        },
     )?;
     iterate_trait_method_candidates(
         &self_ty,
@@ -1132,7 +1183,9 @@ fn iterate_method_candidates_for_self_ty(
         name,
         None,
         None,
-        callback,
+        &mut |adjustments, item, is_visible| {
+            callback.on_trait_method(adjustments, item, is_visible)
+        },
     )
 }
 
@@ -1147,24 +1200,37 @@ fn iterate_trait_method_candidates(
     callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
     let db = table.db;
-    let env = table.trait_env.clone();
 
-    let canonical_self_ty = table.canonicalize(self_ty.clone()).value;
+    let canonical_self_ty = table.canonicalize(self_ty.clone());
+    let TraitEnvironment { krate, block, .. } = *table.trait_env;
 
     'traits: for &t in traits_in_scope {
         let data = db.trait_data(t);
 
-        // Traits annotated with `#[rustc_skip_array_during_method_dispatch]` are skipped during
+        // Traits annotated with `#[rustc_skip_during_method_dispatch]` are skipped during
         // method resolution, if the receiver is an array, and we're compiling for editions before
         // 2021.
         // This is to make `[a].into_iter()` not break code with the new `IntoIterator` impl for
         // arrays.
-        if data.skip_array_during_method_dispatch
-            && matches!(self_ty.kind(Interner), chalk_ir::TyKind::Array(..))
+        if data.flags.contains(TraitFlags::SKIP_ARRAY_DURING_METHOD_DISPATCH)
+            && matches!(self_ty.kind(Interner), TyKind::Array(..))
         {
             // FIXME: this should really be using the edition of the method name's span, in case it
             // comes from a macro
-            if db.crate_graph()[env.krate].edition < Edition::Edition2021 {
+            if !db.crate_graph()[krate].edition.at_least_2021() {
+                continue;
+            }
+        }
+        if data.flags.contains(TraitFlags::SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH)
+            && matches!(
+                self_ty.kind(Interner), TyKind::Adt(AdtId(def), subst)
+                if is_box(table.db, *def)
+                    && matches!(subst.at(Interner, 0).assert_ty_ref(Interner).kind(Interner), TyKind::Slice(..))
+            )
+        {
+            // FIXME: this should really be using the edition of the method name's span, in case it
+            // comes from a macro
+            if !db.crate_graph()[krate].edition.at_least_2024() {
                 continue;
             }
         }
@@ -1183,8 +1249,8 @@ fn iterate_trait_method_candidates(
                     IsValidCandidate::No => continue,
                 };
             if !known_implemented {
-                let goal = generic_implements_goal(db, env.clone(), t, &canonical_self_ty);
-                if db.trait_solve(env.krate, env.block, goal.cast(Interner)).is_none() {
+                let goal = generic_implements_goal(db, &table.trait_env, t, &canonical_self_ty);
+                if db.trait_solve(krate, block, goal.cast(Interner)).is_none() {
                     continue 'traits;
                 }
             }
@@ -1333,7 +1399,7 @@ fn iterate_inherent_methods(
         callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         for &impl_id in impls.for_self_ty(self_ty) {
-            for &item in &table.db.impl_data(impl_id).items {
+            for &item in table.db.impl_data(impl_id).items.iter() {
                 let visible = match is_valid_impl_method_candidate(
                     table,
                     self_ty,
@@ -1365,7 +1431,7 @@ pub(crate) fn resolve_indexing_op(
     let ty = table.instantiate_canonical(ty);
     let deref_chain = autoderef_method_receiver(&mut table, ty);
     for (ty, adj) in deref_chain {
-        let goal = generic_implements_goal(db, table.trait_env.clone(), index_trait, &ty);
+        let goal = generic_implements_goal(db, &table.trait_env, index_trait, &ty);
         if db
             .trait_solve(table.trait_env.krate, table.trait_env.block, goal.cast(Interner))
             .is_some()
@@ -1376,6 +1442,7 @@ pub(crate) fn resolve_indexing_op(
     None
 }
 
+// FIXME: Replace this with a `Try` impl once stable
 macro_rules! check_that {
     ($cond:expr) => {
         if !$cond {
@@ -1384,6 +1451,7 @@ macro_rules! check_that {
     };
 }
 
+#[derive(Debug)]
 enum IsValidCandidate {
     Yes,
     No,
@@ -1413,7 +1481,7 @@ fn is_valid_impl_method_candidate(
         AssocItemId::ConstId(c) => {
             let db = table.db;
             check_that!(receiver_ty.is_none());
-            check_that!(name.map_or(true, |n| db.const_data(c).name.as_ref() == Some(n)));
+            check_that!(name.is_none_or(|n| db.const_data(c).name.as_ref() == Some(n)));
 
             if let Some(from_module) = visible_from_module {
                 if !db.const_visibility(c).is_visible_from(db.upcast(), from_module) {
@@ -1451,7 +1519,7 @@ fn is_valid_trait_method_candidate(
         AssocItemId::FunctionId(fn_id) => {
             let data = db.function_data(fn_id);
 
-            check_that!(name.map_or(true, |n| n == &data.name));
+            check_that!(name.is_none_or(|n| n == &data.name));
 
             table.run_in_snapshot(|table| {
                 let impl_subst = TyBuilder::subst_for_def(db, trait_id, None)
@@ -1464,7 +1532,7 @@ fn is_valid_trait_method_candidate(
                 if let Some(receiver_ty) = receiver_ty {
                     check_that!(data.has_self_param());
 
-                    let fn_subst = TyBuilder::subst_for_def(db, fn_id, Some(impl_subst.clone()))
+                    let fn_subst = TyBuilder::subst_for_def(db, fn_id, Some(impl_subst))
                         .fill_with_inference_vars(table)
                         .build();
 
@@ -1480,7 +1548,7 @@ fn is_valid_trait_method_candidate(
         }
         AssocItemId::ConstId(c) => {
             check_that!(receiver_ty.is_none());
-            check_that!(name.map_or(true, |n| db.const_data(c).name.as_ref() == Some(n)));
+            check_that!(name.is_none_or(|n| db.const_data(c).name.as_ref() == Some(n)));
 
             IsValidCandidate::Yes
         }
@@ -1501,7 +1569,7 @@ fn is_valid_impl_fn_candidate(
     let db = table.db;
     let data = db.function_data(fn_id);
 
-    check_that!(name.map_or(true, |n| n == &data.name));
+    check_that!(name.is_none_or(|n| n == &data.name));
     if let Some(from_module) = visible_from_module {
         if !db.function_visibility(fn_id).is_visible_from(db.upcast(), from_module) {
             cov_mark::hit!(autoderef_candidate_not_visible);
@@ -1509,7 +1577,7 @@ fn is_valid_impl_fn_candidate(
         }
     }
     table.run_in_snapshot(|table| {
-        let _p = tracing::span!(tracing::Level::INFO, "subst_for_def").entered();
+        let _p = tracing::info_span!("subst_for_def").entered();
         let impl_subst =
             TyBuilder::subst_for_def(db, impl_id, None).fill_with_inference_vars(table).build();
         let expect_self_ty = db.impl_self_ty(impl_id).substitute(Interner, &impl_subst);
@@ -1517,7 +1585,7 @@ fn is_valid_impl_fn_candidate(
         check_that!(table.unify(&expect_self_ty, self_ty));
 
         if let Some(receiver_ty) = receiver_ty {
-            let _p = tracing::span!(tracing::Level::INFO, "check_receiver_ty").entered();
+            let _p = tracing::info_span!("check_receiver_ty").entered();
             check_that!(data.has_self_param());
 
             let fn_subst = TyBuilder::subst_for_def(db, fn_id, Some(impl_subst.clone()))
@@ -1548,7 +1616,7 @@ fn is_valid_impl_fn_candidate(
 
         for goal in goals.clone() {
             let in_env = InEnvironment::new(&table.trait_env.env, goal);
-            let canonicalized = table.canonicalize(in_env);
+            let canonicalized = table.canonicalize_with_free_vars(in_env);
             let solution = table.db.trait_solve(
                 table.trait_env.krate,
                 table.trait_env.block,
@@ -1586,10 +1654,10 @@ fn is_valid_impl_fn_candidate(
 pub fn implements_trait(
     ty: &Canonical<Ty>,
     db: &dyn HirDatabase,
-    env: Arc<TraitEnvironment>,
+    env: &TraitEnvironment,
     trait_: TraitId,
 ) -> bool {
-    let goal = generic_implements_goal(db, env.clone(), trait_, ty);
+    let goal = generic_implements_goal(db, env, trait_, ty);
     let solution = db.trait_solve(env.krate, env.block, goal.cast(Interner));
 
     solution.is_some()
@@ -1598,10 +1666,10 @@ pub fn implements_trait(
 pub fn implements_trait_unique(
     ty: &Canonical<Ty>,
     db: &dyn HirDatabase,
-    env: Arc<TraitEnvironment>,
+    env: &TraitEnvironment,
     trait_: TraitId,
 ) -> bool {
-    let goal = generic_implements_goal(db, env.clone(), trait_, ty);
+    let goal = generic_implements_goal(db, env, trait_, ty);
     let solution = db.trait_solve(env.krate, env.block, goal.cast(Interner));
 
     matches!(solution, Some(crate::Solution::Unique(_)))
@@ -1612,32 +1680,30 @@ pub fn implements_trait_unique(
 #[tracing::instrument(skip_all)]
 fn generic_implements_goal(
     db: &dyn HirDatabase,
-    env: Arc<TraitEnvironment>,
+    env: &TraitEnvironment,
     trait_: TraitId,
     self_ty: &Canonical<Ty>,
 ) -> Canonical<InEnvironment<super::DomainGoal>> {
-    let mut kinds = self_ty.binders.interned().to_vec();
+    let binders = self_ty.binders.interned();
     let trait_ref = TyBuilder::trait_ref(db, trait_)
         .push(self_ty.value.clone())
-        .fill_with_bound_vars(DebruijnIndex::INNERMOST, kinds.len())
+        .fill_with_bound_vars(DebruijnIndex::INNERMOST, binders.len())
         .build();
-    kinds.extend(trait_ref.substitution.iter(Interner).skip(1).map(|it| {
-        let vk = match it.data(Interner) {
-            chalk_ir::GenericArgData::Ty(_) => {
-                chalk_ir::VariableKind::Ty(chalk_ir::TyVariableKind::General)
-            }
-            chalk_ir::GenericArgData::Lifetime(_) => chalk_ir::VariableKind::Lifetime,
-            chalk_ir::GenericArgData::Const(c) => {
-                chalk_ir::VariableKind::Const(c.data(Interner).ty.clone())
-            }
-        };
-        chalk_ir::WithKind::new(vk, UniverseIndex::ROOT)
-    }));
+
+    let kinds =
+        binders.iter().cloned().chain(trait_ref.substitution.iter(Interner).skip(1).map(|it| {
+            let vk = match it.data(Interner) {
+                GenericArgData::Ty(_) => VariableKind::Ty(chalk_ir::TyVariableKind::General),
+                GenericArgData::Lifetime(_) => VariableKind::Lifetime,
+                GenericArgData::Const(c) => VariableKind::Const(c.data(Interner).ty.clone()),
+            };
+            WithKind::new(vk, UniverseIndex::ROOT)
+        }));
+    let binders = CanonicalVarKinds::from_iter(Interner, kinds);
+
     let obligation = trait_ref.cast(Interner);
-    Canonical {
-        binders: CanonicalVarKinds::from_iter(Interner, kinds),
-        value: InEnvironment::new(&env.env, obligation),
-    }
+    let value = InEnvironment::new(&env.env, obligation);
+    Canonical { binders, value }
 }
 
 fn autoderef_method_receiver(
@@ -1645,10 +1711,10 @@ fn autoderef_method_receiver(
     ty: Ty,
 ) -> Vec<(Canonical<Ty>, ReceiverAdjustments)> {
     let mut deref_chain: Vec<_> = Vec::new();
-    let mut autoderef = autoderef::Autoderef::new(table, ty, false);
+    let mut autoderef = autoderef::Autoderef::new_no_tracking(table, ty, false);
     while let Some((ty, derefs)) = autoderef.next() {
         deref_chain.push((
-            autoderef.table.canonicalize(ty).value,
+            autoderef.table.canonicalize(ty),
             ReceiverAdjustments { autoref: None, autoderefs: derefs, unsize_array: false },
         ));
     }

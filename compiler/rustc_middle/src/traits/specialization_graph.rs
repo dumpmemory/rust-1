@@ -1,11 +1,13 @@
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_errors::ErrorGuaranteed;
+use rustc_hir::def_id::{DefId, DefIdMap};
+use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_span::sym;
+
 use crate::error::StrictCoherenceNeedsNegativeCoherence;
 use crate::ty::fast_reject::SimplifiedType;
 use crate::ty::visit::TypeVisitableExt;
 use crate::ty::{self, TyCtxt};
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_errors::ErrorGuaranteed;
-use rustc_hir::def_id::{DefId, DefIdMap};
-use rustc_span::symbol::sym;
 
 /// A per-trait graph of impls in specialization order. At the moment, this
 /// graph forms a tree rooted with the trait itself, with all other nodes
@@ -59,7 +61,7 @@ pub enum OverlapMode {
 
 impl OverlapMode {
     pub fn get(tcx: TyCtxt<'_>, trait_id: DefId) -> OverlapMode {
-        let with_negative_coherence = tcx.features().with_negative_coherence;
+        let with_negative_coherence = tcx.features().with_negative_coherence();
         let strict_coherence = tcx.has_attr(trait_id, sym::rustc_strict_coherence);
 
         if with_negative_coherence {

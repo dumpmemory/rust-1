@@ -1,24 +1,20 @@
 //! Conversion lsp_types types to rust-analyzer specific ones.
 use anyhow::format_err;
 use ide::{Annotation, AnnotationKind, AssistKind, LineCol};
-use ide_db::{
-    base_db::{FileId, FilePosition, FileRange},
-    line_index::WideLineCol,
-};
+use ide_db::{line_index::WideLineCol, FileId, FilePosition, FileRange};
+use paths::Utf8PathBuf;
 use syntax::{TextRange, TextSize};
 use vfs::AbsPathBuf;
 
 use crate::{
-    from_json,
     global_state::GlobalStateSnapshot,
     line_index::{LineIndex, PositionEncoding},
-    lsp::utils::invalid_params_error,
     lsp_ext,
 };
 
 pub(crate) fn abs_path(url: &lsp_types::Url) -> anyhow::Result<AbsPathBuf> {
     let path = url.to_file_path().map_err(|()| anyhow::format_err!("url is not a file"))?;
-    Ok(AbsPathBuf::try_from(path).unwrap())
+    Ok(AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path).unwrap()).unwrap())
 }
 
 pub(crate) fn vfs_path(url: &lsp_types::Url) -> anyhow::Result<vfs::VfsPath> {
@@ -39,9 +35,18 @@ pub(crate) fn offset(
                 .ok_or_else(|| format_err!("Invalid wide col offset"))?
         }
     };
-    let text_size =
-        line_index.index.offset(line_col).ok_or_else(|| format_err!("Invalid offset"))?;
-    Ok(text_size)
+    let line_range = line_index.index.line(line_col.line).ok_or_else(|| {
+        format_err!("Invalid offset {line_col:?} (line index length: {:?})", line_index.index.len())
+    })?;
+    let col = TextSize::from(line_col.col);
+    let clamped_len = col.min(line_range.len());
+    if clamped_len < col {
+        tracing::error!(
+            "Position {line_col:?} column exceeds line length {}, clamping it",
+            u32::from(line_range.len()),
+        );
+    }
+    Ok(line_range.start() + clamped_len)
 }
 
 pub(crate) fn text_range(
@@ -105,16 +110,13 @@ pub(crate) fn assist_kind(kind: lsp_types::CodeActionKind) -> Option<AssistKind>
 
 pub(crate) fn annotation(
     snap: &GlobalStateSnapshot,
-    code_lens: lsp_types::CodeLens,
+    range: lsp_types::Range,
+    data: lsp_ext::CodeLensResolveData,
 ) -> anyhow::Result<Option<Annotation>> {
-    let data =
-        code_lens.data.ok_or_else(|| invalid_params_error("code lens without data".to_owned()))?;
-    let resolve = from_json::<lsp_ext::CodeLensResolveData>("CodeLensResolveData", &data)?;
-
-    match resolve.kind {
+    match data.kind {
         lsp_ext::CodeLensResolveDataKind::Impls(params) => {
             if snap.url_file_version(&params.text_document_position_params.text_document.uri)
-                != Some(resolve.version)
+                != Some(data.version)
             {
                 return Ok(None);
             }
@@ -123,19 +125,19 @@ pub(crate) fn annotation(
             let line_index = snap.file_line_index(file_id)?;
 
             Ok(Annotation {
-                range: text_range(&line_index, code_lens.range)?,
+                range: text_range(&line_index, range)?,
                 kind: AnnotationKind::HasImpls { pos, data: None },
             })
         }
         lsp_ext::CodeLensResolveDataKind::References(params) => {
-            if snap.url_file_version(&params.text_document.uri) != Some(resolve.version) {
+            if snap.url_file_version(&params.text_document.uri) != Some(data.version) {
                 return Ok(None);
             }
             let pos @ FilePosition { file_id, .. } = file_position(snap, params)?;
             let line_index = snap.file_line_index(file_id)?;
 
             Ok(Annotation {
-                range: text_range(&line_index, code_lens.range)?,
+                range: text_range(&line_index, range)?,
                 kind: AnnotationKind::HasReferences { pos, data: None },
             })
         }

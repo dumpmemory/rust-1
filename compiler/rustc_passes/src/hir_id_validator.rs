@@ -1,7 +1,7 @@
 use rustc_data_structures::sync::Lock;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{intravisit, HirId, ItemLocalId};
+use rustc_hir::{HirId, ItemLocalId, intravisit};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
@@ -160,5 +160,9 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for HirIdValidator<'a, 'hir> {
     fn visit_impl_item(&mut self, i: &'hir hir::ImplItem<'hir>) {
         let mut inner_visitor = self.new_visitor(self.tcx);
         inner_visitor.check(i.owner_id, |this| intravisit::walk_impl_item(this, i));
+    }
+
+    fn visit_pattern_type_pattern(&mut self, p: &'hir hir::Pat<'hir>) {
+        self.visit_pat(p)
     }
 }

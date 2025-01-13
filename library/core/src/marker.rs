@@ -9,8 +9,7 @@
 use crate::cell::UnsafeCell;
 use crate::cmp;
 use crate::fmt::Debug;
-use crate::hash::Hash;
-use crate::hash::Hasher;
+use crate::hash::{Hash, Hasher};
 
 /// Implements a given marker trait for multiple types at the same time.
 ///
@@ -42,6 +41,8 @@ use crate::hash::Hasher;
 /// }
 /// ```
 #[unstable(feature = "internal_impls_macro", issue = "none")]
+// Allow implementations of `UnsizedConstParamTy` even though std cannot use that feature.
+#[allow_internal_unstable(unsized_const_params)]
 macro marker_impls {
     ( $(#[$($meta:tt)*])* $Trait:ident for $({$($bounds:tt)*})? $T:ty $(, $($rest:tt)*)? ) => {
         $(#[$($meta)*])* impl< $($($bounds)*)? > $Trait for $T {}
@@ -140,7 +141,8 @@ unsafe impl<T: Sync + ?Sized> Send for &T {}
 )]
 #[fundamental] // for Default, for example, which requires that `[T]: !Default` be evaluatable
 #[rustc_specialization_trait]
-#[rustc_deny_explicit_impl(implement_via_object = false)]
+#[rustc_deny_explicit_impl]
+#[rustc_do_not_implement_via_object]
 #[rustc_coinductive]
 pub trait Sized {
     // Empty.
@@ -157,7 +159,7 @@ pub trait Sized {
 /// - Arrays `[T; N]` implement `Unsize<[T]>`.
 /// - A type implements `Unsize<dyn Trait + 'a>` if all of these conditions are met:
 ///   - The type implements `Trait`.
-///   - `Trait` is object safe.
+///   - `Trait` is dyn-compatible[^1].
 ///   - The type is sized.
 ///   - The type outlives `'a`.
 /// - Structs `Foo<..., T1, ..., Tn, ...>` implement `Unsize<Foo<..., U1, ..., Un, ...>>`
@@ -177,33 +179,30 @@ pub trait Sized {
 /// [`Rc`]: ../../std/rc/struct.Rc.html
 /// [RFC982]: https://github.com/rust-lang/rfcs/blob/master/text/0982-dst-coercion.md
 /// [nomicon-coerce]: ../../nomicon/coercions.html
+/// [^1]: Formerly known as *object safe*.
 #[unstable(feature = "unsize", issue = "18598")]
 #[lang = "unsize"]
-#[rustc_deny_explicit_impl(implement_via_object = false)]
+#[rustc_deny_explicit_impl]
+#[rustc_do_not_implement_via_object]
 pub trait Unsize<T: ?Sized> {
     // Empty.
 }
 
 /// Required trait for constants used in pattern matches.
 ///
-/// Any type that derives `PartialEq` automatically implements this trait,
-/// *regardless* of whether its type-parameters implement `PartialEq`.
+/// Constants are only allowed as patterns if (a) their type implements
+/// `PartialEq`, and (b) interpreting the value of the constant as a pattern
+/// is equialent to calling `PartialEq`. This ensures that constants used as
+/// patterns cannot expose implementation details in an unexpected way or
+/// cause semver hazards.
 ///
-/// If a `const` item contains some type that does not implement this trait,
-/// then that type either (1.) does not implement `PartialEq` (which means the
-/// constant will not provide that comparison method, which code generation
-/// assumes is available), or (2.) it implements *its own* version of
-/// `PartialEq` (which we assume does not conform to a structural-equality
-/// comparison).
+/// This trait ensures point (b).
+/// Any type that derives `PartialEq` automatically implements this trait.
 ///
-/// In either of the two scenarios above, we reject usage of such a constant in
-/// a pattern match.
-///
-/// See also the [structural match RFC][RFC1445], and [issue 63438] which
-/// motivated migrating from an attribute-based design to this trait.
-///
-/// [RFC1445]: https://github.com/rust-lang/rfcs/blob/master/text/1445-restrict-constants-in-patterns.md
-/// [issue 63438]: https://github.com/rust-lang/rust/issues/63438
+/// Implementing this trait (which is unstable) is a way for type authors to explicitly allow
+/// comparing const values of this type; that operation will recursively compare all fields
+/// (including private fields), even if that behavior differs from `PartialEq`. This can make it
+/// semver-breaking to add further private fields to a type.
 #[unstable(feature = "structural_match", issue = "31434")]
 #[diagnostic::on_unimplemented(message = "the type `{Self}` does not `#[derive(PartialEq)]`")]
 #[lang = "structural_peq"]
@@ -287,8 +286,19 @@ marker_impls! {
 /// }
 /// ```
 ///
-/// There is a small difference between the two: the `derive` strategy will also place a `Copy`
-/// bound on type parameters, which isn't always desired.
+/// There is a small difference between the two. The `derive` strategy will also place a `Copy`
+/// bound on type parameters:
+///
+/// ```
+/// #[derive(Clone)]
+/// struct MyStruct<T>(T);
+///
+/// impl<T: Copy> Copy for MyStruct<T> { }
+/// ```
+///
+/// This isn't always desired. For example, shared references (`&T`) can be copied regardless of
+/// whether `T` is `Copy`. Likewise, a generic struct containing markers such as [`PhantomData`]
+/// could potentially be duplicated with a bit-wise copy.
 ///
 /// ## What's the difference between `Copy` and `Clone`?
 ///
@@ -422,7 +432,7 @@ marker_impls! {
     Copy for
         usize, u8, u16, u32, u64, u128,
         isize, i8, i16, i32, i64, i128,
-        f32, f64,
+        f16, f32, f64, f128,
         bool, char,
         {T: ?Sized} *const T,
         {T: ?Sized} *mut T,
@@ -802,7 +812,8 @@ impl<T: ?Sized> StructuralPartialEq for PhantomData<T> {}
     reason = "this trait is unlikely to ever be stabilized, use `mem::discriminant` instead"
 )]
 #[lang = "discriminant_kind"]
-#[rustc_deny_explicit_impl(implement_via_object = false)]
+#[rustc_deny_explicit_impl]
+#[rustc_do_not_implement_via_object]
 pub trait DiscriminantKind {
     /// The type of the discriminant, which must satisfy the trait
     /// bounds required by `mem::Discriminant`.
@@ -810,15 +821,28 @@ pub trait DiscriminantKind {
     type Discriminant: Clone + Copy + Debug + Eq + PartialEq + Hash + Send + Sync + Unpin;
 }
 
-/// Compiler-internal trait used to determine whether a type contains
+/// Used to determine whether a type contains
 /// any `UnsafeCell` internally, but not through an indirection.
 /// This affects, for example, whether a `static` of that type is
 /// placed in read-only static memory or writable static memory.
+/// This can be used to declare that a constant with a generic type
+/// will not contain interior mutability, and subsequently allow
+/// placing the constant behind references.
+///
+/// # Safety
+///
+/// This trait is a core part of the language, it is just expressed as a trait in libcore for
+/// convenience. Do *not* implement it for other types.
+// FIXME: Eventually this trait should become `#[rustc_deny_explicit_impl]`.
+// That requires porting the impls below to native internal impls.
 #[lang = "freeze"]
-pub(crate) unsafe auto trait Freeze {}
+#[unstable(feature = "freeze", issue = "121675")]
+pub unsafe auto trait Freeze {}
 
+#[unstable(feature = "freeze", issue = "121675")]
 impl<T: ?Sized> !Freeze for UnsafeCell<T> {}
 marker_impls! {
+    #[unstable(feature = "freeze", issue = "121675")]
     unsafe Freeze for
         {T: ?Sized} PhantomData<T>,
         {T: ?Sized} *const T,
@@ -856,7 +880,7 @@ marker_impls! {
 ///
 /// *However*, you cannot use [`mem::replace`] on `!Unpin` data which is *pinned* by being wrapped
 /// inside a [`Pin<Ptr>`] pointing at it. This is because you cannot (safely) use a
-/// [`Pin<Ptr>`] to get an `&mut T` to its pointee value, which you would need to call
+/// [`Pin<Ptr>`] to get a `&mut T` to its pointee value, which you would need to call
 /// [`mem::replace`], and *that* is what makes this system work.
 ///
 /// So this, for example, can only be done on types implementing `Unpin`:
@@ -927,10 +951,11 @@ marker_impls! {
 ///
 /// This should be used for `~const` bounds,
 /// as non-const bounds will always hold for every type.
-#[unstable(feature = "const_trait_impl", issue = "67792")]
+#[unstable(feature = "const_destruct", issue = "133214")]
 #[lang = "destruct"]
 #[rustc_on_unimplemented(message = "can't drop `{Self}`", append_const_msg)]
-#[rustc_deny_explicit_impl(implement_via_object = false)]
+#[rustc_deny_explicit_impl]
+#[rustc_do_not_implement_via_object]
 #[const_trait]
 pub trait Destruct {}
 
@@ -941,20 +966,40 @@ pub trait Destruct {}
 #[unstable(feature = "tuple_trait", issue = "none")]
 #[lang = "tuple_trait"]
 #[diagnostic::on_unimplemented(message = "`{Self}` is not a tuple")]
-#[rustc_deny_explicit_impl(implement_via_object = false)]
+#[rustc_deny_explicit_impl]
+#[rustc_do_not_implement_via_object]
 pub trait Tuple {}
 
 /// A marker for pointer-like types.
 ///
-/// All types that have the same size and alignment as a `usize` or
-/// `*const ()` automatically implement this trait.
+/// This trait can only be implemented for types that are certain to have
+/// the same size and alignment as a [`usize`] or [`*const ()`](pointer).
+/// To ensure this, there are special requirements on implementations
+/// of `PointerLike` (other than the already-provided implementations
+/// for built-in types):
+///
+/// * The type must have `#[repr(transparent)]`.
+/// * The type’s sole non-zero-sized field must itself implement `PointerLike`.
 #[unstable(feature = "pointer_like_trait", issue = "none")]
 #[lang = "pointer_like"]
 #[diagnostic::on_unimplemented(
     message = "`{Self}` needs to have the same ABI as a pointer",
     label = "`{Self}` needs to be a pointer-like type"
 )]
+#[rustc_do_not_implement_via_object]
 pub trait PointerLike {}
+
+marker_impls! {
+    #[unstable(feature = "pointer_like_trait", issue = "none")]
+    PointerLike for
+        isize,
+        usize,
+        {T} &T,
+        {T} &mut T,
+        {T} *const T,
+        {T} *mut T,
+        {T: PointerLike} crate::pin::Pin<T>,
+}
 
 /// A marker for types which can be used as types of `const` generic parameters.
 ///
@@ -963,35 +1008,65 @@ pub trait PointerLike {}
 /// that all fields are also `ConstParamTy`, which implies that recursively, all fields
 /// are `StructuralPartialEq`.
 #[lang = "const_param_ty"]
-#[unstable(feature = "adt_const_params", issue = "95174")]
+#[unstable(feature = "unsized_const_params", issue = "95174")]
 #[diagnostic::on_unimplemented(message = "`{Self}` can't be used as a const parameter type")]
 #[allow(multiple_supertrait_upcastable)]
-pub trait ConstParamTy: StructuralPartialEq + Eq {}
+// We name this differently than the derive macro so that the `adt_const_params` can
+// be used independently of `unsized_const_params` without requiring a full path
+// to the derive macro every time it is used. This should be renamed on stabilization.
+pub trait ConstParamTy_: UnsizedConstParamTy + StructuralPartialEq + Eq {}
 
 /// Derive macro generating an impl of the trait `ConstParamTy`.
 #[rustc_builtin_macro]
+#[allow_internal_unstable(unsized_const_params)]
 #[unstable(feature = "adt_const_params", issue = "95174")]
 pub macro ConstParamTy($item:item) {
+    /* compiler built-in */
+}
+
+#[lang = "unsized_const_param_ty"]
+#[unstable(feature = "unsized_const_params", issue = "95174")]
+#[diagnostic::on_unimplemented(message = "`{Self}` can't be used as a const parameter type")]
+/// A marker for types which can be used as types of `const` generic parameters.
+///
+/// Equivalent to [`ConstParamTy_`] except that this is used by
+/// the `unsized_const_params` to allow for fake unstable impls.
+pub trait UnsizedConstParamTy: StructuralPartialEq + Eq {}
+
+/// Derive macro generating an impl of the trait `ConstParamTy`.
+#[rustc_builtin_macro]
+#[allow_internal_unstable(unsized_const_params)]
+#[unstable(feature = "unsized_const_params", issue = "95174")]
+pub macro UnsizedConstParamTy($item:item) {
     /* compiler built-in */
 }
 
 // FIXME(adt_const_params): handle `ty::FnDef`/`ty::Closure`
 marker_impls! {
     #[unstable(feature = "adt_const_params", issue = "95174")]
-    ConstParamTy for
+    ConstParamTy_ for
         usize, u8, u16, u32, u64, u128,
         isize, i8, i16, i32, i64, i128,
         bool,
         char,
-        str /* Technically requires `[u8]: ConstParamTy` */,
-        {T: ConstParamTy, const N: usize} [T; N],
-        {T: ConstParamTy} [T],
-        {T: ?Sized + ConstParamTy} &T,
+        (),
+        {T: ConstParamTy_, const N: usize} [T; N],
 }
 
-// FIXME(adt_const_params): Add to marker_impls call above once not in bootstrap
-#[unstable(feature = "adt_const_params", issue = "95174")]
-impl ConstParamTy for () {}
+marker_impls! {
+    #[unstable(feature = "unsized_const_params", issue = "95174")]
+    UnsizedConstParamTy for
+        usize, u8, u16, u32, u64, u128,
+        isize, i8, i16, i32, i64, i128,
+        bool,
+        char,
+        (),
+        {T: UnsizedConstParamTy, const N: usize} [T; N],
+
+        str,
+        {T: UnsizedConstParamTy} [T],
+        {T: UnsizedConstParamTy + ?Sized} &T,
+}
 
 /// A common trait implemented by all function pointers.
 #[unstable(
@@ -1000,9 +1075,18 @@ impl ConstParamTy for () {}
     reason = "internal trait for implementing various traits for all function pointers"
 )]
 #[lang = "fn_ptr_trait"]
-#[rustc_deny_explicit_impl(implement_via_object = false)]
+#[rustc_deny_explicit_impl]
+#[rustc_do_not_implement_via_object]
 pub trait FnPtr: Copy + Clone {
     /// Returns the address of the function pointer.
     #[lang = "fn_ptr_addr"]
     fn addr(self) -> *const ();
+}
+
+/// Derive macro generating impls of traits related to smart pointers.
+#[rustc_builtin_macro(CoercePointee, attributes(pointee))]
+#[allow_internal_unstable(dispatch_from_dyn, coerce_unsized, unsize)]
+#[unstable(feature = "derive_coerce_pointee", issue = "123430")]
+pub macro CoercePointee($item:item) {
+    /* compiler built-in */
 }

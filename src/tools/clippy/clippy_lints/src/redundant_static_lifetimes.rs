@@ -1,5 +1,6 @@
-use clippy_config::msrvs::{self, Msrv};
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet;
 use rustc_ast::ast::{ConstItem, Item, ItemKind, StaticItem, Ty, TyKind};
 use rustc_errors::Applicability;
@@ -38,9 +39,10 @@ pub struct RedundantStaticLifetimes {
 }
 
 impl RedundantStaticLifetimes {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
     }
 }
 
@@ -48,7 +50,7 @@ impl_lint_pass!(RedundantStaticLifetimes => [REDUNDANT_STATIC_LIFETIMES]);
 
 impl RedundantStaticLifetimes {
     // Recursively visit types
-    fn visit_type(ty: &Ty, cx: &EarlyContext<'_>, reason: &str) {
+    fn visit_type(ty: &Ty, cx: &EarlyContext<'_>, reason: &'static str) {
         match ty.kind {
             // Be careful of nested structures (arrays and tuples)
             TyKind::Array(ref ty, _) | TyKind::Slice(ref ty) => {

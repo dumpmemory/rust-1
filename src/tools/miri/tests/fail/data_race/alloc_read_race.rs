@@ -1,5 +1,6 @@
 //@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
-#![feature(new_uninit)]
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
 
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;

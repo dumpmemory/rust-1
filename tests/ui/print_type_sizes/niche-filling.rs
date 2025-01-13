@@ -9,13 +9,12 @@
 //! padding and overall computed sizes can be quite different.
 //!
 //@ compile-flags: -Z print-type-sizes --crate-type lib
-//@ ignore-debug: debug assertions will print more types
+//@ ignore-std-debug-assertions (debug assertions will print more types)
 //@ build-pass
 //@ ignore-pass
 //  ^-- needed because `--pass check` does not emit the output needed.
 //      FIXME: consider using an attribute instead of side-effects.
 #![allow(dead_code)]
-#![feature(generic_nonzero)]
 #![feature(rustc_attrs)]
 
 use std::num::NonZero;

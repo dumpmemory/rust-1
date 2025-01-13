@@ -1,40 +1,45 @@
 use rustc_errors::ErrorGuaranteed;
+use rustc_hir::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::{BuiltinImplSource, CodegenObligationError};
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, Instance, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::util::AsyncDropGlueMorphology;
+use rustc_middle::ty::{
+    self, GenericArgsRef, Instance, PseudoCanonicalInput, TyCtxt, TypeVisitableExt,
+};
 use rustc_span::sym;
 use rustc_trait_selection::traits;
 use rustc_type_ir::ClosureKind;
-use traits::{translate_args, Reveal};
+use tracing::debug;
+use traits::translate_args;
 
 use crate::errors::UnexpectedFnPtrAssociatedItem;
 
-fn resolve_instance<'tcx>(
+fn resolve_instance_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
-    key: ty::ParamEnvAnd<'tcx, (DefId, GenericArgsRef<'tcx>)>,
+    key: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgsRef<'tcx>)>,
 ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-    let (param_env, (def_id, args)) = key.into_parts();
+    let PseudoCanonicalInput { typing_env, value: (def_id, args) } = key;
 
     let result = if let Some(trait_def_id) = tcx.trait_of_item(def_id) {
-        debug!(" => associated item, attempting to find impl in param_env {:#?}", param_env);
+        debug!(" => associated item, attempting to find impl in typing_env {:#?}", typing_env);
         resolve_associated_item(
             tcx,
             def_id,
-            param_env,
+            typing_env,
             trait_def_id,
-            tcx.normalize_erasing_regions(param_env, args),
+            tcx.normalize_erasing_regions(typing_env, args),
         )
     } else {
         let def = if tcx.intrinsic(def_id).is_some() {
             debug!(" => intrinsic");
-            ty::InstanceDef::Intrinsic(def_id)
-        } else if Some(def_id) == tcx.lang_items().drop_in_place_fn() {
+            ty::InstanceKind::Intrinsic(def_id)
+        } else if tcx.is_lang_item(def_id, LangItem::DropInPlace) {
             let ty = args.type_at(0);
 
-            if ty.needs_drop(tcx, param_env) {
+            if ty.needs_drop(tcx, typing_env) {
                 debug!(" => nontrivial drop glue");
                 match *ty.kind() {
                     ty::Closure(..)
@@ -44,20 +49,42 @@ fn resolve_instance<'tcx>(
                     | ty::Adt(..)
                     | ty::Dynamic(..)
                     | ty::Array(..)
-                    | ty::Slice(..) => {}
+                    | ty::Slice(..)
+                    | ty::UnsafeBinder(..) => {}
                     // Drop shims can only be built from ADTs.
                     _ => return Ok(None),
                 }
 
-                ty::InstanceDef::DropGlue(def_id, Some(ty))
+                ty::InstanceKind::DropGlue(def_id, Some(ty))
             } else {
                 debug!(" => trivial drop glue");
-                ty::InstanceDef::DropGlue(def_id, None)
+                ty::InstanceKind::DropGlue(def_id, None)
+            }
+        } else if tcx.is_lang_item(def_id, LangItem::AsyncDropInPlace) {
+            let ty = args.type_at(0);
+
+            if ty.async_drop_glue_morphology(tcx) != AsyncDropGlueMorphology::Noop {
+                match *ty.kind() {
+                    ty::Closure(..)
+                    | ty::CoroutineClosure(..)
+                    | ty::Coroutine(..)
+                    | ty::Tuple(..)
+                    | ty::Adt(..)
+                    | ty::Dynamic(..)
+                    | ty::Array(..)
+                    | ty::Slice(..) => {}
+                    // Async destructor ctor shims can only be built from ADTs.
+                    _ => return Ok(None),
+                }
+                debug!(" => nontrivial async drop glue ctor");
+                ty::InstanceKind::AsyncDropGlueCtorShim(def_id, Some(ty))
+            } else {
+                debug!(" => trivial async drop glue ctor");
+                ty::InstanceKind::AsyncDropGlueCtorShim(def_id, None)
             }
         } else {
             debug!(" => free item");
-            // FIXME(effects): we may want to erase the effect param if that is present on this item.
-            ty::InstanceDef::Item(def_id)
+            ty::InstanceKind::Item(def_id)
         };
 
         Ok(Some(Instance { def, args }))
@@ -69,28 +96,22 @@ fn resolve_instance<'tcx>(
 fn resolve_associated_item<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_item_id: DefId,
-    param_env: ty::ParamEnv<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     trait_id: DefId,
     rcvr_args: GenericArgsRef<'tcx>,
 ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-    debug!(?trait_item_id, ?param_env, ?trait_id, ?rcvr_args, "resolve_associated_item");
+    debug!(?trait_item_id, ?typing_env, ?trait_id, ?rcvr_args, "resolve_associated_item");
 
     let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_args);
 
-    let vtbl = match tcx.codegen_select_candidate((param_env, trait_ref)) {
+    let input = typing_env.as_query_input(trait_ref);
+    let vtbl = match tcx.codegen_select_candidate(input) {
         Ok(vtbl) => vtbl,
-        Err(CodegenObligationError::Ambiguity) => {
-            let reported = tcx.dcx().span_delayed_bug(
-                tcx.def_span(trait_item_id),
-                format!(
-                    "encountered ambiguity selecting `{trait_ref:?}` during codegen, presuming due to \
-                     overflow or prior type error",
-                ),
-            );
-            return Err(reported);
-        }
-        Err(CodegenObligationError::Unimplemented) => return Ok(None),
-        Err(CodegenObligationError::FulfillmentError) => return Ok(None),
+        Err(
+            CodegenObligationError::Ambiguity
+            | CodegenObligationError::Unimplemented
+            | CodegenObligationError::FulfillmentError,
+        ) => return Ok(None),
     };
 
     // Now that we know which impl is being used, we can dispatch to
@@ -99,7 +120,7 @@ fn resolve_associated_item<'tcx>(
         traits::ImplSource::UserDefined(impl_data) => {
             debug!(
                 "resolving ImplSource::UserDefined: {:?}, {:?}, {:?}, {:?}",
-                param_env, trait_item_id, rcvr_args, impl_data
+                typing_env, trait_item_id, rcvr_args, impl_data
             );
             assert!(!rcvr_args.has_infer());
             assert!(!trait_ref.has_infer());
@@ -112,20 +133,11 @@ fn resolve_associated_item<'tcx>(
                 .unwrap_or_else(|| {
                     bug!("{:?} not found in {:?}", trait_item_id, impl_data.impl_def_id);
                 });
-            let infcx = tcx.infer_ctxt().build();
-            let param_env = param_env.with_reveal_all_normalized(tcx);
-            let args = rcvr_args.rebase_onto(tcx, trait_def_id, impl_data.args);
-            let args = translate_args(
-                &infcx,
-                param_env,
-                impl_data.impl_def_id,
-                args,
-                leaf_def.defining_node,
-            );
-            let args = infcx.tcx.erase_regions(args);
 
-            // Since this is a trait item, we need to see if the item is either a trait default item
-            // or a specialization because we can't resolve those unless we can `Reveal::All`.
+            // Since this is a trait item, we need to see if the item is either a trait
+            // default item or a specialization because we can't resolve those until we're
+            // in `TypingMode::PostAnalysis`.
+            //
             // NOTE: This should be kept in sync with the similar code in
             // `rustc_trait_selection::traits::project::assemble_candidates_from_impls()`.
             let eligible = if leaf_def.is_final() {
@@ -136,15 +148,28 @@ fn resolve_associated_item<'tcx>(
                 // and the obligation is monomorphic, otherwise passes such as
                 // transmute checking and polymorphic MIR optimizations could
                 // get a result which isn't correct for all monomorphizations.
-                if param_env.reveal() == Reveal::All {
-                    !trait_ref.still_further_specializable()
-                } else {
-                    false
+                match typing_env.typing_mode {
+                    ty::TypingMode::Coherence
+                    | ty::TypingMode::Analysis { .. }
+                    | ty::TypingMode::PostBorrowckAnalysis { .. } => false,
+                    ty::TypingMode::PostAnalysis => !trait_ref.still_further_specializable(),
                 }
             };
             if !eligible {
                 return Ok(None);
             }
+
+            let typing_env = typing_env.with_post_analysis_normalized(tcx);
+            let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
+            let args = rcvr_args.rebase_onto(tcx, trait_def_id, impl_data.args);
+            let args = translate_args(
+                &infcx,
+                param_env,
+                impl_data.impl_def_id,
+                args,
+                leaf_def.defining_node,
+            );
+            let args = infcx.tcx.erase_regions(args);
 
             // HACK: We may have overlapping `dyn Trait` built-in impls and
             // user-provided blanket impls. Detect that case here, and return
@@ -172,45 +197,65 @@ fn resolve_associated_item<'tcx>(
 
             // Any final impl is required to define all associated items.
             if !leaf_def.item.defaultness(tcx).has_value() {
-                let guard = tcx.dcx().span_delayed_bug(
+                let guar = tcx.dcx().span_delayed_bug(
                     tcx.def_span(leaf_def.item.def_id),
                     "missing value for assoc item in impl",
                 );
-                return Err(guard);
+                return Err(guar);
+            }
+
+            // Make sure that we're projecting to an item that has compatible args.
+            // This may happen if we are resolving an instance before codegen, such
+            // as during inlining. This check is also done in projection.
+            if !tcx.check_args_compatible(leaf_def.item.def_id, args) {
+                let guar = tcx.dcx().span_delayed_bug(
+                    tcx.def_span(leaf_def.item.def_id),
+                    "missing value for assoc item in impl",
+                );
+                return Err(guar);
             }
 
             let args = tcx.erase_regions(args);
 
-            // Check if we just resolved an associated `const` declaration from
-            // a `trait` to an associated `const` definition in an `impl`, where
-            // the definition in the `impl` has the wrong type (for which an
-            // error has already been/will be emitted elsewhere).
-            if leaf_def.item.kind == ty::AssocKind::Const
-                && trait_item_id != leaf_def.item.def_id
+            // We check that the impl item is compatible with the trait item
+            // because otherwise we may ICE in const eval due to type mismatches,
+            // signature incompatibilities, etc.
+            // NOTE: We could also only enforce this in `PostAnalysis`, which
+            // is what CTFE and MIR inlining would care about anyways.
+            if trait_item_id != leaf_def.item.def_id
                 && let Some(leaf_def_item) = leaf_def.item.def_id.as_local()
             {
-                tcx.compare_impl_const((leaf_def_item, trait_item_id))?;
+                tcx.ensure().compare_impl_item(leaf_def_item)?;
             }
 
             Some(ty::Instance::new(leaf_def.item.def_id, args))
         }
-        traits::ImplSource::Builtin(BuiltinImplSource::Object { vtable_base }, _) => {
-            traits::get_vtable_index_of_object_method(tcx, *vtable_base, trait_item_id).map(
-                |index| Instance {
-                    def: ty::InstanceDef::Virtual(trait_item_id, index),
+        traits::ImplSource::Builtin(BuiltinImplSource::Object(_), _) => {
+            let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_args);
+            if trait_ref.has_non_region_infer() || trait_ref.has_non_region_param() {
+                // We only resolve totally substituted vtable entries.
+                None
+            } else {
+                let vtable_base = tcx.first_method_vtable_slot(trait_ref);
+                let offset = tcx
+                    .own_existential_vtable_entries(trait_id)
+                    .iter()
+                    .copied()
+                    .position(|def_id| def_id == trait_item_id);
+                offset.map(|offset| Instance {
+                    def: ty::InstanceKind::Virtual(trait_item_id, vtable_base + offset),
                     args: rcvr_args,
-                },
-            )
+                })
+            }
         }
         traits::ImplSource::Builtin(BuiltinImplSource::Misc, _) => {
-            let lang_items = tcx.lang_items();
-            if Some(trait_ref.def_id) == lang_items.clone_trait() {
+            if tcx.is_lang_item(trait_ref.def_id, LangItem::Clone) {
                 // FIXME(eddyb) use lang items for methods instead of names.
                 let name = tcx.item_name(trait_item_id);
                 if name == sym::clone {
                     let self_ty = trait_ref.self_ty();
                     match self_ty.kind() {
-                        ty::FnDef(..) | ty::FnPtr(_) => (),
+                        ty::FnDef(..) | ty::FnPtr(..) => (),
                         ty::Coroutine(..)
                         | ty::CoroutineWitness(..)
                         | ty::Closure(..)
@@ -220,7 +265,7 @@ fn resolve_associated_item<'tcx>(
                     };
 
                     Some(Instance {
-                        def: ty::InstanceDef::CloneShim(trait_item_id, self_ty),
+                        def: ty::InstanceKind::CloneShim(trait_item_id, self_ty),
                         args: rcvr_args,
                     })
                 } else {
@@ -230,14 +275,14 @@ fn resolve_associated_item<'tcx>(
                     let args = tcx.erase_regions(rcvr_args);
                     Some(ty::Instance::new(trait_item_id, args))
                 }
-            } else if Some(trait_ref.def_id) == lang_items.fn_ptr_trait() {
-                if lang_items.fn_ptr_addr() == Some(trait_item_id) {
+            } else if tcx.is_lang_item(trait_ref.def_id, LangItem::FnPtrTrait) {
+                if tcx.is_lang_item(trait_item_id, LangItem::FnPtrAddr) {
                     let self_ty = trait_ref.self_ty();
                     if !matches!(self_ty.kind(), ty::FnPtr(..)) {
                         return Ok(None);
                     }
                     Some(Instance {
-                        def: ty::InstanceDef::FnPtrAddrShim(trait_item_id, self_ty),
+                        def: ty::InstanceKind::FnPtrAddrShim(trait_item_id, self_ty),
                         args: rcvr_args,
                     })
                 } else {
@@ -255,7 +300,7 @@ fn resolve_associated_item<'tcx>(
                 {
                     // For compiler developers who'd like to add new items to `Fn`/`FnMut`/`FnOnce`,
                     // you either need to generate a shim body, or perhaps return
-                    // `InstanceDef::Item` pointing to a trait default method body if
+                    // `InstanceKind::Item` pointing to a trait default method body if
                     // it is given a default implementation by the trait.
                     bug!(
                         "no definition for `{trait_ref}::{}` for built-in callable type",
@@ -267,7 +312,7 @@ fn resolve_associated_item<'tcx>(
                         Some(Instance::resolve_closure(tcx, closure_def_id, args, target_kind))
                     }
                     ty::FnDef(..) | ty::FnPtr(..) => Some(Instance {
-                        def: ty::InstanceDef::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
+                        def: ty::InstanceKind::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
                         args: rcvr_args,
                     }),
                     ty::CoroutineClosure(coroutine_closure_def_id, args) => {
@@ -280,9 +325,9 @@ fn resolve_associated_item<'tcx>(
                             Some(Instance::new(coroutine_closure_def_id, args))
                         } else {
                             Some(Instance {
-                                def: ty::InstanceDef::ConstructCoroutineInClosureShim {
+                                def: ty::InstanceKind::ConstructCoroutineInClosureShim {
                                     coroutine_closure_def_id,
-                                    target_kind: ty::ClosureKind::FnOnce,
+                                    receiver_by_ref: target_kind != ty::ClosureKind::FnOnce,
                                 },
                                 args,
                             })
@@ -297,32 +342,27 @@ fn resolve_associated_item<'tcx>(
             {
                 match *rcvr_args.type_at(0).kind() {
                     ty::CoroutineClosure(coroutine_closure_def_id, args) => {
-                        match (target_kind, args.as_coroutine_closure().kind()) {
-                            (ClosureKind::FnOnce | ClosureKind::FnMut, ClosureKind::Fn)
-                            | (ClosureKind::FnOnce, ClosureKind::FnMut) => {
-                                // If we're computing `AsyncFnOnce`/`AsyncFnMut` for a by-ref closure,
-                                // or `AsyncFnOnce` for a by-mut closure, then construct a new body that
-                                // has the right return types.
-                                //
-                                // Specifically, `AsyncFnMut` for a by-ref coroutine-closure just needs
-                                // to have its input and output types fixed (`&mut self` and returning
-                                // `i16` coroutine kind).
-                                Some(Instance {
-                                    def: ty::InstanceDef::ConstructCoroutineInClosureShim {
-                                        coroutine_closure_def_id,
-                                        target_kind,
-                                    },
-                                    args,
-                                })
-                            }
-                            _ => Some(Instance::new(coroutine_closure_def_id, args)),
+                        if target_kind == ClosureKind::FnOnce
+                            && args.as_coroutine_closure().kind() != ClosureKind::FnOnce
+                        {
+                            // If we're computing `AsyncFnOnce` for a by-ref closure then
+                            // construct a new body that has the right return types.
+                            Some(Instance {
+                                def: ty::InstanceKind::ConstructCoroutineInClosureShim {
+                                    coroutine_closure_def_id,
+                                    receiver_by_ref: false,
+                                },
+                                args,
+                            })
+                        } else {
+                            Some(Instance::new(coroutine_closure_def_id, args))
                         }
                     }
                     ty::Closure(closure_def_id, args) => {
                         Some(Instance::resolve_closure(tcx, closure_def_id, args, target_kind))
                     }
                     ty::FnDef(..) | ty::FnPtr(..) => Some(Instance {
-                        def: ty::InstanceDef::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
+                        def: ty::InstanceKind::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
                         args: rcvr_args,
                     }),
                     _ => bug!(
@@ -330,6 +370,11 @@ fn resolve_associated_item<'tcx>(
                         tcx.item_name(trait_item_id)
                     ),
                 }
+            } else if tcx.is_lang_item(trait_ref.def_id, LangItem::TransmuteTrait) {
+                let name = tcx.item_name(trait_item_id);
+                assert_eq!(name, sym::transmute);
+                let args = tcx.erase_regions(rcvr_args);
+                Some(ty::Instance::new(trait_item_id, args))
             } else {
                 Instance::try_resolve_item_for_coroutine(tcx, trait_item_id, trait_id, rcvr_args)
             }
@@ -341,5 +386,5 @@ fn resolve_associated_item<'tcx>(
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { resolve_instance, ..*providers };
+    *providers = Providers { resolve_instance_raw, ..*providers };
 }

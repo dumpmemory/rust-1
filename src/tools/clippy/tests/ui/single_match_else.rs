@@ -1,5 +1,4 @@
 //@aux-build: proc_macros.rs
-//@compile-flags: -Zdeduplicate-diagnostics=yes
 
 #![warn(clippy::single_match_else)]
 #![allow(unused, clippy::needless_return, clippy::no_effect, clippy::uninlined_format_args)]
@@ -99,7 +98,7 @@ fn main() {
 
     // lint here
     use std::convert::Infallible;
-    match Result::<i32, Infallible>::Ok(1) {
+    match Result::<i32, &Infallible>::Ok(1) {
         Ok(a) => println!("${:?}", a),
         Err(_) => {
             println!("else block");
@@ -197,6 +196,16 @@ fn issue_10808(bar: Option<i32>) {
                 let r = &v as *const i32;
                 println!("{}", *r);
             }
+        },
+    }
+}
+
+fn irrefutable_match() -> Option<&'static ExprNode> {
+    match ExprNode::Butterflies {
+        ExprNode::Butterflies => Some(&NODE),
+        _ => {
+            let x = 5;
+            None
         },
     }
 }

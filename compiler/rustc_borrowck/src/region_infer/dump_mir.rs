@@ -3,11 +3,13 @@
 //! state of region inference. This code handles emitting the region
 //! context internal state.
 
-use super::{OutlivesConstraint, RegionInferenceContext};
-use crate::type_check::Locations;
+use std::io::{self, Write};
+
 use rustc_infer::infer::NllRegionVariableOrigin;
 use rustc_middle::ty::TyCtxt;
-use std::io::{self, Write};
+
+use super::{OutlivesConstraint, RegionInferenceContext};
+use crate::type_check::Locations;
 
 // Room for "'_#NNNNr" before things get misaligned.
 // Easy enough to fix if this ever doesn't seem like
@@ -21,7 +23,8 @@ impl<'tcx> RegionInferenceContext<'tcx> {
 
         for region in self.regions() {
             if let NllRegionVariableOrigin::FreeRegion = self.definitions[region].origin {
-                let classification = self.universal_regions.region_classification(region).unwrap();
+                let classification =
+                    self.universal_regions().region_classification(region).unwrap();
                 let outlived_by = self.universal_region_relations.regions_outlived_by(region);
                 writeln!(
                     out,

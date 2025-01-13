@@ -1,6 +1,7 @@
 // This test ensure that the sidebar isn't "hidden" on mobile but instead moved out of the viewport.
 // This is especially important for devices for "text-first" content (like for users with
 // sight issues).
+include: "utils.goml"
 go-to: "file://" + |DOC_PATH| + "/test_docs/struct.Foo.html"
 // Switching to "mobile view" by reducing the width to 600px.
 set-window-size: (600, 600)
@@ -24,9 +25,12 @@ click: ".sidebar-menu-toggle"
 assert-css: (".sidebar", {"left": "0px"})
 
 // Make sure the "struct Foo" header is hidden, since the mobile topbar already does it.
-assert-css: ("//nav[contains(@class, 'sidebar')]//h2/a[text()='Foo']/parent::h2", {"display": "none"})
+assert-css: ("//nav[contains(@class, 'sidebar')]//h2/a[normalize-space()='Foo']/parent::h2", {"display": "none"})
 // Make sure the global navigation is still here.
-assert-css: ("//nav[contains(@class, 'sidebar')]//h2/a[text()='In crate test_docs']/parent::h2", {"display": "block"})
+assert-css: (
+    "//nav[contains(@class, 'sidebar')]//h2/a[normalize-space()='In crate test_docs']/parent::h2",
+    {"display": "block"}
+)
 
 // Click elsewhere.
 click: "body"
@@ -57,9 +61,9 @@ show-text: true
 
 define-function: (
     "check-colors",
-    (theme, color, background),
+    [theme, color, background],
     block {
-        set-local-storage: {"rustdoc-use-system-theme": "false", "rustdoc-theme": |theme|}
+        call-function: ("switch-theme", {"theme": |theme|})
         reload:
 
         // Open the sidebar menu.

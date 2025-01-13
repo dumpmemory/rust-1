@@ -1,7 +1,6 @@
 #![allow(unused)]
 #![allow(non_contiguous_range_endpoints)]
 #![warn(clippy::manual_range_patterns)]
-#![feature(exclusive_range_pattern)]
 
 fn main() {
     let f = 6;
@@ -46,4 +45,12 @@ fn main() {
         };
     }
     mac!(f);
+
+    #[rustfmt::skip]
+    let _ = match f {
+        | 2..=15 => 4,
+        | 241..=254 => 5,
+        | 255 => 6,
+        | _ => 7,
+    };
 }

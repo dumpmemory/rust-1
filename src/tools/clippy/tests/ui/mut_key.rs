@@ -2,10 +2,10 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
-//@no-rustfix
+
 struct Key(AtomicUsize);
 
 impl Clone for Key {
@@ -77,8 +77,6 @@ fn main() {
     //~^ ERROR: mutable key type
     let _map = HashMap::<&mut Cell<usize>, usize>::new();
     //~^ ERROR: mutable key type
-    let _map = HashMap::<&mut usize, usize>::new();
-    //~^ ERROR: mutable key type
     // Collection types from `std` who's impl of `Hash` or `Ord` delegate their type parameters
     let _map = HashMap::<Vec<Cell<usize>>, usize>::new();
     //~^ ERROR: mutable key type
@@ -92,8 +90,6 @@ fn main() {
     //~^ ERROR: mutable key type
     let _map = HashMap::<Option<Vec<Cell<usize>>>, usize>::new();
     //~^ ERROR: mutable key type
-    let _map = HashMap::<Result<&mut usize, ()>, usize>::new();
-    //~^ ERROR: mutable key type
     // Smart pointers from `std` who's impl of `Hash` or `Ord` delegate their type parameters
     let _map = HashMap::<Box<Cell<usize>>, usize>::new();
     //~^ ERROR: mutable key type
@@ -101,4 +97,8 @@ fn main() {
     //~^ ERROR: mutable key type
     let _map = HashMap::<Arc<Cell<usize>>, usize>::new();
     //~^ ERROR: mutable key type
+
+    // Not interior mutability
+    let _map = HashMap::<&mut usize, usize>::new();
+    let _map = HashMap::<Result<&mut usize, ()>, usize>::new();
 }

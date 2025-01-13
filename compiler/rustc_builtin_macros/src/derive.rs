@@ -1,16 +1,19 @@
-use crate::cfg_eval::cfg_eval;
-use crate::errors;
-
 use rustc_ast as ast;
-use rustc_ast::{GenericParamKind, ItemKind, MetaItemKind, NestedMetaItem, StmtKind};
-use rustc_expand::base::{Annotatable, ExpandResult, ExtCtxt, Indeterminate, MultiItemModifier};
+use rustc_ast::{GenericParamKind, ItemKind, MetaItemInner, MetaItemKind, StmtKind};
+use rustc_expand::base::{
+    Annotatable, DeriveResolution, ExpandResult, ExtCtxt, Indeterminate, MultiItemModifier,
+};
 use rustc_feature::AttributeTemplate;
 use rustc_parse::validate_attr;
 use rustc_session::Session;
-use rustc_span::symbol::{sym, Ident};
-use rustc_span::{ErrorGuaranteed, Span};
+use rustc_span::{ErrorGuaranteed, Ident, Span, sym};
 
-pub(crate) struct Expander(pub bool);
+use crate::cfg_eval::cfg_eval;
+use crate::errors;
+
+pub(crate) struct Expander {
+    pub is_const: bool,
+}
 
 impl MultiItemModifier for Expander {
     fn expand(
@@ -39,14 +42,15 @@ impl MultiItemModifier for Expander {
                     ast::AttrStyle::Outer,
                     sym::derive,
                     template,
+                    true,
                 );
 
                 let mut resolutions = match &meta_item.kind {
                     MetaItemKind::List(list) => {
                         list.iter()
-                            .filter_map(|nested_meta| match nested_meta {
-                                NestedMetaItem::MetaItem(meta) => Some(meta),
-                                NestedMetaItem::Lit(lit) => {
+                            .filter_map(|meta_item_inner| match meta_item_inner {
+                                MetaItemInner::MetaItem(meta) => Some(meta),
+                                MetaItemInner::Lit(lit) => {
                                     // Reject `#[derive("Debug")]`.
                                     report_unexpected_meta_item_lit(sess, lit);
                                     None
@@ -58,7 +62,12 @@ impl MultiItemModifier for Expander {
                                 report_path_args(sess, meta);
                                 meta.path.clone()
                             })
-                            .map(|path| (path, dummy_annotatable(), None, self.0))
+                            .map(|path| DeriveResolution {
+                                path,
+                                item: dummy_annotatable(),
+                                exts: None,
+                                is_const: self.is_const,
+                            })
                             .collect()
                     }
                     _ => vec![],
@@ -67,15 +76,15 @@ impl MultiItemModifier for Expander {
                 // Do not configure or clone items unless necessary.
                 match &mut resolutions[..] {
                     [] => {}
-                    [(_, first_item, ..), others @ ..] => {
-                        *first_item = cfg_eval(
+                    [first, others @ ..] => {
+                        first.item = cfg_eval(
                             sess,
                             features,
                             item.clone(),
                             ecx.current_expansion.lint_node_id,
                         );
-                        for (_, item, _, _) in others {
-                            *item = first_item.clone();
+                        for other in others {
+                            other.item = first.item.clone();
                         }
                     }
                 }

@@ -45,7 +45,7 @@ mod inline {
     //~| NOTE not a function or closure
 
     #[inline = "2100"] fn f() { }
-    //~^ ERROR attribute must be of the form
+    //~^ ERROR valid forms for the attribute are
     //~| WARN this was previously accepted
     //~| NOTE #[deny(ill_formed_attribute_input)]` on by default
     //~| NOTE for more information, see issue #57571 <https://github.com/rust-lang/rust/issues/57571>
@@ -160,6 +160,30 @@ mod repr {
     //~| NOTE not a struct, enum, or union
 
     #[repr(C)] impl S { }
+    //~^ ERROR: attribute should be applied to a struct, enum, or union
+    //~| NOTE not a struct, enum, or union
+}
+
+
+#[repr(Rust)]
+//~^ ERROR: attribute should be applied to a struct, enum, or union
+mod repr_rust {
+//~^ NOTE not a struct, enum, or union
+    mod inner { #![repr(Rust)] }
+    //~^ ERROR: attribute should be applied to a struct, enum, or union
+    //~| NOTE not a struct, enum, or union
+
+    #[repr(Rust)] fn f() { }
+    //~^ ERROR: attribute should be applied to a struct, enum, or union
+    //~| NOTE not a struct, enum, or union
+
+    struct S;
+
+    #[repr(Rust)] type T = S;
+    //~^ ERROR: attribute should be applied to a struct, enum, or union
+    //~| NOTE not a struct, enum, or union
+
+    #[repr(Rust)] impl S { }
     //~^ ERROR: attribute should be applied to a struct, enum, or union
     //~| NOTE not a struct, enum, or union
 }

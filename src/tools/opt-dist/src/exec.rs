@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::process::{Command, Stdio};
+
+use camino::{Utf8Path, Utf8PathBuf};
+
 use crate::environment::Environment;
 use crate::metrics::{load_metrics, record_metrics};
 use crate::timer::TimerSection;
 use crate::training::{BoltProfile, LlvmPGOProfile, RustcPGOProfile};
-use camino::{Utf8Path, Utf8PathBuf};
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::process::{Command, Stdio};
 
 #[derive(Default)]
 pub struct CmdBuilder {
@@ -103,9 +105,9 @@ impl Bootstrap {
             env.checkout_path().join("x.py").as_str(),
             "build",
             "--target",
-            &env.host_triple(),
+            &env.host_tuple(),
             "--host",
-            &env.host_triple(),
+            &env.host_tuple(),
             "--stage",
             "2",
             "library/std",

@@ -1,21 +1,15 @@
-use crate::dep_graph::DepNodeIndex;
+use std::fmt::Debug;
+use std::hash::Hash;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sharded::{self, Sharded};
-use rustc_data_structures::sync::{Lock, OnceLock};
+use rustc_data_structures::sync::OnceLock;
+pub use rustc_data_structures::vec_cache::VecCache;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_index::{Idx, IndexVec};
-use rustc_span::def_id::DefId;
-use rustc_span::def_id::DefIndex;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::marker::PhantomData;
+use rustc_index::Idx;
+use rustc_span::def_id::{DefId, DefIndex};
 
-pub trait CacheSelector<'tcx, V> {
-    type Cache
-    where
-        V: Copy;
-}
+use crate::dep_graph::DepNodeIndex;
 
 pub trait QueryCache: Sized {
     type Key: Hash + Eq + Copy + Debug;
@@ -27,14 +21,6 @@ pub trait QueryCache: Sized {
     fn complete(&self, key: Self::Key, value: Self::Value, index: DepNodeIndex);
 
     fn iter(&self, f: &mut dyn FnMut(&Self::Key, &Self::Value, DepNodeIndex));
-}
-
-pub struct DefaultCacheSelector<K>(PhantomData<K>);
-
-impl<'tcx, K: Eq + Hash, V: 'tcx> CacheSelector<'tcx, V> for DefaultCacheSelector<K> {
-    type Cache = DefaultCache<K, V>
-    where
-        V: Copy;
 }
 
 pub struct DefaultCache<K, V> {
@@ -81,14 +67,6 @@ where
     }
 }
 
-pub struct SingleCacheSelector;
-
-impl<'tcx, V: 'tcx> CacheSelector<'tcx, V> for SingleCacheSelector {
-    type Cache = SingleCache<V>
-    where
-        V: Copy;
-}
-
 pub struct SingleCache<V> {
     cache: OnceLock<(V, DepNodeIndex)>,
 }
@@ -123,75 +101,10 @@ where
     }
 }
 
-pub struct VecCacheSelector<K>(PhantomData<K>);
-
-impl<'tcx, K: Idx, V: 'tcx> CacheSelector<'tcx, V> for VecCacheSelector<K> {
-    type Cache = VecCache<K, V>
-    where
-        V: Copy;
-}
-
-pub struct VecCache<K: Idx, V> {
-    cache: Sharded<IndexVec<K, Option<(V, DepNodeIndex)>>>,
-}
-
-impl<K: Idx, V> Default for VecCache<K, V> {
-    fn default() -> Self {
-        VecCache { cache: Default::default() }
-    }
-}
-
-impl<K, V> QueryCache for VecCache<K, V>
-where
-    K: Eq + Idx + Copy + Debug,
-    V: Copy,
-{
-    type Key = K;
-    type Value = V;
-
-    #[inline(always)]
-    fn lookup(&self, key: &K) -> Option<(V, DepNodeIndex)> {
-        // FIXME: lock_shard_by_hash will use high bits which are usually zero in the index() passed
-        // here. This makes sharding essentially useless, always selecting the zero'th shard.
-        let lock = self.cache.lock_shard_by_hash(key.index() as u64);
-        if let Some(Some(value)) = lock.get(*key) { Some(*value) } else { None }
-    }
-
-    #[inline]
-    fn complete(&self, key: K, value: V, index: DepNodeIndex) {
-        let mut lock = self.cache.lock_shard_by_hash(key.index() as u64);
-        lock.insert(key, (value, index));
-    }
-
-    fn iter(&self, f: &mut dyn FnMut(&Self::Key, &Self::Value, DepNodeIndex)) {
-        for shard in self.cache.lock_shards() {
-            for (k, v) in shard.iter_enumerated() {
-                if let Some(v) = v {
-                    f(&k, &v.0, v.1);
-                }
-            }
-        }
-    }
-}
-
-pub struct DefIdCacheSelector;
-
-impl<'tcx, V: 'tcx> CacheSelector<'tcx, V> for DefIdCacheSelector {
-    type Cache = DefIdCache<V>
-    where
-        V: Copy;
-}
-
 pub struct DefIdCache<V> {
     /// Stores the local DefIds in a dense map. Local queries are much more often dense, so this is
     /// a win over hashing query keys at marginal memory cost (~5% at most) compared to FxHashMap.
-    ///
-    /// The second element of the tuple is the set of keys actually present in the IndexVec, used
-    /// for faster iteration in `iter()`.
-    // FIXME: This may want to be sharded, like VecCache. However *how* to shard an IndexVec isn't
-    // super clear; VecCache is effectively not sharded today (see FIXME there). For now just omit
-    // that complexity here.
-    local: Lock<(IndexVec<DefIndex, Option<(V, DepNodeIndex)>>, Vec<DefIndex>)>,
+    local: VecCache<DefIndex, V, DepNodeIndex>,
     foreign: DefaultCache<DefId, V>,
 }
 
@@ -211,8 +124,7 @@ where
     #[inline(always)]
     fn lookup(&self, key: &DefId) -> Option<(V, DepNodeIndex)> {
         if key.krate == LOCAL_CRATE {
-            let cache = self.local.lock();
-            cache.0.get(key.index).and_then(|v| *v)
+            self.local.lookup(&key.index)
         } else {
             self.foreign.lookup(key)
         }
@@ -221,27 +133,39 @@ where
     #[inline]
     fn complete(&self, key: DefId, value: V, index: DepNodeIndex) {
         if key.krate == LOCAL_CRATE {
-            let mut cache = self.local.lock();
-            let (cache, present) = &mut *cache;
-            let slot = cache.ensure_contains_elem(key.index, Default::default);
-            if slot.is_none() {
-                // FIXME: Only store the present set when running in incremental mode. `iter` is not
-                // used outside of saving caches to disk and self-profile.
-                present.push(key.index);
-            }
-            *slot = Some((value, index));
+            self.local.complete(key.index, value, index)
         } else {
             self.foreign.complete(key, value, index)
         }
     }
 
     fn iter(&self, f: &mut dyn FnMut(&Self::Key, &Self::Value, DepNodeIndex)) {
-        let guard = self.local.lock();
-        let (cache, present) = &*guard;
-        for &idx in present.iter() {
-            let value = cache[idx].unwrap();
-            f(&DefId { krate: LOCAL_CRATE, index: idx }, &value.0, value.1);
-        }
+        self.local.iter(&mut |key, value, index| {
+            f(&DefId { krate: LOCAL_CRATE, index: *key }, value, index);
+        });
         self.foreign.iter(f);
+    }
+}
+
+impl<K, V> QueryCache for VecCache<K, V, DepNodeIndex>
+where
+    K: Idx + Eq + Hash + Copy + Debug,
+    V: Copy,
+{
+    type Key = K;
+    type Value = V;
+
+    #[inline(always)]
+    fn lookup(&self, key: &K) -> Option<(V, DepNodeIndex)> {
+        self.lookup(key)
+    }
+
+    #[inline]
+    fn complete(&self, key: K, value: V, index: DepNodeIndex) {
+        self.complete(key, value, index)
+    }
+
+    fn iter(&self, f: &mut dyn FnMut(&Self::Key, &Self::Value, DepNodeIndex)) {
+        self.iter(f)
     }
 }

@@ -2,24 +2,25 @@
 // unresolved type variables and replaces "ty_var" types with their
 // generic parameters.
 
-use crate::FnCtxt;
+use std::mem;
+
 use rustc_data_structures::unord::ExtendUnord;
-use rustc_errors::{ErrorGuaranteed, StashKey};
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
+use rustc_hir::HirId;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_infer::infer::error_reporting::TypeAnnotationNeeded::E0282;
+use rustc_middle::span_bug;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
-use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
+use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, fold_regions};
 use rustc_middle::ty::visit::TypeVisitableExt;
-use rustc_middle::ty::TypeSuperFoldable;
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::symbol::sym;
-use rustc_span::Span;
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperFoldable};
+use rustc_span::{Span, sym};
+use rustc_trait_selection::error_reporting::infer::need_type_info::TypeAnnotationNeeded;
 use rustc_trait_selection::solve;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
+use tracing::{debug, instrument};
 
-use std::mem;
+use crate::FnCtxt;
 
 ///////////////////////////////////////////////////////////////////////////
 // Entry point
@@ -34,7 +35,7 @@ use std::mem;
 // resolve_type_vars_in_body, which creates a new TypeTables which
 // doesn't contain any inference types.
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
-    pub fn resolve_type_vars_in_body(
+    pub(crate) fn resolve_type_vars_in_body(
         &self,
         body: &'tcx hir::Body<'tcx>,
     ) -> &'tcx ty::TypeckResults<'tcx> {
@@ -134,7 +135,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         self.fcx.tcx
     }
 
-    fn write_ty_to_typeck_results(&mut self, hir_id: hir::HirId, ty: Ty<'tcx>) {
+    fn write_ty_to_typeck_results(&mut self, hir_id: HirId, ty: Ty<'tcx>) {
         debug!("write_ty_to_typeck_results({:?}, {:?})", hir_id, ty);
         assert!(
             !ty.has_infer() && !ty.has_placeholders() && !ty.has_free_regions(),
@@ -217,28 +218,9 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     fn fix_index_builtin_expr(&mut self, e: &hir::Expr<'_>) {
         if let hir::ExprKind::Index(ref base, ref index, _) = e.kind {
             // All valid indexing looks like this; might encounter non-valid indexes at this point.
-            let base_ty = self.typeck_results.expr_ty_adjusted_opt(base);
-            if base_ty.is_none() {
-                // When encountering `return [0][0]` outside of a `fn` body we can encounter a base
-                // that isn't in the type table. We assume more relevant errors have already been
-                // emitted. (#64638)
-                assert!(self.tcx().dcx().has_errors().is_some(), "bad base: `{base:?}`");
-            }
-            if let Some(base_ty) = base_ty
-                && let ty::Ref(_, base_ty_inner, _) = *base_ty.kind()
-            {
-                let index_ty =
-                    self.typeck_results.expr_ty_adjusted_opt(index).unwrap_or_else(|| {
-                        // When encountering `return [0][0]` outside of a `fn` body we would attempt
-                        // to access an nonexistent index. We assume that more relevant errors will
-                        // already have been emitted, so we only gate on this with an ICE if no
-                        // error has been emitted. (#64638)
-                        Ty::new_error_with_message(
-                            self.fcx.tcx,
-                            e.span,
-                            format!("bad index {index:?} for base: `{base:?}`"),
-                        )
-                    });
+            let base_ty = self.typeck_results.expr_ty_adjusted(base);
+            if let ty::Ref(_, base_ty_inner, _) = *base_ty.kind() {
+                let index_ty = self.typeck_results.expr_ty_adjusted(index);
                 if self.is_builtin_index(e, base_ty_inner, index_ty) {
                     // Remove the method call record
                     self.typeck_results.type_dependent_defs_mut().remove(e.hir_id);
@@ -263,6 +245,13 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                 }
             }
         }
+    }
+
+    fn visit_const_block(&mut self, span: Span, anon_const: &hir::ConstBlock) {
+        self.visit_node_id(span, anon_const.hir_id);
+
+        let body = self.tcx().hir().body(anon_const.body);
+        self.visit_body(body);
     }
 }
 
@@ -293,11 +282,8 @@ impl<'cx, 'tcx> Visitor<'tcx> for WritebackCx<'cx, 'tcx> {
             hir::ExprKind::Field(..) | hir::ExprKind::OffsetOf(..) => {
                 self.visit_field_id(e.hir_id);
             }
-            hir::ExprKind::ConstBlock(anon_const) => {
-                self.visit_node_id(e.span, anon_const.hir_id);
-
-                let body = self.tcx().hir().body(anon_const.body);
-                self.visit_body(body);
+            hir::ExprKind::ConstBlock(ref anon_const) => {
+                self.visit_const_block(e.span, anon_const);
             }
             _ => {}
         }
@@ -345,13 +331,23 @@ impl<'cx, 'tcx> Visitor<'tcx> for WritebackCx<'cx, 'tcx> {
             _ => {}
         };
 
+        self.visit_rust_2024_migration_desugared_pats(p.hir_id);
+        self.visit_skipped_ref_pats(p.hir_id);
         self.visit_pat_adjustments(p.span, p.hir_id);
 
         self.visit_node_id(p.span, p.hir_id);
         intravisit::walk_pat(self, p);
     }
 
-    fn visit_local(&mut self, l: &'tcx hir::Local<'tcx>) {
+    fn visit_pat_expr(&mut self, expr: &'tcx hir::PatExpr<'tcx>) {
+        self.visit_node_id(expr.span, expr.hir_id);
+        if let hir::PatExprKind::ConstBlock(c) = &expr.kind {
+            self.visit_const_block(expr.span, c);
+        }
+        intravisit::walk_pat_expr(self, expr);
+    }
+
+    fn visit_local(&mut self, l: &'tcx hir::LetStmt<'tcx>) {
         intravisit::walk_local(self, l);
         let var_ty = self.fcx.local_ty(l.span, l.hir_id);
         let var_ty = self.resolve(var_ty, &l.span);
@@ -460,7 +456,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             fcx_typeck_results.closure_kind_origins().items_in_stable_order();
 
         for (local_id, origin) in fcx_closure_kind_origins {
-            let hir_id = hir::HirId { owner: common_hir_owner, local_id };
+            let hir_id = HirId { owner: common_hir_owner, local_id };
             let place_span = origin.0;
             let place = self.resolve(origin.1.clone(), &place_span);
             self.typeck_results.closure_kind_origins_mut().insert(hir_id, (place_span, place));
@@ -489,9 +485,9 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
 
             let mut errors_buffer = Vec::new();
             for (local_id, c_ty) in sorted_user_provided_types {
-                let hir_id = hir::HirId { owner: common_hir_owner, local_id };
+                let hir_id = HirId { owner: common_hir_owner, local_id };
 
-                if let ty::UserType::TypeOf(_, user_args) = c_ty.value {
+                if let ty::UserTypeKind::TypeOf(_, user_args) = c_ty.value.kind {
                     // This is a unit-testing mechanism.
                     let span = self.tcx().hir().span(hir_id);
                     // We need to buffer the errors in order to guarantee a consistent
@@ -512,7 +508,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
 
         self.typeck_results.user_provided_types_mut().extend(
             fcx_typeck_results.user_provided_types().items().map(|(local_id, c_ty)| {
-                let hir_id = hir::HirId { owner: common_hir_owner, local_id };
+                let hir_id = HirId { owner: common_hir_owner, local_id };
 
                 if cfg!(debug_assertions) && c_ty.has_infer() {
                     span_bug!(
@@ -549,15 +545,10 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     fn visit_coroutine_interior(&mut self) {
         let fcx_typeck_results = self.fcx.typeck_results.borrow();
         assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
-        self.tcx().with_stable_hashing_context(move |ref hcx| {
-            for (&expr_def_id, predicates) in
-                fcx_typeck_results.coroutine_interior_predicates.to_sorted(hcx, false).into_iter()
-            {
-                let predicates =
-                    self.resolve(predicates.clone(), &self.fcx.tcx.def_span(expr_def_id));
-                self.typeck_results.coroutine_interior_predicates.insert(expr_def_id, predicates);
-            }
-        })
+        for (predicate, cause) in &fcx_typeck_results.coroutine_stalled_predicates {
+            let (predicate, cause) = self.resolve((*predicate, cause.clone()), &cause.span);
+            self.typeck_results.coroutine_stalled_predicates.insert((predicate, cause));
+        }
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -575,11 +566,13 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             let hidden_type = self.resolve(decl.hidden_type, &decl.hidden_type.span);
             let opaque_type_key = self.resolve(opaque_type_key, &decl.hidden_type.span);
 
-            if let ty::Alias(ty::Opaque, alias_ty) = hidden_type.ty.kind()
-                && alias_ty.def_id == opaque_type_key.def_id.to_def_id()
-                && alias_ty.args == opaque_type_key.args
-            {
-                continue;
+            if !self.fcx.next_trait_solver() {
+                if let ty::Alias(ty::Opaque, alias_ty) = hidden_type.ty.kind()
+                    && alias_ty.def_id == opaque_type_key.def_id.to_def_id()
+                    && alias_ty.args == opaque_type_key.args
+                {
+                    continue;
+                }
             }
 
             // Here we only detect impl trait definition conflicts when they
@@ -589,34 +582,22 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                 && last_opaque_ty.ty != hidden_type.ty
             {
                 assert!(!self.fcx.next_trait_solver());
-                if let Ok(d) = hidden_type.build_mismatch_error(
-                    &last_opaque_ty,
-                    opaque_type_key.def_id,
-                    self.tcx(),
-                ) {
-                    d.stash(
-                        self.tcx().def_span(opaque_type_key.def_id),
-                        StashKey::OpaqueHiddenTypeMismatch,
-                    );
+                if let Ok(d) = hidden_type.build_mismatch_error(&last_opaque_ty, self.tcx()) {
+                    d.emit();
                 }
             }
         }
     }
 
-    fn visit_field_id(&mut self, hir_id: hir::HirId) {
+    fn visit_field_id(&mut self, hir_id: HirId) {
         if let Some(index) = self.fcx.typeck_results.borrow_mut().field_indices_mut().remove(hir_id)
         {
             self.typeck_results.field_indices_mut().insert(hir_id, index);
         }
-        if let Some(nested_fields) =
-            self.fcx.typeck_results.borrow_mut().nested_fields_mut().remove(hir_id)
-        {
-            self.typeck_results.nested_fields_mut().insert(hir_id, nested_fields);
-        }
     }
 
     #[instrument(skip(self, span), level = "debug")]
-    fn visit_node_id(&mut self, span: Span, hir_id: hir::HirId) {
+    fn visit_node_id(&mut self, span: Span, hir_id: HirId) {
         // Export associated path extensions and method resolutions.
         if let Some(def) =
             self.fcx.typeck_results.borrow_mut().type_dependent_defs_mut().remove(hir_id)
@@ -643,7 +624,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     }
 
     #[instrument(skip(self, span), level = "debug")]
-    fn visit_adjustments(&mut self, span: Span, hir_id: hir::HirId) {
+    fn visit_adjustments(&mut self, span: Span, hir_id: HirId) {
         let adjustment = self.fcx.typeck_results.borrow_mut().adjustments_mut().remove(hir_id);
         match adjustment {
             None => {
@@ -658,8 +639,26 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         }
     }
 
+    #[instrument(skip(self), level = "debug")]
+    fn visit_rust_2024_migration_desugared_pats(&mut self, hir_id: hir::HirId) {
+        if let Some(is_hard_error) = self
+            .fcx
+            .typeck_results
+            .borrow_mut()
+            .rust_2024_migration_desugared_pats_mut()
+            .remove(hir_id)
+        {
+            debug!(
+                "node is a pat whose match ergonomics are desugared by the Rust 2024 migration lint"
+            );
+            self.typeck_results
+                .rust_2024_migration_desugared_pats_mut()
+                .insert(hir_id, is_hard_error);
+        }
+    }
+
     #[instrument(skip(self, span), level = "debug")]
-    fn visit_pat_adjustments(&mut self, span: Span, hir_id: hir::HirId) {
+    fn visit_pat_adjustments(&mut self, span: Span, hir_id: HirId) {
         let adjustment = self.fcx.typeck_results.borrow_mut().pat_adjustments_mut().remove(hir_id);
         match adjustment {
             None => {
@@ -674,6 +673,14 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         }
     }
 
+    #[instrument(skip(self), level = "debug")]
+    fn visit_skipped_ref_pats(&mut self, hir_id: hir::HirId) {
+        if self.fcx.typeck_results.borrow_mut().skipped_ref_pats_mut().remove(hir_id) {
+            debug!("node is a skipped ref pat");
+            self.typeck_results.skipped_ref_pats_mut().insert(hir_id);
+        }
+    }
+
     fn visit_liberated_fn_sigs(&mut self) {
         let fcx_typeck_results = self.fcx.typeck_results.borrow();
         assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
@@ -682,7 +689,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         let fcx_liberated_fn_sigs = fcx_typeck_results.liberated_fn_sigs().items_in_stable_order();
 
         for (local_id, &fn_sig) in fcx_liberated_fn_sigs {
-            let hir_id = hir::HirId { owner: common_hir_owner, local_id };
+            let hir_id = HirId { owner: common_hir_owner, local_id };
             let fn_sig = self.resolve(fn_sig, &hir_id);
             self.typeck_results.liberated_fn_sigs_mut().insert(hir_id, fn_sig);
         }
@@ -696,7 +703,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         let fcx_fru_field_types = fcx_typeck_results.fru_field_types().items_in_stable_order();
 
         for (local_id, ftys) in fcx_fru_field_types {
-            let hir_id = hir::HirId { owner: common_hir_owner, local_id };
+            let hir_id = HirId { owner: common_hir_owner, local_id };
             let ftys = self.resolve(ftys.clone(), &hir_id);
             self.typeck_results.fru_field_types_mut().insert(hir_id, ftys);
         }
@@ -710,7 +717,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         for (local_id, &(container, ref indices)) in
             fcx_typeck_results.offset_of_data().items_in_stable_order()
         {
-            let hir_id = hir::HirId { owner: common_hir_owner, local_id };
+            let hir_id = HirId { owner: common_hir_owner, local_id };
             let container = self.resolve(container, &hir_id);
             self.typeck_results.offset_of_data_mut().insert(hir_id, (container, indices.clone()));
         }
@@ -745,7 +752,7 @@ impl Locatable for Span {
     }
 }
 
-impl Locatable for hir::HirId {
+impl Locatable for HirId {
     fn to_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.hir().span(*self)
     }
@@ -770,7 +777,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
     }
 
     fn report_error(&self, p: impl Into<ty::GenericArg<'tcx>>) -> ErrorGuaranteed {
-        if let Some(guar) = self.fcx.dcx().has_errors() {
+        if let Some(guar) = self.fcx.tainted_by_errors() {
             guar
         } else {
             self.fcx
@@ -779,7 +786,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
                     self.fcx.tcx.hir().body_owner_def_id(self.body.id()),
                     self.span.to_span(self.fcx.tcx),
                     p.into(),
-                    E0282,
+                    TypeAnnotationNeeded::E0282,
                     false,
                 )
                 .emit()
@@ -799,7 +806,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         // We must deeply normalize in the new solver, since later lints
         // expect that types that show up in the typeck are fully
         // normalized.
-        let value = if self.should_normalize {
+        let mut value = if self.should_normalize {
             let body_id = tcx.hir().body_owner_def_id(self.body.id());
             let cause = ObligationCause::misc(self.span.to_span(tcx), body_id);
             let at = self.fcx.at(&cause, self.fcx.param_env);
@@ -814,17 +821,34 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
             value
         };
 
+        // Bail if there are any non-region infer.
         if value.has_non_region_infer() {
             let guar = self.report_error(value);
-            new_err(tcx, guar)
-        } else {
-            tcx.fold_regions(value, |_, _| tcx.lifetimes.re_erased)
+            value = new_err(tcx, guar);
         }
+
+        // Erase the regions from the ty, since it's not really meaningful what
+        // these region values are; there's not a trivial correspondence between
+        // regions in the HIR and MIR, so when we turn the body into MIR, there's
+        // no reason to keep regions around. They will be repopulated during MIR
+        // borrowck, and specifically region constraints will be populated during
+        // MIR typeck which is run on the new body.
+        //
+        // We're not using `tcx.erase_regions` as that also anonymizes bound variables,
+        // regressing borrowck diagnostics.
+        value = fold_regions(tcx, value, |_, _| tcx.lifetimes.re_erased);
+
+        // Normalize consts in writeback, because GCE doesn't normalize eagerly.
+        if tcx.features().generic_const_exprs() {
+            value = value.fold_with(&mut EagerlyNormalizeConsts::new(self.fcx));
+        }
+
+        value
     }
 }
 
 impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.fcx.tcx
     }
 
@@ -839,8 +863,9 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
         self.handle_term(ct, ty::Const::outer_exclusive_binder, |tcx, guar| {
-            ty::Const::new_error(tcx, guar, ct.ty())
+            ty::Const::new_error(tcx, guar)
         })
+        .super_fold_with(self)
     }
 
     fn fold_predicate(&mut self, predicate: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
@@ -851,5 +876,27 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
         let predicate = predicate.super_fold_with(self);
         self.should_normalize = prev;
         predicate
+    }
+}
+
+struct EagerlyNormalizeConsts<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+}
+impl<'tcx> EagerlyNormalizeConsts<'tcx> {
+    fn new(fcx: &FnCtxt<'_, 'tcx>) -> Self {
+        // FIXME(#132279, generic_const_exprs): Using `try_normalize_erasing_regions` here
+        // means we can't handle opaque types in their defining scope.
+        EagerlyNormalizeConsts { tcx: fcx.tcx, typing_env: fcx.typing_env(fcx.param_env) }
+    }
+}
+
+impl<'tcx> TypeFolder<TyCtxt<'tcx>> for EagerlyNormalizeConsts<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        self.tcx.try_normalize_erasing_regions(self.typing_env, ct).unwrap_or(ct)
     }
 }

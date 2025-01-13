@@ -9,14 +9,12 @@
 //!
 //! * Compiler internal types like `Ty` and `TyCtxt`
 
-use rustc_ast as ast;
 use rustc_hir::diagnostic_items::DiagnosticItems;
-use rustc_hir::OwnerId;
-use rustc_middle::query::LocalCrate;
-use rustc_middle::query::Providers;
+use rustc_hir::{Attribute, OwnerId};
+use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
-use rustc_span::symbol::{sym, Symbol};
+use rustc_span::{Symbol, sym};
 
 use crate::errors::DuplicateDiagnosticItemInCrate;
 
@@ -50,13 +48,13 @@ fn report_duplicate_item(
         orig_span,
         crate_name: tcx.crate_name(item_def_id.krate),
         orig_crate_name: tcx.crate_name(original_def_id.krate),
-        different_crates: (item_def_id.krate != original_def_id.krate).then_some(()),
+        different_crates: (item_def_id.krate != original_def_id.krate),
         name,
     });
 }
 
 /// Extract the first `rustc_diagnostic_item = "$name"` out of a list of attributes.
-fn extract(attrs: &[ast::Attribute]) -> Option<Symbol> {
+fn extract(attrs: &[Attribute]) -> Option<Symbol> {
     attrs.iter().find_map(|attr| {
         if attr.has_name(sym::rustc_diagnostic_item) { attr.value_str() } else { None }
     })
@@ -91,7 +89,7 @@ fn all_diagnostic_items(tcx: TyCtxt<'_>, (): ()) -> DiagnosticItems {
     items
 }
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     providers.diagnostic_items = diagnostic_items;
     providers.all_diagnostic_items = all_diagnostic_items;
 }

@@ -1,18 +1,18 @@
-use clippy_config::msrvs::{self, Msrv};
-use clippy_utils::consts::{constant, Constant};
+use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::usage::local_used_after_expr;
-use clippy_utils::visitors::{for_each_expr_with_closures, Descend};
+use clippy_utils::visitors::{Descend, for_each_expr};
 use clippy_utils::{is_diag_item_method, match_def_path, path_to_local_id, paths};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir::{
-    BindingAnnotation, Expr, ExprKind, HirId, LangItem, Local, MatchSource, Node, Pat, PatKind, QPath, Stmt, StmtKind,
+    BindingMode, Expr, ExprKind, HirId, LangItem, LetStmt, MatchSource, Node, Pat, PatKind, QPath, Stmt, StmtKind,
 };
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::{sym, Span, Symbol, SyntaxContext};
+use rustc_span::{Span, Symbol, SyntaxContext, sym};
 
 use super::{MANUAL_SPLIT_ONCE, NEEDLESS_SPLITN};
 
@@ -53,7 +53,7 @@ fn lint_needless(cx: &LateContext<'_>, method_name: &str, expr: &Expr<'_>, self_
         cx,
         NEEDLESS_SPLITN,
         expr.span,
-        &format!("unnecessary use of `{r}splitn`"),
+        format!("unnecessary use of `{r}splitn`"),
         "try",
         format!(
             "{}.{r}split({})",
@@ -128,8 +128,8 @@ fn check_manual_split_once_indirect(
 ) -> Option<()> {
     let ctxt = expr.span.ctxt();
     let mut parents = cx.tcx.hir().parent_iter(expr.hir_id);
-    if let (_, Node::Local(local)) = parents.next()?
-        && let PatKind::Binding(BindingAnnotation::MUT, iter_binding_id, iter_ident, None) = local.pat.kind
+    if let (_, Node::LetStmt(local)) = parents.next()?
+        && let PatKind::Binding(BindingMode::MUT, iter_binding_id, _, None) = local.pat.kind
         && let (iter_stmt_id, Node::Stmt(_)) = parents.next()?
         && let (_, Node::Block(enclosing_block)) = parents.next()?
         && let mut stmts = enclosing_block
@@ -154,7 +154,7 @@ fn check_manual_split_once_indirect(
         let self_snip = snippet_with_context(cx, self_arg.span, ctxt, "..", &mut app).0;
         let pat_snip = snippet_with_context(cx, pat_arg.span, ctxt, "..", &mut app).0;
 
-        span_lint_and_then(cx, MANUAL_SPLIT_ONCE, local.span, &msg, |diag| {
+        span_lint_and_then(cx, MANUAL_SPLIT_ONCE, local.span, msg, |diag| {
             diag.span_label(first.span, "first usage here");
             diag.span_label(second.span, "second usage here");
 
@@ -162,16 +162,20 @@ fn check_manual_split_once_indirect(
                 UnwrapKind::Unwrap => ".unwrap()",
                 UnwrapKind::QuestionMark => "?",
             };
-            diag.span_suggestion_verbose(
-                local.span,
-                format!("try `{r}split_once`"),
-                format!("let ({lhs}, {rhs}) = {self_snip}.{r}split_once({pat_snip}){unwrap};"),
+
+            // Add a multipart suggestion
+            diag.multipart_suggestion(
+                format!("replace with `{r}split_once`"),
+                vec![
+                    (
+                        local.span,
+                        format!("let ({lhs}, {rhs}) = {self_snip}.{r}split_once({pat_snip}){unwrap};"),
+                    ),
+                    (first.span, String::new()),  // Remove the first usage
+                    (second.span, String::new()), // Remove the second usage
+                ],
                 app,
             );
-
-            let remove_msg = format!("remove the `{iter_ident}` usages");
-            diag.span_suggestion(first.span, remove_msg.clone(), "", app);
-            diag.span_suggestion(second.span, remove_msg, "", app);
         });
     }
 
@@ -198,9 +202,9 @@ fn indirect_usage<'tcx>(
     binding: HirId,
     ctxt: SyntaxContext,
 ) -> Option<IndirectUsage<'tcx>> {
-    if let StmtKind::Local(&Local {
+    if let StmtKind::Let(&LetStmt {
         pat: Pat {
-            kind: PatKind::Binding(BindingAnnotation::NONE, _, ident, None),
+            kind: PatKind::Binding(BindingMode::NONE, _, ident, None),
             ..
         },
         init: Some(init_expr),
@@ -209,7 +213,7 @@ fn indirect_usage<'tcx>(
     }) = stmt.kind
     {
         let mut path_to_binding = None;
-        let _: Option<!> = for_each_expr_with_closures(cx, init_expr, |e| {
+        let _: Option<!> = for_each_expr(cx, init_expr, |e| {
             if path_to_local_id(e, binding) {
                 path_to_binding = Some(e);
             }
@@ -293,15 +297,15 @@ fn parse_iter_usage<'tcx>(
                     {
                         Some(IterUsage {
                             kind: IterUsageKind::NextTuple,
-                            span: e.span,
                             unwrap_kind: None,
+                            span: e.span,
                         })
                     } else {
                         None
                     };
                 },
                 ("nth" | "skip", [idx_expr]) if cx.tcx.trait_of_item(did) == Some(iter_id) => {
-                    if let Some(Constant::Int(idx)) = constant(cx, cx.typeck_results(), idx_expr) {
+                    if let Some(Constant::Int(idx)) = ConstEvalCtxt::new(cx).eval(idx_expr) {
                         let span = if name.ident.as_str() == "nth" {
                             e.span
                         } else if let Some((_, Node::Expr(next_expr))) = iter.next()
@@ -333,7 +337,7 @@ fn parse_iter_usage<'tcx>(
                     kind: ExprKind::Path(QPath::LangItem(LangItem::TryTraitBranch, ..)),
                     ..
                 },
-                _,
+                [_],
             ) => {
                 let parent_span = e.span.parent_callsite().unwrap();
                 if parent_span.ctxt() == ctxt {
@@ -348,7 +352,7 @@ fn parse_iter_usage<'tcx>(
                     && cx
                         .typeck_results()
                         .type_dependent_def_id(e.hir_id)
-                        .map_or(false, |id| is_diag_item_method(cx, id, sym::Option)) =>
+                        .is_some_and(|id| is_diag_item_method(cx, id, sym::Option)) =>
             {
                 (Some(UnwrapKind::Unwrap), e.span)
             },

@@ -1,5 +1,5 @@
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-//@ unit-test: DataflowConstProp
+//@ test-mir-pass: DataflowConstProp
 
 #[inline(never)]
 fn escape<T>(x: &T) {}
@@ -24,7 +24,7 @@ fn main() {
     // This should currently not be propagated.
 
     // CHECK-NOT: [[b]] = const
-    // CHECK: [[b]] = [[a]];
+    // CHECK: [[b]] = copy [[a]];
     // CHECK-NOT: [[b]] = const
     let b = a;
 }

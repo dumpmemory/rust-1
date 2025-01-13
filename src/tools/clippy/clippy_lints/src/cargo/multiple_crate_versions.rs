@@ -1,5 +1,3 @@
-//! lint on multiple versions of a crate being used
-
 use cargo_metadata::{DependencyKind, Metadata, Node, Package, PackageId};
 use clippy_utils::diagnostics::span_lint;
 use itertools::Itertools;
@@ -52,7 +50,7 @@ pub(super) fn check(cx: &LateContext<'_>, metadata: &Metadata, allowed_duplicate
                     cx,
                     MULTIPLE_CRATE_VERSIONS,
                     DUMMY_SP,
-                    &format!("multiple versions for dependency `{name}`: {versions}"),
+                    format!("multiple versions for dependency `{name}`: {versions}"),
                 );
             }
         }

@@ -6,11 +6,11 @@ use hir::{
 };
 use ide_db::{
     base_db::{
-        salsa::{
+        ra_salsa::{
             debug::{DebugQueryTable, TableEntry},
             Query, QueryTable,
         },
-        CrateData, FileId, FileTextQuery, ParseQuery, SourceDatabase, SourceRootId,
+        CompressedFileTextQuery, CrateData, ParseQuery, SourceDatabase, SourceRootId,
     },
     symbol_index::ModuleSymbolsQuery,
 };
@@ -20,7 +20,7 @@ use ide_db::{
 };
 use itertools::Itertools;
 use profile::{memory_usage, Bytes};
-use std::env;
+use span::{EditionedFileId, FileId};
 use stdx::format_to;
 use syntax::{ast, Parse, SyntaxNode};
 use triomphe::Arc;
@@ -38,15 +38,12 @@ use triomphe::Arc;
 pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
     let mut buf = String::new();
 
-    format_to!(buf, "{}\n", collect_query(FileTextQuery.in_db(db)));
+    format_to!(buf, "{}\n", collect_query(CompressedFileTextQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(ParseQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(ParseMacroExpansionQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(LibrarySymbolsQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(ModuleSymbolsQuery.in_db(db)));
     format_to!(buf, "{} in total\n", memory_usage());
-    if env::var("RA_COUNT").is_ok() {
-        format_to!(buf, "\nCounts:\n{}", profile::countme::get_all());
-    }
 
     format_to!(buf, "\nDebug info:\n");
     format_to!(buf, "{}\n", collect_query(AttrsQuery.in_db(db)));
@@ -160,7 +157,7 @@ impl QueryCollect for ParseMacroExpansionQuery {
     type Collector = SyntaxTreeStats<true>;
 }
 
-impl QueryCollect for FileTextQuery {
+impl QueryCollect for CompressedFileTextQuery {
     type Collector = FilesStats;
 }
 
@@ -188,8 +185,8 @@ impl fmt::Display for FilesStats {
     }
 }
 
-impl StatCollect<FileId, Arc<str>> for FilesStats {
-    fn collect_entry(&mut self, _: FileId, value: Option<Arc<str>>) {
+impl StatCollect<FileId, Arc<[u8]>> for FilesStats {
+    fn collect_entry(&mut self, _: FileId, value: Option<Arc<[u8]>>) {
         self.total += 1;
         self.size += value.unwrap().len();
     }
@@ -213,8 +210,8 @@ impl<const MACROS: bool> fmt::Display for SyntaxTreeStats<MACROS> {
     }
 }
 
-impl StatCollect<FileId, Parse<ast::SourceFile>> for SyntaxTreeStats<false> {
-    fn collect_entry(&mut self, _: FileId, value: Option<Parse<ast::SourceFile>>) {
+impl StatCollect<EditionedFileId, Parse<ast::SourceFile>> for SyntaxTreeStats<false> {
+    fn collect_entry(&mut self, _: EditionedFileId, value: Option<Parse<ast::SourceFile>>) {
         self.total += 1;
         self.retained += value.is_some() as usize;
     }

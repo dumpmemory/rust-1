@@ -31,7 +31,7 @@
 //! // instead of a max-heap.
 //! impl Ord for State {
 //!     fn cmp(&self, other: &Self) -> Ordering {
-//!         // Notice that the we flip the ordering on costs.
+//!         // Notice that we flip the ordering on costs.
 //!         // In case of a tie we compare positions - this step is necessary
 //!         // to make implementations of `PartialEq` and `Ord` consistent.
 //!         other.cost.cmp(&self.cost)
@@ -144,20 +144,16 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::alloc::Allocator;
-use core::fmt;
 use core::iter::{FusedIterator, InPlaceIterable, SourceIter, TrustedFused, TrustedLen};
-use core::mem::{self, swap, ManuallyDrop};
+use core::mem::{self, ManuallyDrop, swap};
 use core::num::NonZero;
 use core::ops::{Deref, DerefMut};
-use core::ptr;
+use core::{fmt, ptr};
 
 use crate::alloc::Global;
 use crate::collections::TryReserveError;
 use crate::slice;
 use crate::vec::{self, AsVecIntoIter, Vec};
-
-#[cfg(test)]
-mod tests;
 
 /// A priority queue implemented with a binary heap.
 ///
@@ -375,7 +371,10 @@ impl<'a, T: Ord, A: Allocator> PeekMut<'a, T, A> {
             // the caller could've mutated the element. It is removed from the
             // heap on the next line and pop() is not sensitive to its value.
         }
-        this.heap.pop().unwrap()
+
+        // SAFETY: Have a `PeekMut` element proves that the associated binary heap being non-empty,
+        // so the `pop` operation will not fail.
+        unsafe { this.heap.pop().unwrap_unchecked() }
     }
 }
 
@@ -385,6 +384,12 @@ impl<T: Clone, A: Allocator + Clone> Clone for BinaryHeap<T, A> {
         BinaryHeap { data: self.data.clone() }
     }
 
+    /// Overwrites the contents of `self` with a clone of the contents of `source`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation if possible.
+    ///
+    /// See [`Vec::clone_from()`] for more details.
     fn clone_from(&mut self, source: &Self) {
         self.data.clone_from(&source.data);
     }
@@ -434,7 +439,7 @@ impl<T: Ord> BinaryHeap<T> {
     /// heap.push(4);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_binary_heap_constructor", issue = "112353")]
+    #[rustc_const_stable(feature = "const_binary_heap_constructor", since = "1.80.0")]
     #[must_use]
     pub const fn new() -> BinaryHeap<T> {
         BinaryHeap { data: vec![] }
@@ -444,7 +449,7 @@ impl<T: Ord> BinaryHeap<T> {
     ///
     /// The binary heap will be able to hold at least `capacity` elements without
     /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the binary heap will not allocate.
+    /// `capacity`. If `capacity` is zero, the binary heap will not allocate.
     ///
     /// # Examples
     ///
@@ -478,7 +483,6 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// heap.push(4);
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
-    #[rustc_const_unstable(feature = "const_binary_heap_constructor", issue = "112353")]
     #[must_use]
     pub const fn new_in(alloc: A) -> BinaryHeap<T, A> {
         BinaryHeap { data: Vec::new_in(alloc) }
@@ -488,7 +492,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     ///
     /// The binary heap will be able to hold at least `capacity` elements without
     /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the binary heap will not allocate.
+    /// `capacity`. If `capacity` is zero, the binary heap will not allocate.
     ///
     /// # Examples
     ///
@@ -527,8 +531,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// heap.push(1);
     /// heap.push(5);
     /// heap.push(2);
-    /// {
-    ///     let mut val = heap.peek_mut().unwrap();
+    /// if let Some(mut val) = heap.peek_mut() {
     ///     *val = 0;
     /// }
     /// assert_eq!(heap.peek(), Some(&2));
@@ -954,11 +957,13 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "binaryheap_iter")]
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { iter: self.data.iter() }
     }
 
     /// Returns an iterator which retrieves elements in heap order.
+    ///
     /// This method consumes the original heap.
     ///
     /// # Examples
@@ -1207,7 +1212,6 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(binary_heap_as_slice)]
     /// use std::collections::BinaryHeap;
     /// use std::io::{self, Write};
     ///
@@ -1216,7 +1220,7 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// io::sink().write(heap.as_slice()).unwrap();
     /// ```
     #[must_use]
-    #[unstable(feature = "binary_heap_as_slice", issue = "83659")]
+    #[stable(feature = "binary_heap_as_slice", since = "1.80.0")]
     pub fn as_slice(&self) -> &[T] {
         self.data.as_slice()
     }
@@ -1356,7 +1360,7 @@ struct Hole<'a, T: 'a> {
 }
 
 impl<'a, T> Hole<'a, T> {
-    /// Create a new `Hole` at index `pos`.
+    /// Creates a new `Hole` at index `pos`.
     ///
     /// Unsafe because pos must be within the data slice.
     #[inline]
@@ -1426,6 +1430,20 @@ impl<T> Drop for Hole<'_, T> {
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Iter<'a, T: 'a> {
     iter: slice::Iter<'a, T>,
+}
+
+#[stable(feature = "default_iters_sequel", since = "1.82.0")]
+impl<T> Default for Iter<'_, T> {
+    /// Creates an empty `binary_heap::Iter`.
+    ///
+    /// ```
+    /// # use std::collections::binary_heap;
+    /// let iter: binary_heap::Iter<'_, u8> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Iter { iter: Default::default() }
+    }
 }
 
 #[stable(feature = "collection_debug", since = "1.17.0")]

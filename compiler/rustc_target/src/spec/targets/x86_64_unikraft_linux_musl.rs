@@ -1,9 +1,14 @@
-use crate::spec::{base, Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOptions};
+use crate::spec::{Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOptions, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "x86_64-unknown-linux-musl".into(),
-        description: None,
+        metadata: crate::spec::TargetMetadata {
+            description: Some("64-bit Unikraft with musl 1.2.3".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
+        },
         pointer_width: 64,
         arch: "x86_64".into(),
         data_layout:

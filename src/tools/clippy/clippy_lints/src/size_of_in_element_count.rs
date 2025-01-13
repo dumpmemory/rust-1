@@ -1,10 +1,7 @@
-//! Lint on use of `size_of` or `size_of_val` of T in an expression
-//! expecting a count of T
-
 use clippy_utils::diagnostics::span_lint_and_help;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::{self, Ty, TypeAndMut};
+use rustc_middle::ty::{self, Ty};
 use rustc_session::declare_lint_pass;
 use rustc_span::sym;
 
@@ -37,7 +34,7 @@ declare_lint_pass!(SizeOfInElementCount => [SIZE_OF_IN_ELEMENT_COUNT]);
 
 fn get_size_of_ty<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, inverted: bool) -> Option<Ty<'tcx>> {
     match expr.kind {
-        ExprKind::Call(count_func, _func_args) => {
+        ExprKind::Call(count_func, _) => {
             if !inverted
                 && let ExprKind::Path(ref count_func_qpath) = count_func.kind
                 && let Some(def_id) = cx.qpath_res(count_func_qpath, count_func.hir_id).opt_def_id()
@@ -107,7 +104,7 @@ fn get_pointee_ty_and_count_expr<'tcx>(
         && METHODS.iter().any(|m| *m == method_ident)
 
         // Get the pointee type
-        && let ty::RawPtr(TypeAndMut { ty: pointee_ty, .. }) =
+        && let ty::RawPtr(pointee_ty, _) =
             cx.typeck_results().expr_ty(ptr_self).kind()
     {
         return Some((*pointee_ty, count));

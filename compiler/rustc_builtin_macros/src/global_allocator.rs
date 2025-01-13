@@ -1,18 +1,19 @@
-use crate::util::check_builtin_macro_attribute;
-
-use crate::errors;
 use rustc_ast::expand::allocator::{
-    global_fn_name, AllocatorMethod, AllocatorMethodInput, AllocatorTy, ALLOCATOR_METHODS,
+    ALLOCATOR_METHODS, AllocatorMethod, AllocatorMethodInput, AllocatorTy, global_fn_name,
 };
 use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, AttrVec, Expr, FnHeader, FnSig, Generics, Param, StmtKind};
-use rustc_ast::{Fn, ItemKind, Mutability, Stmt, Ty, TyKind, Unsafe};
+use rustc_ast::{
+    self as ast, AttrVec, Expr, Fn, FnHeader, FnSig, Generics, ItemKind, Mutability, Param, Safety,
+    Stmt, StmtKind, Ty, TyKind,
+};
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
+use rustc_span::{Ident, Span, Symbol, kw, sym};
+use thin_vec::{ThinVec, thin_vec};
 
-pub fn expand(
+use crate::errors;
+use crate::util::check_builtin_macro_attribute;
+
+pub(crate) fn expand(
     ecx: &mut ExtCtxt<'_>,
     _span: Span,
     meta_item: &ast::MetaItem,
@@ -63,7 +64,7 @@ struct AllocFnFactory<'a, 'b> {
     span: Span,
     ty_span: Span,
     global: Ident,
-    cx: &'b ExtCtxt<'a>,
+    cx: &'a ExtCtxt<'b>,
 }
 
 impl AllocFnFactory<'_, '_> {
@@ -73,7 +74,7 @@ impl AllocFnFactory<'_, '_> {
         let result = self.call_allocator(method.name, args);
         let output_ty = self.ret_ty(&method.output);
         let decl = self.cx.fn_decl(abi_args, ast::FnRetTy::Ty(output_ty));
-        let header = FnHeader { unsafety: Unsafe::Yes(self.span), ..FnHeader::default() };
+        let header = FnHeader { safety: Safety::Unsafe(self.span), ..FnHeader::default() };
         let sig = FnSig { decl, header, span: self.span };
         let body = Some(self.cx.block_expr(result));
         let kind = ItemKind::Fn(Box::new(Fn {

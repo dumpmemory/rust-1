@@ -1,10 +1,12 @@
+// tidy-alphabetical-start
+#![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", feature(never_type))]
 #![cfg_attr(feature = "nightly", feature(rustc_attrs))]
-#![cfg_attr(feature = "nightly", allow(internal_features))]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 #[cfg(feature = "nightly")]
-#[macro_use]
-extern crate rustc_macros;
+use rustc_macros::{Decodable, Encodable, HashStable_NoContext};
 
 pub mod visit;
 
@@ -51,6 +53,14 @@ impl Mutability {
         }
     }
 
+    /// Returns `"const"` or `"mut"` depending on the mutability.
+    pub fn ptr_str(self) -> &'static str {
+        match self {
+            Mutability::Not => "const",
+            Mutability::Mut => "mut",
+        }
+    }
+
     /// Returns `""` (empty string) or `"mutably "` depending on the mutability.
     pub fn mutably_str(self) -> &'static str {
         match self {
@@ -68,4 +78,11 @@ impl Mutability {
     pub fn is_not(self) -> bool {
         matches!(self, Self::Not)
     }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Copy)]
+#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
+pub enum Pinnedness {
+    Not,
+    Pinned,
 }

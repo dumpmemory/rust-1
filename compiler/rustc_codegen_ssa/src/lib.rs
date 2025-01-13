@@ -1,34 +1,36 @@
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(rustdoc_internals)]
+// tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![feature(associated_type_bounds)]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
+#![feature(assert_matches)]
 #![feature(box_patterns)]
+#![feature(debug_closure_helpers)]
+#![feature(file_buffered)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(negative_impls)]
-#![feature(strict_provenance)]
+#![feature(rustdoc_internals)]
+#![feature(trait_alias)]
 #![feature(try_blocks)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
 //! The backend-agnostic functions of this crate use functions defined in various traits that
 //! have to be implemented by each backend.
 
-#[macro_use]
-extern crate rustc_macros;
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
+use std::collections::BTreeSet;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::def_id::CrateNum;
+use rustc_macros::{Decodable, Encodable, HashStable};
 use rustc_middle::dep_graph::WorkProduct;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::Dependencies;
@@ -36,14 +38,11 @@ use rustc_middle::middle::exported_symbols::SymbolExportKind;
 use rustc_middle::util::Providers;
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+use rustc_session::Session;
 use rustc_session::config::{CrateType, OutputFilenames, OutputType, RUST_CGU_EXT};
 use rustc_session::cstore::{self, CrateSource};
 use rustc_session::utils::NativeLibKind;
-use rustc_session::Session;
-use rustc_span::symbol::Symbol;
-use std::collections::BTreeSet;
-use std::io;
-use std::path::{Path, PathBuf};
+use rustc_span::Symbol;
 
 pub mod assert_module_sources;
 pub mod back;
@@ -79,13 +78,26 @@ impl<M> ModuleCodegen<M> {
         emit_obj: bool,
         emit_dwarf_obj: bool,
         emit_bc: bool,
+        emit_asm: bool,
+        emit_ir: bool,
         outputs: &OutputFilenames,
     ) -> CompiledModule {
         let object = emit_obj.then(|| outputs.temp_path(OutputType::Object, Some(&self.name)));
         let dwarf_object = emit_dwarf_obj.then(|| outputs.temp_path_dwo(Some(&self.name)));
         let bytecode = emit_bc.then(|| outputs.temp_path(OutputType::Bitcode, Some(&self.name)));
+        let assembly = emit_asm.then(|| outputs.temp_path(OutputType::Assembly, Some(&self.name)));
+        let llvm_ir =
+            emit_ir.then(|| outputs.temp_path(OutputType::LlvmAssembly, Some(&self.name)));
 
-        CompiledModule { name: self.name.clone(), kind: self.kind, object, dwarf_object, bytecode }
+        CompiledModule {
+            name: self.name.clone(),
+            kind: self.kind,
+            object,
+            dwarf_object,
+            bytecode,
+            assembly,
+            llvm_ir,
+        }
     }
 }
 
@@ -96,9 +108,29 @@ pub struct CompiledModule {
     pub object: Option<PathBuf>,
     pub dwarf_object: Option<PathBuf>,
     pub bytecode: Option<PathBuf>,
+    pub assembly: Option<PathBuf>, // --emit=asm
+    pub llvm_ir: Option<PathBuf>,  // --emit=llvm-ir, llvm-bc is in bytecode
 }
 
-pub struct CachedModuleCodegen {
+impl CompiledModule {
+    /// Call `emit` function with every artifact type currently compiled
+    pub fn for_each_output(&self, mut emit: impl FnMut(&Path, OutputType)) {
+        if let Some(path) = self.object.as_deref() {
+            emit(path, OutputType::Object);
+        }
+        if let Some(path) = self.bytecode.as_deref() {
+            emit(path, OutputType::Bitcode);
+        }
+        if let Some(path) = self.llvm_ir.as_deref() {
+            emit(path, OutputType::LlvmAssembly);
+        }
+        if let Some(path) = self.assembly.as_deref() {
+            emit(path, OutputType::Assembly);
+        }
+    }
+}
+
+pub(crate) struct CachedModuleCodegen {
     pub name: String,
     pub source: WorkProduct,
 }
@@ -124,7 +156,7 @@ pub struct NativeLib {
     pub kind: NativeLibKind,
     pub name: Symbol,
     pub filename: Option<Symbol>,
-    pub cfg: Option<ast::MetaItem>,
+    pub cfg: Option<ast::MetaItemInner>,
     pub verbatim: bool,
     pub dll_imports: Vec<cstore::DllImport>,
 }
@@ -184,6 +216,7 @@ pub enum CodegenErrors {
     EmptyVersionNumber,
     EncodingVersionMismatch { version_array: String, rlink_version: u32 },
     RustcVersionMismatch { rustc_version: String },
+    CorruptFile,
 }
 
 pub fn provide(providers: &mut Providers) {
@@ -254,7 +287,9 @@ impl CodegenResults {
             });
         }
 
-        let mut decoder = MemDecoder::new(&data[4..], 0);
+        let Ok(mut decoder) = MemDecoder::new(&data[4..], 0) else {
+            return Err(CodegenErrors::CorruptFile);
+        };
         let rustc_version = decoder.read_str();
         if rustc_version != sess.cfg_version {
             return Err(CodegenErrors::RustcVersionMismatch {

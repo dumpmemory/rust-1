@@ -1,52 +1,53 @@
-use super::{flags::Flags, Config};
-use crate::core::config::{LldMode, TomlConfig};
+use std::collections::BTreeSet;
+use std::env;
+use std::fs::{File, remove_file};
+use std::io::Write;
+use std::path::Path;
 
 use clap::CommandFactory;
 use serde::Deserialize;
-use std::{
-    env,
-    fs::{remove_file, File},
-    io::Write,
-    path::Path,
-};
 
-fn parse(config: &str) -> Config {
-    let config = format!("{config} \r\n build.rustc = \"/does-not-exists\" ");
+use super::flags::Flags;
+use super::{ChangeIdWrapper, Config, RUSTC_IF_UNCHANGED_ALLOWED_PATHS};
+use crate::core::build_steps::clippy::{LintConfig, get_clippy_rules_in_order};
+use crate::core::build_steps::llvm;
+use crate::core::config::{LldMode, Target, TargetSelection, TomlConfig};
+
+pub(crate) fn parse(config: &str) -> Config {
     Config::parse_inner(
-        &[
-            "check".to_owned(),
-            "--config=/does/not/exist".to_owned(),
-            "--skip-stage0-validation".to_owned(),
-        ],
-        |&_| toml::from_str(&config).unwrap(),
+        Flags::parse(&["check".to_string(), "--config=/does/not/exist".to_string()]),
+        |&_| toml::from_str(&config),
     )
 }
 
 #[test]
 fn download_ci_llvm() {
-    if crate::core::build_steps::llvm::is_ci_llvm_modified(&parse("")) {
-        eprintln!("Detected LLVM as non-available: running in CI and modified LLVM in this change");
-        return;
+    let config = parse("");
+    let is_available = llvm::is_ci_llvm_available(&config, config.llvm_assertions);
+    if is_available {
+        assert!(config.llvm_from_ci);
     }
 
-    let parse_llvm = |s| parse(s).llvm_from_ci;
-    let if_unchanged = parse_llvm("llvm.download-ci-llvm = \"if-unchanged\"");
+    let config = parse("llvm.download-ci-llvm = true");
+    let is_available = llvm::is_ci_llvm_available(&config, config.llvm_assertions);
+    if is_available {
+        assert!(config.llvm_from_ci);
+    }
 
-    assert!(parse_llvm("llvm.download-ci-llvm = true"));
-    assert!(!parse_llvm("llvm.download-ci-llvm = false"));
-    assert_eq!(parse_llvm(""), if_unchanged);
-    assert_eq!(parse_llvm("rust.channel = \"dev\""), if_unchanged);
-    assert!(!parse_llvm("rust.channel = \"stable\""));
-    assert_eq!(parse_llvm("build.build = \"x86_64-unknown-linux-gnu\""), if_unchanged);
-    assert_eq!(
-        parse_llvm(
-            "llvm.assertions = true \r\n build.build = \"x86_64-unknown-linux-gnu\" \r\n llvm.download-ci-llvm = \"if-unchanged\""
-        ),
-        if_unchanged
-    );
-    assert!(!parse_llvm(
-        "llvm.assertions = true \r\n build.build = \"aarch64-apple-darwin\" \r\n llvm.download-ci-llvm = \"if-unchanged\""
-    ));
+    let config = parse("llvm.download-ci-llvm = false");
+    assert!(!config.llvm_from_ci);
+
+    let if_unchanged_config = parse("llvm.download-ci-llvm = \"if-unchanged\"");
+    if if_unchanged_config.llvm_from_ci {
+        let has_changes = if_unchanged_config
+            .last_modified_commit(&["src/llvm-project"], "download-ci-llvm", true)
+            .is_none();
+
+        assert!(
+            !has_changes,
+            "CI LLVM can't be enabled with 'if-unchanged' while there are changes in LLVM submodule."
+        );
+    }
 }
 
 // FIXME(onur-ozkan): extend scope of the test
@@ -100,8 +101,8 @@ fn detect_src_and_out() {
     test(parse(""), None);
 
     {
-        let build_dir = if cfg!(windows) { Some("C:\\tmp") } else { Some("/tmp") };
-        test(parse("build.build-dir = \"/tmp\""), build_dir);
+        let build_dir = if cfg!(windows) { "C:\\tmp" } else { "/tmp" };
+        test(parse(&format!("build.build-dir = '{build_dir}'")), Some(build_dir));
     }
 }
 
@@ -113,16 +114,22 @@ fn clap_verify() {
 #[test]
 fn override_toml() {
     let config = Config::parse_inner(
-        &[
+        Flags::parse(&[
             "check".to_owned(),
             "--config=/does/not/exist".to_owned(),
             "--set=change-id=1".to_owned(),
             "--set=rust.lto=fat".to_owned(),
             "--set=rust.deny-warnings=false".to_owned(),
+            "--set=build.optimized-compiler-builtins=true".to_owned(),
             "--set=build.gdb=\"bar\"".to_owned(),
             "--set=build.tools=[\"cargo\"]".to_owned(),
             "--set=llvm.build-config={\"foo\" = \"bar\"}".to_owned(),
-        ],
+            "--set=target.x86_64-unknown-linux-gnu.runner=bar".to_owned(),
+            "--set=target.x86_64-unknown-linux-gnu.rpath=false".to_owned(),
+            "--set=target.aarch64-unknown-linux-gnu.sanitizers=false".to_owned(),
+            "--set=target.aarch64-apple-darwin.runner=apple".to_owned(),
+            "--set=target.aarch64-apple-darwin.optimized-compiler-builtins=false".to_owned(),
+        ]),
         |&_| {
             toml::from_str(
                 r#"
@@ -130,6 +137,7 @@ change-id = 0
 [rust]
 lto = "off"
 deny-warnings = true
+download-rustc=false
 
 [build]
 gdb = "foo"
@@ -138,9 +146,19 @@ tools = []
 [llvm]
 download-ci-llvm = false
 build-config = {}
+
+[target.aarch64-unknown-linux-gnu]
+sanitizers = true
+rpath = true
+runner = "aarch64-runner"
+
+[target.x86_64-unknown-linux-gnu]
+sanitizers = true
+rpath = true
+runner = "x86_64-runner"
+
                 "#,
             )
-            .unwrap()
         },
     );
     assert_eq!(config.change_id, Some(1), "setting top-level value");
@@ -151,6 +169,7 @@ build-config = {}
     );
     assert_eq!(config.gdb, Some("bar".into()), "setting string value with quotes");
     assert!(!config.deny_warnings, "setting boolean value");
+    assert!(config.optimized_compiler_builtins, "setting boolean value");
     assert_eq!(
         config.tools,
         Some(["cargo".to_string()].into_iter().collect()),
@@ -161,25 +180,55 @@ build-config = {}
         [("foo".to_string(), "bar".to_string())].into_iter().collect(),
         "setting dictionary value"
     );
+
+    let x86_64 = TargetSelection::from_user("x86_64-unknown-linux-gnu");
+    let x86_64_values = Target {
+        sanitizers: Some(true),
+        rpath: Some(false),
+        runner: Some("bar".into()),
+        ..Default::default()
+    };
+    let aarch64 = TargetSelection::from_user("aarch64-unknown-linux-gnu");
+    let aarch64_values = Target {
+        sanitizers: Some(false),
+        rpath: Some(true),
+        runner: Some("aarch64-runner".into()),
+        ..Default::default()
+    };
+    let darwin = TargetSelection::from_user("aarch64-apple-darwin");
+    let darwin_values = Target {
+        runner: Some("apple".into()),
+        optimized_compiler_builtins: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        config.target_config,
+        [(x86_64, x86_64_values), (aarch64, aarch64_values), (darwin, darwin_values)]
+            .into_iter()
+            .collect(),
+        "setting dictionary value"
+    );
+    assert!(!config.llvm_from_ci);
+    assert!(!config.download_rustc());
 }
 
 #[test]
 #[should_panic]
 fn override_toml_duplicate() {
     Config::parse_inner(
-        &[
+        Flags::parse(&[
             "check".to_owned(),
-            "--config=/does/not/exist".to_owned(),
+            "--config=/does/not/exist".to_string(),
             "--set=change-id=1".to_owned(),
             "--set=change-id=2".to_owned(),
-        ],
-        |&_| toml::from_str("change-id = 0").unwrap(),
+        ]),
+        |&_| toml::from_str("change-id = 0"),
     );
 }
 
 #[test]
 fn profile_user_dist() {
-    fn get_toml(file: &Path) -> TomlConfig {
+    fn get_toml(file: &Path) -> Result<TomlConfig, toml::de::Error> {
         let contents =
             if file.ends_with("config.toml") || env::var_os("RUST_BOOTSTRAP_CONFIG").is_some() {
                 "profile = \"user\"".to_owned()
@@ -188,11 +237,9 @@ fn profile_user_dist() {
                 std::fs::read_to_string(file).unwrap()
             };
 
-        toml::from_str(&contents)
-            .and_then(|table: toml::Value| TomlConfig::deserialize(table))
-            .unwrap()
+        toml::from_str(&contents).and_then(|table: toml::Value| TomlConfig::deserialize(table))
     }
-    Config::parse_inner(&["check".to_owned()], get_toml);
+    Config::parse_inner(Flags::parse(&["check".to_owned()]), get_toml);
 }
 
 #[test]
@@ -236,4 +283,174 @@ fn rust_lld() {
     assert!(matches!(parse("rust.use-lld = \"external\"").lld_mode, LldMode::External));
     assert!(matches!(parse("rust.use-lld = true").lld_mode, LldMode::External));
     assert!(matches!(parse("rust.use-lld = false").lld_mode, LldMode::Unused));
+}
+
+#[test]
+#[should_panic]
+fn parse_config_with_unknown_field() {
+    parse("unknown-key = 1");
+}
+
+#[test]
+fn parse_change_id_with_unknown_field() {
+    let config = r#"
+        change-id = 3461
+        unknown-key = 1
+    "#;
+
+    let change_id_wrapper: ChangeIdWrapper = toml::from_str(config).unwrap();
+    assert_eq!(change_id_wrapper.inner, Some(3461));
+}
+
+#[test]
+fn order_of_clippy_rules() {
+    let args = vec![
+        "clippy".to_string(),
+        "--fix".to_string(),
+        "--allow-dirty".to_string(),
+        "--allow-staged".to_string(),
+        "-Aclippy:all".to_string(),
+        "-Wclippy::style".to_string(),
+        "-Aclippy::foo1".to_string(),
+        "-Aclippy::foo2".to_string(),
+    ];
+    let config = Config::parse(Flags::parse(&args));
+
+    let actual = match config.cmd.clone() {
+        crate::Subcommand::Clippy { allow, deny, warn, forbid, .. } => {
+            let cfg = LintConfig { allow, deny, warn, forbid };
+            get_clippy_rules_in_order(&args, &cfg)
+        }
+        _ => panic!("invalid subcommand"),
+    };
+
+    let expected = vec![
+        "-Aclippy:all".to_string(),
+        "-Wclippy::style".to_string(),
+        "-Aclippy::foo1".to_string(),
+        "-Aclippy::foo2".to_string(),
+    ];
+
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn clippy_rule_separate_prefix() {
+    let args =
+        vec!["clippy".to_string(), "-A clippy:all".to_string(), "-W clippy::style".to_string()];
+    let config = Config::parse(Flags::parse(&args));
+
+    let actual = match config.cmd.clone() {
+        crate::Subcommand::Clippy { allow, deny, warn, forbid, .. } => {
+            let cfg = LintConfig { allow, deny, warn, forbid };
+            get_clippy_rules_in_order(&args, &cfg)
+        }
+        _ => panic!("invalid subcommand"),
+    };
+
+    let expected = vec!["-A clippy:all".to_string(), "-W clippy::style".to_string()];
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn verbose_tests_default_value() {
+    let config = Config::parse(Flags::parse(&["build".into(), "compiler".into()]));
+    assert_eq!(config.verbose_tests, false);
+
+    let config = Config::parse(Flags::parse(&["build".into(), "compiler".into(), "-v".into()]));
+    assert_eq!(config.verbose_tests, true);
+}
+
+#[test]
+fn parse_rust_std_features() {
+    let config = parse("rust.std-features = [\"panic-unwind\", \"backtrace\"]");
+    let expected_features: BTreeSet<String> =
+        ["panic-unwind", "backtrace"].into_iter().map(|s| s.to_string()).collect();
+    assert_eq!(config.rust_std_features, expected_features);
+}
+
+#[test]
+fn parse_rust_std_features_empty() {
+    let config = parse("rust.std-features = []");
+    let expected_features: BTreeSet<String> = BTreeSet::new();
+    assert_eq!(config.rust_std_features, expected_features);
+}
+
+#[test]
+#[should_panic]
+fn parse_rust_std_features_invalid() {
+    parse("rust.std-features = \"backtrace\"");
+}
+
+#[test]
+fn parse_jobs() {
+    assert_eq!(parse("build.jobs = 1").jobs, Some(1));
+}
+
+#[test]
+fn jobs_precedence() {
+    // `--jobs` should take precedence over using `--set build.jobs`.
+
+    let config = Config::parse_inner(
+        Flags::parse(&[
+            "check".to_owned(),
+            "--config=/does/not/exist".to_owned(),
+            "--jobs=67890".to_owned(),
+            "--set=build.jobs=12345".to_owned(),
+        ]),
+        |&_| toml::from_str(""),
+    );
+    assert_eq!(config.jobs, Some(67890));
+
+    // `--set build.jobs` should take precedence over `config.toml`.
+    let config = Config::parse_inner(
+        Flags::parse(&[
+            "check".to_owned(),
+            "--config=/does/not/exist".to_owned(),
+            "--set=build.jobs=12345".to_owned(),
+        ]),
+        |&_| {
+            toml::from_str(
+                r#"
+            [build]
+            jobs = 67890
+        "#,
+            )
+        },
+    );
+    assert_eq!(config.jobs, Some(12345));
+
+    // `--jobs` > `--set build.jobs` > `config.toml`
+    let config = Config::parse_inner(
+        Flags::parse(&[
+            "check".to_owned(),
+            "--jobs=123".to_owned(),
+            "--config=/does/not/exist".to_owned(),
+            "--set=build.jobs=456".to_owned(),
+        ]),
+        |&_| {
+            toml::from_str(
+                r#"
+            [build]
+            jobs = 789
+        "#,
+            )
+        },
+    );
+    assert_eq!(config.jobs, Some(123));
+}
+
+#[test]
+fn check_rustc_if_unchanged_paths() {
+    let config = parse("");
+    let normalised_allowed_paths: Vec<_> = RUSTC_IF_UNCHANGED_ALLOWED_PATHS
+        .iter()
+        .map(|t| {
+            t.strip_prefix(":!").expect(&format!("{t} doesn't have ':!' prefix, but it should."))
+        })
+        .collect();
+
+    for p in normalised_allowed_paths {
+        assert!(config.src.join(p).exists(), "{p} doesn't exist.");
+    }
 }

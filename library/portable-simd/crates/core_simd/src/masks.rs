@@ -34,6 +34,7 @@ mod sealed {
         fn eq(self, other: Self) -> bool;
 
         fn to_usize(self) -> usize;
+        fn max_unsigned() -> u64;
 
         type Unsigned: SimdElement;
 
@@ -76,6 +77,11 @@ macro_rules! impl_element {
             #[inline]
             fn to_usize(self) -> usize {
                 self as usize
+            }
+
+            #[inline]
+            fn max_unsigned() -> u64 {
+                <$unsigned>::MAX as u64
             }
 
             type Unsigned = $unsigned;
@@ -131,7 +137,7 @@ where
     T: MaskElement,
     LaneCount<N>: SupportedLaneCount,
 {
-    /// Construct a mask by setting all elements to the given value.
+    /// Constructs a mask by setting all elements to the given value.
     #[inline]
     pub fn splat(value: bool) -> Self {
         Self(mask_impl::Mask::splat(value))
@@ -282,7 +288,7 @@ where
         self.0.all()
     }
 
-    /// Create a bitmask from a mask.
+    /// Creates a bitmask from a mask.
     ///
     /// Each bit is set if the corresponding element in the mask is `true`.
     /// If the mask contains more than 64 elements, the bitmask is truncated to the first 64.
@@ -292,7 +298,7 @@ where
         self.0.to_bitmask_integer()
     }
 
-    /// Create a mask from a bitmask.
+    /// Creates a mask from a bitmask.
     ///
     /// For each bit, if it is set, the corresponding element in the mask is set to `true`.
     /// If the mask contains more than 64 elements, the remainder are set to `false`.
@@ -302,7 +308,7 @@ where
         Self(mask_impl::Mask::from_bitmask_integer(bitmask))
     }
 
-    /// Create a bitmask vector from a mask.
+    /// Creates a bitmask vector from a mask.
     ///
     /// Each bit is set if the corresponding element in the mask is `true`.
     /// The remaining bits are unset.
@@ -322,7 +328,7 @@ where
         self.0.to_bitmask_vector()
     }
 
-    /// Create a mask from a bitmask vector.
+    /// Creates a mask from a bitmask vector.
     ///
     /// For each bit, if it is set, the corresponding element in the mask is set to `true`.
     ///
@@ -344,7 +350,7 @@ where
         Self(mask_impl::Mask::from_bitmask_vector(bitmask))
     }
 
-    /// Find the index of the first set element.
+    /// Finds the index of the first set element.
     ///
     /// ```
     /// # #![feature(portable_simd)]

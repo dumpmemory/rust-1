@@ -1,19 +1,18 @@
-use crate::question_mark::{QuestionMark, QUESTION_MARK};
-use clippy_config::msrvs;
+use crate::question_mark::{QUESTION_MARK, QuestionMark};
 use clippy_config::types::MatchLintBehaviour;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::IfLetOrMatch;
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::{is_lint_allowed, is_never_expr, pat_and_expr_can_be_question_mark, peel_blocks};
+use clippy_utils::{is_lint_allowed, is_never_expr, msrvs, pat_and_expr_can_be_question_mark, peel_blocks};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, MatchSource, Pat, PatKind, QPath, Stmt, StmtKind};
 use rustc_lint::{LateContext, LintContext};
 use rustc_middle::lint::in_external_macro;
 
-use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
+use rustc_span::symbol::{Symbol, sym};
 use std::slice;
 
 declare_clippy_lint! {
@@ -49,16 +48,14 @@ declare_clippy_lint! {
 
 impl<'tcx> QuestionMark {
     pub(crate) fn check_manual_let_else(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'tcx>) {
-        if !self.msrv.meets(msrvs::LET_ELSE) || in_external_macro(cx.sess(), stmt.span) {
-            return;
-        }
-
-        if let StmtKind::Local(local) = stmt.kind
+        if let StmtKind::Let(local) = stmt.kind
             && let Some(init) = local.init
             && local.els.is_none()
             && local.ty.is_none()
             && init.span.eq_ctxt(stmt.span)
             && let Some(if_let_or_match) = IfLetOrMatch::parse(cx, init)
+            && self.msrv.meets(msrvs::LET_ELSE)
+            && !in_external_macro(cx.sess(), stmt.span)
         {
             match if_let_or_match {
                 IfLetOrMatch::IfLet(if_let_expr, let_pat, if_then, if_else, ..) => {

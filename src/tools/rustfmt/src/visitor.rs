@@ -3,28 +3,28 @@ use std::rc::Rc;
 
 use rustc_ast::{ast, token::Delimiter, visit};
 use rustc_data_structures::sync::Lrc;
-use rustc_span::{symbol, BytePos, Pos, Span};
+use rustc_span::{BytePos, Pos, Span, symbol};
+use tracing::debug;
 
 use crate::attr::*;
-use crate::comment::{contains_comment, rewrite_comment, CodeCharKind, CommentCodeSlices};
-use crate::config::Version;
-use crate::config::{BraceStyle, Config, MacroSelector};
+use crate::comment::{CodeCharKind, CommentCodeSlices, contains_comment, rewrite_comment};
+use crate::config::{BraceStyle, Config, MacroSelector, StyleEdition};
 use crate::coverage::transform_missing_snippet;
 use crate::items::{
-    format_impl, format_trait, format_trait_alias, is_mod_decl, is_use_item, rewrite_extern_crate,
-    rewrite_type_alias, FnBraceStyle, FnSig, ItemVisitorKind, StaticParts, StructParts,
+    FnBraceStyle, FnSig, ItemVisitorKind, StaticParts, StructParts, format_impl, format_trait,
+    format_trait_alias, is_mod_decl, is_use_item, rewrite_extern_crate, rewrite_type_alias,
 };
-use crate::macros::{macro_style, rewrite_macro, rewrite_macro_def, MacroPosition};
+use crate::macros::{MacroPosition, macro_style, rewrite_macro, rewrite_macro_def};
 use crate::modules::Module;
 use crate::parse::session::ParseSess;
 use crate::rewrite::{Rewrite, RewriteContext};
 use crate::shape::{Indent, Shape};
-use crate::skip::{is_skip_attr, SkipContext};
+use crate::skip::{SkipContext, is_skip_attr};
 use crate::source_map::{LineRangeUtils, SpanUtils};
 use crate::spanned::Spanned;
 use crate::stmt::Stmt;
 use crate::utils::{
-    self, contains_skip, count_newlines, depr_skip_annotation, format_unsafety, inner_attributes,
+    self, contains_skip, count_newlines, depr_skip_annotation, format_safety, inner_attributes,
     last_line_width, mk_sp, ptr_vec_to_ref_vec, rewrite_ident, starts_with_newline, stmt_expr,
 };
 use crate::{ErrorKind, FormatReport, FormattingError};
@@ -81,7 +81,7 @@ pub(crate) struct FmtVisitor<'a> {
     pub(crate) snippet_provider: &'a SnippetProvider,
     pub(crate) line_number: usize,
     /// List of 1-based line ranges which were annotated with skip
-    /// Both bounds are inclusifs.
+    /// Both bounds are inclusive.
     pub(crate) skipped_range: Rc<RefCell<Vec<(usize, usize)>>>,
     pub(crate) macro_rewrite_failure: bool,
     pub(crate) report: FormatReport,
@@ -150,7 +150,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                 self.visit_item(item);
                 self.last_pos = stmt.span().hi();
             }
-            ast::StmtKind::Local(..) | ast::StmtKind::Expr(..) | ast::StmtKind::Semi(..) => {
+            ast::StmtKind::Let(..) | ast::StmtKind::Expr(..) | ast::StmtKind::Semi(..) => {
                 let attrs = get_attrs_from_stmt(stmt.as_ast_node());
                 if contains_skip(attrs) {
                     self.push_skipped_with_span(
@@ -290,7 +290,9 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
 
                     let mut comment_shape =
                         Shape::indented(self.block_indent, config).comment(config);
-                    if self.config.version() == Version::Two && comment_on_same_line {
+                    if self.config.style_edition() >= StyleEdition::Edition2024
+                        && comment_on_same_line
+                    {
                         self.push_str(" ");
                         // put the first line of the comment on the same line as the
                         // block's last line
@@ -311,8 +313,8 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                                 let comment_str =
                                     rewrite_comment(other_lines, false, comment_shape, config);
                                 match comment_str {
-                                    Some(ref s) => self.push_str(s),
-                                    None => self.push_str(other_lines),
+                                    Ok(ref s) => self.push_str(s),
+                                    Err(_) => self.push_str(other_lines),
                                 }
                             }
                         }
@@ -341,8 +343,8 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
 
                         let comment_str = rewrite_comment(&sub_slice, false, comment_shape, config);
                         match comment_str {
-                            Some(ref s) => self.push_str(s),
-                            None => self.push_str(&sub_slice),
+                            Ok(ref s) => self.push_str(s),
+                            Err(_) => self.push_str(&sub_slice),
                         }
                     }
                 }
@@ -388,7 +390,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                 block = b;
                 self.rewrite_fn_before_block(
                     indent,
-                    ident,
+                    *ident,
                     &FnSig::from_fn_kind(&fk, fd, defaultness),
                     mk_sp(s.lo(), b.span.lo()),
                 )
@@ -517,9 +519,9 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     self.visit_enum(item.ident, &item.vis, def, generics, item.span);
                     self.last_pos = source!(self, item.span).hi();
                 }
-                ast::ItemKind::Mod(unsafety, ref mod_kind) => {
+                ast::ItemKind::Mod(safety, ref mod_kind) => {
                     self.format_missing_with_indent(source!(self, item.span).lo());
-                    self.format_mod(mod_kind, unsafety, &item.vis, item.span, item.ident, attrs);
+                    self.format_mod(mod_kind, safety, &item.vis, item.span, item.ident, attrs);
                 }
                 ast::ItemKind::MacCall(ref mac) => {
                     self.visit_mac(mac, Some(item.ident), MacroPosition::Item);
@@ -538,21 +540,14 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                         ref generics,
                         ref body,
                     } = **fn_kind;
-                    if let Some(ref body) = body {
+                    if body.is_some() {
                         let inner_attrs = inner_attributes(&item.attrs);
                         let fn_ctxt = match sig.header.ext {
                             ast::Extern::None => visit::FnCtxt::Free,
                             _ => visit::FnCtxt::Foreign,
                         };
                         self.visit_fn(
-                            visit::FnKind::Fn(
-                                fn_ctxt,
-                                item.ident,
-                                sig,
-                                &item.vis,
-                                generics,
-                                Some(body),
-                            ),
+                            visit::FnKind::Fn(fn_ctxt, &item.ident, sig, &item.vis, generics, body),
                             &sig.decl,
                             item.span,
                             defaultness,
@@ -560,9 +555,11 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                         )
                     } else {
                         let indent = self.block_indent;
-                        let rewrite = self.rewrite_required_fn(
-                            indent, item.ident, sig, &item.vis, generics, item.span,
-                        );
+                        let rewrite = self
+                            .rewrite_required_fn(
+                                indent, item.ident, sig, &item.vis, generics, item.span,
+                            )
+                            .ok();
                         self.push_rewrite(item.span, rewrite);
                     }
                 }
@@ -583,10 +580,11 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                         item.ident,
                         &item.vis,
                         item.span,
-                    );
+                    )
+                    .ok();
                     self.push_rewrite(item.span, rewrite);
                 }
-                ast::ItemKind::Delegation(..) => {
+                ast::ItemKind::Delegation(..) | ast::ItemKind::DelegationMac(..) => {
                     // TODO: rewrite delegation items once syntax is established.
                     // For now, leave the contents of the Span unformatted.
                     self.push_rewrite(item.span, None)
@@ -608,7 +606,8 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             self.block_indent,
             visitor_kind,
             span,
-        );
+        )
+        .ok();
         self.push_rewrite(span, rewrite);
     }
 
@@ -642,11 +641,11 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     ref generics,
                     ref body,
                 } = **fn_kind;
-                if let Some(ref body) = body {
+                if body.is_some() {
                     let inner_attrs = inner_attributes(&ai.attrs);
                     let fn_ctxt = visit::FnCtxt::Assoc(assoc_ctxt);
                     self.visit_fn(
-                        visit::FnKind::Fn(fn_ctxt, ai.ident, sig, &ai.vis, generics, Some(body)),
+                        visit::FnKind::Fn(fn_ctxt, &ai.ident, sig, &ai.vis, generics, body),
                         &sig.decl,
                         ai.span,
                         defaultness,
@@ -654,8 +653,9 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     );
                 } else {
                     let indent = self.block_indent;
-                    let rewrite =
-                        self.rewrite_required_fn(indent, ai.ident, sig, &ai.vis, generics, ai.span);
+                    let rewrite = self
+                        .rewrite_required_fn(indent, ai.ident, sig, &ai.vis, generics, ai.span)
+                        .ok();
                     self.push_rewrite(ai.span, rewrite);
                 }
             }
@@ -682,7 +682,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
 
         // 1 = ;
         let shape = self.shape().saturating_sub_width(1);
-        let rewrite = self.with_context(|ctx| rewrite_macro(mac, ident, ctx, shape, pos));
+        let rewrite = self.with_context(|ctx| rewrite_macro(mac, ident, ctx, shape, pos).ok());
         // As of v638 of the rustc-ap-* crates, the associated span no longer includes
         // the trailing semicolon. This determines the correct span to ensure scenarios
         // with whitespace between the delimiters and trailing semi (i.e. `foo!(abc)     ;`)
@@ -913,7 +913,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
     fn format_mod(
         &mut self,
         mod_kind: &ast::ModKind,
-        unsafety: ast::Unsafe,
+        safety: ast::Safety,
         vis: &ast::Visibility,
         s: Span,
         ident: symbol::Ident,
@@ -921,13 +921,13 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
     ) {
         let vis_str = utils::format_visibility(&self.get_context(), vis);
         self.push_str(&*vis_str);
-        self.push_str(format_unsafety(unsafety));
+        self.push_str(format_safety(safety));
         self.push_str("mod ");
         // Calling `to_owned()` to work around borrow checker.
         let ident_str = rewrite_ident(&self.get_context(), ident).to_owned();
         self.push_str(&ident_str);
 
-        if let ast::ModKind::Loaded(ref items, ast::Inline::Yes, ref spans) = mod_kind {
+        if let ast::ModKind::Loaded(ref items, ast::Inline::Yes, ref spans, _) = mod_kind {
             let ast::ModSpans {
                 inner_span,
                 inject_use_span: _,

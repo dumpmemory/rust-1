@@ -23,7 +23,7 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for structure field patterns bound to wildcards.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Using `..` instead is shorter and leaves the focus on
     /// the fields that are actually bound.
     ///
@@ -138,7 +138,7 @@ declare_clippy_lint! {
     /// To enforce unseparated literal suffix style,
     /// see the `separated_literal_suffix` lint.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Suffix style should be consistent.
     ///
     /// ### Example
@@ -166,7 +166,7 @@ declare_clippy_lint! {
     /// To enforce separated literal suffix style,
     /// see the `unseparated_literal_suffix` lint.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Suffix style should be consistent.
     ///
     /// ### Example
@@ -364,8 +364,8 @@ declare_lint_pass!(MiscEarlyLints => [
 ]);
 
 impl EarlyLintPass for MiscEarlyLints {
-    fn check_generics(&mut self, cx: &EarlyContext<'_>, gen: &Generics) {
-        for param in &gen.params {
+    fn check_generics(&mut self, cx: &EarlyContext<'_>, generics: &Generics) {
+        for param in &generics.params {
             builtin_type_shadow::check(cx, param);
         }
     }
@@ -394,7 +394,7 @@ impl EarlyLintPass for MiscEarlyLints {
                             cx,
                             DUPLICATE_UNDERSCORE_ARGUMENT,
                             *correspondence,
-                            &format!(
+                            format!(
                                 "`{arg_name}` already exists, having another argument having almost the same \
                                  name makes code comprehension and documentation more difficult"
                             ),
@@ -427,7 +427,7 @@ impl MiscEarlyLints {
         // See <https://github.com/rust-lang/rust-clippy/issues/4507> for a regression.
         // FIXME: Find a better way to detect those cases.
         let lit_snip = match snippet_opt(cx, span) {
-            Some(snip) if snip.chars().next().map_or(false, |c| c.is_ascii_digit()) => snip,
+            Some(snip) if snip.chars().next().is_some_and(|c| c.is_ascii_digit()) => snip,
             _ => return,
         };
 

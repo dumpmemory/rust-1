@@ -17,17 +17,20 @@ mod same_item_push;
 mod single_element_loop;
 mod unused_enumerate_index;
 mod utils;
+mod while_float;
 mod while_immutable_condition;
 mod while_let_loop;
 mod while_let_on_iterator;
 
-use clippy_config::msrvs::Msrv;
+use clippy_config::Conf;
 use clippy_utils::higher;
+use clippy_utils::msrvs::Msrv;
+use rustc_ast::Label;
 use rustc_hir::{Expr, ExprKind, LoopSource, Pat};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
-use utils::{make_iterator_snippet, IncrementVisitor, InitializeVisitor};
+use utils::{IncrementVisitor, InitializeVisitor, make_iterator_snippet};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -185,22 +188,22 @@ declare_clippy_lint! {
     /// The `while let` loop is usually shorter and more
     /// readable.
     ///
-    /// ### Known problems
-    /// Sometimes the wrong binding is displayed ([#383](https://github.com/rust-lang/rust-clippy/issues/383)).
-    ///
     /// ### Example
     /// ```rust,no_run
-    /// # let y = Some(1);
+    /// let y = Some(1);
     /// loop {
     ///     let x = match y {
     ///         Some(x) => x,
     ///         None => break,
     ///     };
-    ///     // .. do something with x
+    ///     // ..
     /// }
-    /// // is easier written as
+    /// ```
+    /// Use instead:
+    /// ```rust,no_run
+    /// let y = Some(1);
     /// while let Some(x) = y {
-    ///     // .. do something with x
+    ///     // ..
     /// };
     /// ```
     #[clippy::version = "pre 1.29.0"]
@@ -355,10 +358,10 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for loops which have a range bound that is a mutable variable
+    /// Checks for loops with a range bound that is a mutable variable.
     ///
     /// ### Why is this bad?
-    /// One might think that modifying the mutable variable changes the loop bounds
+    /// One might think that modifying the mutable variable changes the loop bounds. It doesn't.
     ///
     /// ### Known problems
     /// False positive when mutation is followed by a `break`, but the `break` is not immediately
@@ -380,7 +383,7 @@ declare_clippy_lint! {
     /// let mut foo = 42;
     /// for i in 0..foo {
     ///     foo -= 1;
-    ///     println!("{}", i); // prints numbers from 0 to 42, not 0 to 21
+    ///     println!("{i}"); // prints numbers from 0 to 41, not 0 to 21
     /// }
     /// ```
     #[clippy::version = "pre 1.29.0"]
@@ -414,6 +417,39 @@ declare_clippy_lint! {
     pub WHILE_IMMUTABLE_CONDITION,
     correctness,
     "variables used within while expression are not mutated in the body"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for while loops comparing floating point values.
+    ///
+    /// ### Why is this bad?
+    /// If you increment floating point values, errors can compound,
+    /// so, use integers instead if possible.
+    ///
+    /// ### Known problems
+    /// The lint will catch all while loops comparing floating point
+    /// values without regarding the increment.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let mut x = 0.0;
+    /// while x < 42.0 {
+    ///     x += 1.0;
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// let mut x = 0;
+    /// while x < 42 {
+    ///     x += 1;
+    /// }
+    /// ```
+    #[clippy::version = "1.80.0"]
+    pub WHILE_FLOAT,
+    nursery,
+    "while loops comparing floating point values"
 }
 
 declare_clippy_lint! {
@@ -641,9 +677,9 @@ declare_clippy_lint! {
     /// Checks for infinite loops in a function where the return type is not `!`
     /// and lint accordingly.
     ///
-    /// ### Why is this bad?
-    /// A loop should be gently exited somewhere, or at least mark its parent function as
-    /// never return (`!`).
+    /// ### Why restrict this?
+    /// Making the return type `!` serves as documentation that the function does not return.
+    /// If the function is not intended to loop infinitely, then this lint may detect a bug.
     ///
     /// ### Example
     /// ```no_run,ignore
@@ -683,10 +719,10 @@ pub struct Loops {
     enforce_iter_loop_reborrow: bool,
 }
 impl Loops {
-    pub fn new(msrv: Msrv, enforce_iter_loop_reborrow: bool) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            msrv,
-            enforce_iter_loop_reborrow,
+            msrv: conf.msrv.clone(),
+            enforce_iter_loop_reborrow: conf.enforce_iter_loop_reborrow,
         }
     }
 }
@@ -706,6 +742,7 @@ impl_lint_pass!(Loops => [
     NEVER_LOOP,
     MUT_RANGE_BOUND,
     WHILE_IMMUTABLE_CONDITION,
+    WHILE_FLOAT,
     SAME_ITEM_PUSH,
     SINGLE_ELEMENT_LOOP,
     MISSING_SPIN_LOOP,
@@ -724,6 +761,7 @@ impl<'tcx> LateLintPass<'tcx> for Loops {
             body,
             loop_id,
             span,
+            label,
         }) = for_loop
         {
             // we don't want to check expanded macros
@@ -732,7 +770,7 @@ impl<'tcx> LateLintPass<'tcx> for Loops {
             if body.span.from_expansion() {
                 return;
             }
-            self.check_for_loop(cx, pat, arg, body, expr, span);
+            self.check_for_loop(cx, pat, arg, body, expr, span, label);
             if let ExprKind::Block(block, _) = body.kind {
                 never_loop::check(cx, block, loop_id, span, for_loop.as_ref());
             }
@@ -762,6 +800,7 @@ impl<'tcx> LateLintPass<'tcx> for Loops {
 
         if let Some(higher::While { condition, body, span }) = higher::While::hir(expr) {
             while_immutable_condition::check(cx, condition, body);
+            while_float::check(cx, condition);
             missing_spin_loop::check(cx, condition, body);
             manual_while_let_some::check(cx, condition, body, span);
         }
@@ -771,6 +810,7 @@ impl<'tcx> LateLintPass<'tcx> for Loops {
 }
 
 impl Loops {
+    #[allow(clippy::too_many_arguments)]
     fn check_for_loop<'tcx>(
         &self,
         cx: &LateContext<'tcx>,
@@ -779,11 +819,12 @@ impl Loops {
         body: &'tcx Expr<'_>,
         expr: &'tcx Expr<'_>,
         span: Span,
+        label: Option<Label>,
     ) {
         let is_manual_memcpy_triggered = manual_memcpy::check(cx, pat, arg, body, expr);
         if !is_manual_memcpy_triggered {
             needless_range_loop::check(cx, pat, arg, body, expr);
-            explicit_counter_loop::check(cx, pat, arg, body, expr);
+            explicit_counter_loop::check(cx, pat, arg, body, expr, label);
         }
         self.check_for_loop_arg(cx, pat, arg);
         for_kv_map::check(cx, pat, arg, body);

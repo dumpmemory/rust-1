@@ -2,30 +2,19 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/resolution.html#selection
 
-use self::EvaluationResult::*;
-
-use super::{SelectionError, SelectionResult};
 use rustc_errors::ErrorGuaranteed;
-
-use crate::ty;
-
 use rustc_hir::def_id::DefId;
+use rustc_macros::{HashStable, TypeVisitable};
 use rustc_query_system::cache::Cache;
 
-pub type SelectionCache<'tcx> = Cache<
-    // This cache does not use `ParamEnvAnd` in its keys because `ParamEnv::and` can replace
-    // caller bounds with an empty list if the `TraitPredicate` looks global, which may happen
-    // after erasing lifetimes from the predicate.
-    (ty::ParamEnv<'tcx>, ty::TraitPredicate<'tcx>),
-    SelectionResult<'tcx, SelectionCandidate<'tcx>>,
->;
+use self::EvaluationResult::*;
+use super::{SelectionError, SelectionResult};
+use crate::ty;
 
-pub type EvaluationCache<'tcx> = Cache<
-    // See above: this cache does not use `ParamEnvAnd` in its keys due to sometimes incorrectly
-    // caching with the wrong `ParamEnv`.
-    (ty::ParamEnv<'tcx>, ty::PolyTraitPredicate<'tcx>),
-    EvaluationResult,
->;
+pub type SelectionCache<'tcx, ENV> =
+    Cache<(ENV, ty::TraitPredicate<'tcx>), SelectionResult<'tcx, SelectionCandidate<'tcx>>>;
+
+pub type EvaluationCache<'tcx, ENV> = Cache<(ENV, ty::PolyTraitPredicate<'tcx>), EvaluationResult>;
 
 /// The selection process begins by considering all impls, where
 /// clauses, and so forth that might resolve an obligation. Sometimes
@@ -162,9 +151,7 @@ pub enum SelectionCandidate<'tcx> {
 
     /// Implementation of a `Fn`-family trait by one of the anonymous
     /// types generated for a fn pointer type (e.g., `fn(int) -> int`)
-    FnPointerCandidate {
-        fn_host_effect: ty::Const<'tcx>,
-    },
+    FnPointerCandidate,
 
     TraitAliasCandidate,
 
@@ -181,9 +168,6 @@ pub enum SelectionCandidate<'tcx> {
     BuiltinObjectCandidate,
 
     BuiltinUnsizeCandidate,
-
-    /// Implementation of `const Destruct`, optionally from a custom `impl const Drop`.
-    ConstDestructCandidate(Option<DefId>),
 }
 
 /// The result of trait evaluation. The order is important
@@ -193,7 +177,6 @@ pub enum SelectionCandidate<'tcx> {
 /// The evaluation results are ordered:
 ///     - `EvaluatedToOk` implies `EvaluatedToOkModuloRegions`
 ///       implies `EvaluatedToAmbig` implies `EvaluatedToAmbigStackDependent`
-///     - `EvaluatedToErr` implies `EvaluatedToErrStackDependent`
 ///     - the "union" of evaluation results is equal to their maximum -
 ///     all the "potential success" candidates can potentially succeed,
 ///     so they are noops when unioned with a definite error, and within
@@ -219,52 +202,9 @@ pub enum EvaluationResult {
     /// variables. We are somewhat imprecise there, so we don't actually
     /// know the real result.
     ///
-    /// This can't be trivially cached for the same reason as `EvaluatedToErrStackDependent`.
+    /// This can't be trivially cached because the result depends on the
+    /// stack results.
     EvaluatedToAmbigStackDependent,
-    /// Evaluation failed because we encountered an obligation we are already
-    /// trying to prove on this branch.
-    ///
-    /// We know this branch can't be a part of a minimal proof-tree for
-    /// the "root" of our cycle, because then we could cut out the recursion
-    /// and maintain a valid proof tree. However, this does not mean
-    /// that all the obligations on this branch do not hold -- it's possible
-    /// that we entered this branch "speculatively", and that there
-    /// might be some other way to prove this obligation that does not
-    /// go through this cycle -- so we can't cache this as a failure.
-    ///
-    /// For example, suppose we have this:
-    ///
-    /// ```rust,ignore (pseudo-Rust)
-    /// pub trait Trait { fn xyz(); }
-    /// // This impl is "useless", but we can still have
-    /// // an `impl Trait for SomeUnsizedType` somewhere.
-    /// impl<T: Trait + Sized> Trait for T { fn xyz() {} }
-    ///
-    /// pub fn foo<T: Trait + ?Sized>() {
-    ///     <T as Trait>::xyz();
-    /// }
-    /// ```
-    ///
-    /// When checking `foo`, we have to prove `T: Trait`. This basically
-    /// translates into this:
-    ///
-    /// ```plain,ignore
-    /// (T: Trait + Sized →_\impl T: Trait), T: Trait ⊢ T: Trait
-    /// ```
-    ///
-    /// When we try to prove it, we first go the first option, which
-    /// recurses. This shows us that the impl is "useless" -- it won't
-    /// tell us that `T: Trait` unless it already implemented `Trait`
-    /// by some other means. However, that does not prevent `T: Trait`
-    /// does not hold, because of the bound (which can indeed be satisfied
-    /// by `SomeUnsizedType` from another crate).
-    //
-    // FIXME: when an `EvaluatedToErrStackDependent` goes past its parent root, we
-    // ought to convert it to an `EvaluatedToErr`, because we know
-    // there definitely isn't a proof tree for that obligation. Not
-    // doing so is still sound -- there isn't any proof tree, so the
-    // branch still can't be a part of a minimal one -- but does not re-enable caching.
-    EvaluatedToErrStackDependent,
     /// Evaluation failed.
     EvaluatedToErr,
 }
@@ -290,13 +230,13 @@ impl EvaluationResult {
             | EvaluatedToAmbig
             | EvaluatedToAmbigStackDependent => true,
 
-            EvaluatedToErr | EvaluatedToErrStackDependent => false,
+            EvaluatedToErr => false,
         }
     }
 
     pub fn is_stack_dependent(self) -> bool {
         match self {
-            EvaluatedToAmbigStackDependent | EvaluatedToErrStackDependent => true,
+            EvaluatedToAmbigStackDependent => true,
 
             EvaluatedToOkModuloOpaqueTypes
             | EvaluatedToOk

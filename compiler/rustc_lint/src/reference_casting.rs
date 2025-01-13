@@ -1,10 +1,12 @@
 use rustc_ast::Mutability;
 use rustc_hir::{Expr, ExprKind, UnOp};
-use rustc_middle::ty::layout::LayoutOf as _;
-use rustc_middle::ty::{self, layout::TyAndLayout, TypeAndMut};
+use rustc_middle::ty::layout::{LayoutOf as _, TyAndLayout};
+use rustc_middle::ty::{self};
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::sym;
 
-use crate::{lints::InvalidReferenceCastingDiag, LateContext, LateLintPass, LintContext};
+use crate::lints::InvalidReferenceCastingDiag;
+use crate::{LateContext, LateLintPass, LintContext};
 
 declare_lint! {
     /// The `invalid_reference_casting` lint checks for casts of `&T` to `&mut T`
@@ -52,8 +54,6 @@ impl<'tcx> LateLintPass<'tcx> for InvalidReferenceCasting {
                 && let Some(ty_has_interior_mutability) =
                     is_cast_from_ref_to_mut_ptr(cx, init, &mut peel_casts)
             {
-                let ty_has_interior_mutability = ty_has_interior_mutability.then_some(());
-
                 cx.emit_span_lint(
                     INVALID_REFERENCE_CASTING,
                     expr.span,
@@ -153,7 +153,7 @@ fn is_cast_from_ref_to_mut_ptr<'tcx>(
     let end_ty = cx.typeck_results().node_type(orig_expr.hir_id);
 
     // Bail out early if the end type is **not** a mutable pointer.
-    if !matches!(end_ty.kind(), ty::RawPtr(TypeAndMut { ty: _, mutbl: Mutability::Mut })) {
+    if !matches!(end_ty.kind(), ty::RawPtr(_, Mutability::Mut)) {
         return None;
     }
 
@@ -168,7 +168,7 @@ fn is_cast_from_ref_to_mut_ptr<'tcx>(
         // Except on the presence of non concrete skeleton types (ie generics)
         // since there is no way to make it safe for arbitrary types.
         let inner_ty_has_interior_mutability =
-            !inner_ty.is_freeze(cx.tcx, cx.param_env) && inner_ty.has_concrete_skeleton();
+            !inner_ty.is_freeze(cx.tcx, cx.typing_env()) && inner_ty.has_concrete_skeleton();
         (!need_check_freeze || !inner_ty_has_interior_mutability)
             .then_some(inner_ty_has_interior_mutability)
     } else {
@@ -183,7 +183,7 @@ fn is_cast_to_bigger_memory_layout<'tcx>(
 ) -> Option<(TyAndLayout<'tcx>, TyAndLayout<'tcx>, Expr<'tcx>)> {
     let end_ty = cx.typeck_results().node_type(orig_expr.hir_id);
 
-    let ty::RawPtr(TypeAndMut { ty: inner_end_ty, mutbl: _ }) = end_ty.kind() else {
+    let ty::RawPtr(inner_end_ty, _) = end_ty.kind() else {
         return None;
     };
 
@@ -198,6 +198,16 @@ fn is_cast_to_bigger_memory_layout<'tcx>(
     let e_alloc = cx.expr_or_init(e);
     let e_alloc =
         if let ExprKind::AddrOf(_, _, inner_expr) = e_alloc.kind { inner_expr } else { e_alloc };
+
+    // if the current expr looks like this `&mut expr[index]` then just looking
+    // at `expr[index]` won't give us the underlying allocation, so we just skip it
+    // the same logic applies field access `&mut expr.field` and reborrows `&mut *expr`.
+    if let ExprKind::Index(..) | ExprKind::Field(..) | ExprKind::Unary(UnOp::Deref, ..) =
+        e_alloc.kind
+    {
+        return None;
+    }
+
     let alloc_ty = cx.typeck_results().node_type(e_alloc.hir_id);
 
     // if we do not find it we bail out, as this may not be UB

@@ -9,12 +9,15 @@
 //! within the `SourceMap`, which upon request can be converted to line and column
 //! information, source code snippets, etc.
 
-use crate::*;
+use std::io::{self, BorrowedBuf, Read};
+use std::{fs, path};
+
 use rustc_data_structures::sync::{IntoDynSyncSend, MappedReadGuard, ReadGuard, RwLock};
 use rustc_data_structures::unhash::UnhashMap;
-use std::fs;
-use std::io::{self, BorrowedBuf, Read};
-use std::path::{self};
+use rustc_macros::{Decodable, Encodable};
+use tracing::{debug, instrument, trace};
+
+use crate::*;
 
 #[cfg(test)]
 mod tests;
@@ -112,6 +115,12 @@ impl FileLoader for RealFileLoader {
     }
 
     fn read_file(&self, path: &Path) -> io::Result<String> {
+        if path.metadata().is_ok_and(|metadata| metadata.len() > SourceFile::MAX_FILE_SIZE.into()) {
+            return Err(io::Error::other(format!(
+                "text files larger than {} bytes are unsupported",
+                SourceFile::MAX_FILE_SIZE
+            )));
+        }
         fs::read_to_string(path)
     }
 
@@ -167,36 +176,51 @@ struct SourceMapFiles {
     stable_id_to_source_file: UnhashMap<StableSourceFileId, Lrc<SourceFile>>,
 }
 
+/// Used to construct a `SourceMap` with `SourceMap::with_inputs`.
+pub struct SourceMapInputs {
+    pub file_loader: Box<dyn FileLoader + Send + Sync>,
+    pub path_mapping: FilePathMapping,
+    pub hash_kind: SourceFileHashAlgorithm,
+    pub checksum_hash_kind: Option<SourceFileHashAlgorithm>,
+}
+
 pub struct SourceMap {
     files: RwLock<SourceMapFiles>,
     file_loader: IntoDynSyncSend<Box<dyn FileLoader + Sync + Send>>,
+
     // This is used to apply the file path remapping as specified via
     // `--remap-path-prefix` to all `SourceFile`s allocated within this `SourceMap`.
     path_mapping: FilePathMapping,
 
     /// The algorithm used for hashing the contents of each source file.
     hash_kind: SourceFileHashAlgorithm,
+
+    /// Similar to `hash_kind`, however this algorithm is used for checksums to determine if a crate is fresh.
+    /// `cargo` is the primary user of these.
+    ///
+    /// If this is equal to `hash_kind` then the checksum won't be computed twice.
+    checksum_hash_kind: Option<SourceFileHashAlgorithm>,
 }
 
 impl SourceMap {
     pub fn new(path_mapping: FilePathMapping) -> SourceMap {
-        Self::with_file_loader_and_hash_kind(
-            Box::new(RealFileLoader),
+        Self::with_inputs(SourceMapInputs {
+            file_loader: Box::new(RealFileLoader),
             path_mapping,
-            SourceFileHashAlgorithm::Md5,
-        )
+            hash_kind: SourceFileHashAlgorithm::Md5,
+            checksum_hash_kind: None,
+        })
     }
 
-    pub fn with_file_loader_and_hash_kind(
-        file_loader: Box<dyn FileLoader + Sync + Send>,
-        path_mapping: FilePathMapping,
-        hash_kind: SourceFileHashAlgorithm,
+    pub fn with_inputs(
+        SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind }: SourceMapInputs,
     ) -> SourceMap {
         SourceMap {
             files: Default::default(),
             file_loader: IntoDynSyncSend(file_loader),
             path_mapping,
             hash_kind,
+            checksum_hash_kind,
         }
     }
 
@@ -218,7 +242,7 @@ impl SourceMap {
     ///
     /// Unlike `load_file`, guarantees that no normalization like BOM-removal
     /// takes place.
-    pub fn load_binary_file(&self, path: &Path) -> io::Result<Lrc<[u8]>> {
+    pub fn load_binary_file(&self, path: &Path) -> io::Result<(Lrc<[u8]>, Span)> {
         let bytes = self.file_loader.read_binary_file(path)?;
 
         // We need to add file to the `SourceMap`, so that it is present
@@ -227,8 +251,16 @@ impl SourceMap {
         // via `mod`, so we try to use real file contents and not just an
         // empty string.
         let text = std::str::from_utf8(&bytes).unwrap_or("").to_string();
-        self.new_source_file(path.to_owned().into(), text);
-        Ok(bytes)
+        let file = self.new_source_file(path.to_owned().into(), text);
+        Ok((
+            bytes,
+            Span::new(
+                file.start_pos,
+                BytePos(file.start_pos.0 + file.source_len.0),
+                SyntaxContext::root(),
+                None,
+            ),
+        ))
     }
 
     // By returning a `MonotonicVec`, we ensure that consumers cannot invalidate
@@ -260,8 +292,8 @@ impl SourceMap {
         });
 
         let file = Lrc::new(file);
-        files.source_files.push(file.clone());
-        files.stable_id_to_source_file.insert(file_id, file.clone());
+        files.source_files.push(Lrc::clone(&file));
+        files.stable_id_to_source_file.insert(file_id, Lrc::clone(&file));
 
         Ok(file)
     }
@@ -271,7 +303,10 @@ impl SourceMap {
     /// unmodified.
     pub fn new_source_file(&self, filename: FileName, src: String) -> Lrc<SourceFile> {
         self.try_new_source_file(filename, src).unwrap_or_else(|OffsetOverflowError| {
-            eprintln!("fatal error: rustc does not support files larger than 4GB");
+            eprintln!(
+                "fatal error: rustc does not support text files larger than {} bytes",
+                SourceFile::MAX_FILE_SIZE
+            );
             crate::fatal_error::FatalError.raise()
         })
     }
@@ -290,7 +325,8 @@ impl SourceMap {
         match self.source_file_by_stable_id(stable_id) {
             Some(lrc_sf) => Ok(lrc_sf),
             None => {
-                let source_file = SourceFile::new(filename, src, self.hash_kind)?;
+                let source_file =
+                    SourceFile::new(filename, src, self.hash_kind, self.checksum_hash_kind)?;
 
                 // Let's make sure the file_id we generated above actually matches
                 // the ID we generate for the SourceFile we just created.
@@ -309,12 +345,12 @@ impl SourceMap {
         &self,
         filename: FileName,
         src_hash: SourceFileHash,
+        checksum_hash: Option<SourceFileHash>,
         stable_id: StableSourceFileId,
         source_len: u32,
         cnum: CrateNum,
         file_local_lines: FreezeLock<SourceFileLines>,
         multibyte_chars: Vec<MultiByteChar>,
-        non_narrow_chars: Vec<NonNarrowChar>,
         normalized_pos: Vec<NormalizedPos>,
         metadata_index: u32,
     ) -> Lrc<SourceFile> {
@@ -324,6 +360,7 @@ impl SourceMap {
             name: filename,
             src: None,
             src_hash,
+            checksum_hash,
             external_src: FreezeLock::new(ExternalSource::Foreign {
                 kind: ExternalSourceKind::AbsentOk,
                 metadata_index,
@@ -332,7 +369,6 @@ impl SourceMap {
             source_len,
             lines: file_local_lines,
             multibyte_chars,
-            non_narrow_chars,
             normalized_pos,
             stable_id,
             cnum,
@@ -359,7 +395,7 @@ impl SourceMap {
     /// Return the SourceFile that contains the given `BytePos`
     pub fn lookup_source_file(&self, pos: BytePos) -> Lrc<SourceFile> {
         let idx = self.lookup_source_file_idx(pos);
-        (*self.files.borrow().source_files)[idx].clone()
+        Lrc::clone(&(*self.files.borrow().source_files)[idx])
     }
 
     /// Looks up source information about a `BytePos`.
@@ -441,7 +477,7 @@ impl SourceMap {
         if lo != hi {
             return true;
         }
-        let f = (*self.files.borrow().source_files)[lo].clone();
+        let f = Lrc::clone(&(*self.files.borrow().source_files)[lo]);
         let lo = f.relative_position(sp.lo());
         let hi = f.relative_position(sp.hi());
         f.lookup_line(lo) != f.lookup_line(hi)
@@ -507,7 +543,7 @@ impl SourceMap {
     /// Extracts the source surrounding the given `Span` using the `extract_source` function. The
     /// extract function takes three arguments: a string slice containing the source, an index in
     /// the slice for the beginning of the span and an index in the slice for the end of the span.
-    fn span_to_source<F, T>(&self, sp: Span, extract_source: F) -> Result<T, SpanSnippetError>
+    pub fn span_to_source<F, T>(&self, sp: Span, extract_source: F) -> Result<T, SpanSnippetError>
     where
         F: Fn(&str, usize, usize) -> Result<T, SpanSnippetError>,
     {
@@ -654,6 +690,12 @@ impl SourceMap {
         })
     }
 
+    /// Extends the span to include any trailing whitespace, or returns the original
+    /// span if a `SpanSnippetError` was encountered.
+    pub fn span_extend_while_whitespace(&self, span: Span) -> Span {
+        self.span_extend_while(span, char::is_whitespace).unwrap_or(span)
+    }
+
     /// Extends the given `Span` to previous character while the previous character matches the predicate
     pub fn span_extend_prev_while(
         &self,
@@ -758,7 +800,7 @@ impl SourceMap {
                     return Ok(false);
                 }
             }
-            return Ok(true);
+            Ok(true)
         })
         .is_ok_and(|is_accessible| is_accessible)
     }
@@ -961,7 +1003,7 @@ impl SourceMap {
         let filename = self.path_mapping().map_filename_prefix(filename).0;
         for sf in self.files.borrow().source_files.iter() {
             if filename == sf.name {
-                return Some(sf.clone());
+                return Some(Lrc::clone(&sf));
             }
         }
         None
@@ -970,7 +1012,7 @@ impl SourceMap {
     /// For a global `BytePos`, computes the local offset within the containing `SourceFile`.
     pub fn lookup_byte_offset(&self, bpos: BytePos) -> SourceFileAndBytePos {
         let idx = self.lookup_source_file_idx(bpos);
-        let sf = (*self.files.borrow().source_files)[idx].clone();
+        let sf = Lrc::clone(&(*self.files.borrow().source_files)[idx]);
         let offset = bpos - sf.start_pos;
         SourceFileAndBytePos { sf, pos: offset }
     }
@@ -1034,13 +1076,14 @@ impl SourceMap {
     /// // ^^^^^^ input
     /// ```
     pub fn mac_call_stmt_semi_span(&self, mac_call: Span) -> Option<Span> {
-        let span = self.span_extend_while(mac_call, char::is_whitespace).ok()?;
-        let span = span.shrink_to_hi().with_hi(BytePos(span.hi().0.checked_add(1)?));
-        if self.span_to_snippet(span).as_deref() != Ok(";") {
-            return None;
-        }
-        Some(span)
+        let span = self.span_extend_while_whitespace(mac_call);
+        let span = self.next_point(span);
+        if self.span_to_snippet(span).as_deref() == Ok(";") { Some(span) } else { None }
     }
+}
+
+pub fn get_source_map() -> Option<Lrc<SourceMap>> {
+    with_session_globals(|session_globals| session_globals.source_map.clone())
 }
 
 #[derive(Clone)]
@@ -1126,6 +1169,21 @@ impl FilePathMapping {
             }
             FileName::Real(_) => unreachable!("attempted to remap an already remapped filename"),
             other => (other.clone(), false),
+        }
+    }
+
+    /// Applies any path prefix substitution as defined by the mapping.
+    /// The return value is the local path with a "virtual path" representing the remapped
+    /// part if any remapping was performed.
+    pub fn to_real_filename<'a>(&self, local_path: impl Into<Cow<'a, Path>>) -> RealFileName {
+        let local_path = local_path.into();
+        if let (remapped_path, true) = self.map_prefix(&*local_path) {
+            RealFileName::Remapped {
+                virtual_name: remapped_path.into_owned(),
+                local_path: Some(local_path.into_owned()),
+            }
+        } else {
+            RealFileName::LocalPath(local_path.into_owned())
         }
     }
 

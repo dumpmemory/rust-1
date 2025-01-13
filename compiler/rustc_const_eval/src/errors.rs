@@ -1,19 +1,22 @@
 use std::borrow::Cow;
+use std::fmt::Write;
 
+use either::Either;
+use rustc_abi::WrappingRange;
+use rustc_errors::codes::*;
 use rustc_errors::{
-    codes::*, Diag, DiagArgValue, DiagCtxt, DiagMessage, EmissionGuarantee, IntoDiagnostic, Level,
+    Diag, DiagArgValue, DiagCtxtHandle, DiagMessage, Diagnostic, EmissionGuarantee, Level,
 };
 use rustc_hir::ConstContext;
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_middle::mir::interpret::{
-    CheckInAllocMsg, ExpectedKind, InterpError, InvalidMetaKind, InvalidProgramInfo, Misalignment,
-    PointerKind, ResourceExhaustionInfo, UndefinedBehaviorInfo, UnsupportedOpInfo,
-    ValidationErrorInfo,
+    CheckInAllocMsg, CtfeProvenance, ExpectedKind, InterpErrorKind, InvalidMetaKind,
+    InvalidProgramInfo, Misalignment, Pointer, PointerKind, ResourceExhaustionInfo,
+    UndefinedBehaviorInfo, UnsupportedOpInfo, ValidationErrorInfo,
 };
 use rustc_middle::ty::{self, Mutability, Ty};
-use rustc_span::Span;
-use rustc_target::abi::call::AdjustForForeignAbiError;
-use rustc_target::abi::{Size, WrappingRange};
+use rustc_span::{Span, Symbol};
+use rustc_target::callconv::AdjustForForeignAbiError;
 
 use crate::interpret::InternKind;
 
@@ -26,6 +29,13 @@ pub(crate) struct DanglingPtrInFinal {
 }
 
 #[derive(Diagnostic)]
+#[diag(const_eval_nested_static_in_thread_local)]
+pub(crate) struct NestedStaticInThreadLocal {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(const_eval_mutable_ptr_in_final)]
 pub(crate) struct MutablePtrInFinal {
     #[primary_span]
@@ -34,11 +44,15 @@ pub(crate) struct MutablePtrInFinal {
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_unstable_in_stable)]
-pub(crate) struct UnstableInStable {
+#[diag(const_eval_unstable_in_stable_exposed)]
+pub(crate) struct UnstableInStableExposed {
     pub gate: String,
     #[primary_span]
     pub span: Span,
+    #[help(const_eval_is_function_call)]
+    pub is_function_call: bool,
+    /// Need to duplicate the field so that fluent also provides it as a variable...
+    pub is_function_call2: bool,
     #[suggestion(
         const_eval_unstable_sugg,
         code = "#[rustc_const_unstable(feature = \"...\", issue = \"...\")]\n",
@@ -84,30 +98,6 @@ pub(crate) struct PanicNonStrErr {
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_mut_deref, code = E0658)]
-pub(crate) struct MutDerefErr {
-    #[primary_span]
-    pub span: Span,
-    pub kind: ConstContext,
-}
-
-#[derive(Diagnostic)]
-#[diag(const_eval_transient_mut_borrow, code = E0658)]
-pub(crate) struct TransientMutBorrowErr {
-    #[primary_span]
-    pub span: Span,
-    pub kind: ConstContext,
-}
-
-#[derive(Diagnostic)]
-#[diag(const_eval_transient_mut_raw, code = E0658)]
-pub(crate) struct TransientMutRawErr {
-    #[primary_span]
-    pub span: Span,
-    pub kind: ConstContext,
-}
-
-#[derive(Diagnostic)]
 #[diag(const_eval_max_num_nodes_in_const)]
 pub(crate) struct MaxNumNodesInConstErr {
     #[primary_span]
@@ -132,23 +122,51 @@ pub(crate) struct UnstableConstFn {
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_unallowed_mutable_refs, code = E0764)]
-pub(crate) struct UnallowedMutableRefs {
+#[diag(const_eval_unstable_intrinsic)]
+#[help]
+pub(crate) struct UnstableIntrinsic {
     #[primary_span]
     pub span: Span,
-    pub kind: ConstContext,
-    #[note(const_eval_teach_note)]
-    pub teach: Option<()>,
+    pub name: Symbol,
+    pub feature: Symbol,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_unallowed_mutable_raw, code = E0764)]
-pub(crate) struct UnallowedMutableRaw {
+#[diag(const_eval_unmarked_const_fn_exposed)]
+#[help]
+pub(crate) struct UnmarkedConstFnExposed {
+    #[primary_span]
+    pub span: Span,
+    pub def_path: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(const_eval_unmarked_intrinsic_exposed)]
+#[help]
+pub(crate) struct UnmarkedIntrinsicExposed {
+    #[primary_span]
+    pub span: Span,
+    pub def_path: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(const_eval_mutable_ref_escaping, code = E0764)]
+pub(crate) struct MutableRefEscaping {
     #[primary_span]
     pub span: Span,
     pub kind: ConstContext,
     #[note(const_eval_teach_note)]
-    pub teach: Option<()>,
+    pub teach: bool,
+}
+
+#[derive(Diagnostic)]
+#[diag(const_eval_mutable_raw_escaping, code = E0764)]
+pub(crate) struct MutableRawEscaping {
+    #[primary_span]
+    pub span: Span,
+    pub kind: ConstContext,
+    #[note(const_eval_teach_note)]
+    pub teach: bool,
 }
 #[derive(Diagnostic)]
 #[diag(const_eval_non_const_fmt_macro_call, code = E0015)]
@@ -156,6 +174,7 @@ pub(crate) struct NonConstFmtMacroCall {
     #[primary_span]
     pub span: Span,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -164,6 +183,17 @@ pub(crate) struct NonConstFnCall {
     #[primary_span]
     pub span: Span,
     pub def_path_str: String,
+    pub def_descr: &'static str,
+    pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag(const_eval_non_const_intrinsic)]
+pub(crate) struct NonConstIntrinsic {
+    #[primary_span]
+    pub span: Span,
+    pub name: Symbol,
     pub kind: ConstContext,
 }
 
@@ -183,7 +213,7 @@ pub(crate) struct UnallowedHeapAllocations {
     pub span: Span,
     pub kind: ConstContext,
     #[note(const_eval_teach_note)]
-    pub teach: Option<()>,
+    pub teach: bool,
 }
 
 #[derive(Diagnostic)]
@@ -195,23 +225,16 @@ pub(crate) struct UnallowedInlineAsm {
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_interior_mutable_data_refer, code = E0492)]
-pub(crate) struct InteriorMutableDataRefer {
+#[diag(const_eval_interior_mutable_ref_escaping, code = E0492)]
+pub(crate) struct InteriorMutableRefEscaping {
     #[primary_span]
     #[label]
     pub span: Span,
     #[help]
-    pub opt_help: Option<()>,
+    pub opt_help: bool,
     pub kind: ConstContext,
     #[note(const_eval_teach_note)]
-    pub teach: Option<()>,
-}
-
-#[derive(Diagnostic)]
-#[diag(const_eval_interior_mutability_borrow)]
-pub(crate) struct InteriorMutabilityBorrow {
-    #[primary_span]
-    pub span: Span,
+    pub teach: bool,
 }
 
 #[derive(LintDiagnostic)]
@@ -230,6 +253,8 @@ pub struct LongRunningWarn {
     pub span: Span,
     #[help]
     pub item_span: Span,
+    // Used for evading `-Z deduplicate-diagnostics`.
+    pub force_duplicate: usize,
 }
 
 #[derive(Subdiagnostic)]
@@ -239,7 +264,7 @@ pub(crate) struct NonConstImplNote {
     pub span: Span,
 }
 
-#[derive(Subdiagnostic, PartialEq, Eq, Clone)]
+#[derive(Subdiagnostic, Clone)]
 #[note(const_eval_frame_note)]
 pub struct FrameNote {
     #[primary_span]
@@ -260,68 +285,75 @@ pub struct RawBytesNote {
 // FIXME(fee1-dead) do not use stringly typed `ConstContext`
 
 #[derive(Diagnostic)]
-#[diag(const_eval_match_eq_non_const, code = E0015)]
+#[diag(const_eval_non_const_match_eq, code = E0015)]
 #[note]
 pub struct NonConstMatchEq<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_for_loop_into_iter_non_const, code = E0015)]
+#[diag(const_eval_non_const_for_loop_into_iter, code = E0015)]
 pub struct NonConstForLoopIntoIter<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_question_branch_non_const, code = E0015)]
+#[diag(const_eval_non_const_question_branch, code = E0015)]
 pub struct NonConstQuestionBranch<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_question_from_residual_non_const, code = E0015)]
+#[diag(const_eval_non_const_question_from_residual, code = E0015)]
 pub struct NonConstQuestionFromResidual<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_try_block_from_output_non_const, code = E0015)]
+#[diag(const_eval_non_const_try_block_from_output, code = E0015)]
 pub struct NonConstTryBlockFromOutput<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_await_non_const, code = E0015)]
+#[diag(const_eval_non_const_await, code = E0015)]
 pub struct NonConstAwait<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub kind: ConstContext,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_closure_non_const, code = E0015)]
+#[diag(const_eval_non_const_closure, code = E0015)]
 pub struct NonConstClosure {
     #[primary_span]
     pub span: Span,
     pub kind: ConstContext,
     #[subdiagnostic]
     pub note: Option<NonConstClosureNote>,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Subdiagnostic)]
@@ -348,17 +380,18 @@ pub struct ConsiderDereferencing {
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_operator_non_const, code = E0015)]
+#[diag(const_eval_non_const_operator, code = E0015)]
 pub struct NonConstOperator {
     #[primary_span]
     pub span: Span,
     pub kind: ConstContext,
     #[subdiagnostic]
     pub sugg: Option<ConsiderDereferencing>,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_deref_coercion_non_const, code = E0015)]
+#[diag(const_eval_non_const_deref_coercion, code = E0015)]
 #[note]
 pub struct NonConstDerefCoercion<'tcx> {
     #[primary_span]
@@ -368,6 +401,7 @@ pub struct NonConstDerefCoercion<'tcx> {
     pub target_ty: Ty<'tcx>,
     #[note(const_eval_target_note)]
     pub deref_target: Option<Span>,
+    pub non_or_conditionally: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -379,7 +413,7 @@ pub struct LiveDrop<'tcx> {
     pub kind: ConstContext,
     pub dropped_ty: Ty<'tcx>,
     #[label(const_eval_dropped_at_label)]
-    pub dropped_at: Option<Span>,
+    pub dropped_at: Span,
 }
 
 #[derive(Diagnostic)]
@@ -394,13 +428,6 @@ pub struct ConstEvalError {
     pub frame_notes: Vec<FrameNote>,
 }
 
-#[derive(LintDiagnostic)]
-#[diag(const_eval_write_through_immutable_pointer)]
-pub struct WriteThroughImmutablePointer {
-    #[subdiagnostic]
-    pub frames: Vec<FrameNote>,
-}
-
 #[derive(Diagnostic)]
 #[diag(const_eval_nullary_intrinsic_fail)]
 pub struct NullaryIntrinsicError {
@@ -409,12 +436,12 @@ pub struct NullaryIntrinsicError {
 }
 
 #[derive(Diagnostic)]
-#[diag(const_eval_undefined_behavior, code = E0080)]
-pub struct UndefinedBehavior {
+#[diag(const_eval_validation_failure, code = E0080)]
+pub struct ValidationFailure {
     #[primary_span]
     pub span: Span,
-    #[note(const_eval_undefined_behavior_note)]
-    pub ub_note: Option<()>,
+    #[note(const_eval_validation_failure_note)]
+    pub ub_note: (),
     #[subdiagnostic]
     pub frames: Vec<FrameNote>,
     #[subdiagnostic]
@@ -442,7 +469,7 @@ pub trait ReportErrorExt {
     }
 }
 
-fn bad_pointer_message(msg: CheckInAllocMsg, dcx: &DiagCtxt) -> String {
+fn bad_pointer_message(msg: CheckInAllocMsg, dcx: DiagCtxtHandle<'_>) -> String {
     use crate::fluent_generated::*;
 
     let msg = match msg {
@@ -457,8 +484,9 @@ fn bad_pointer_message(msg: CheckInAllocMsg, dcx: &DiagCtxt) -> String {
 
 impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
     fn diagnostic_message(&self) -> DiagMessage {
-        use crate::fluent_generated::*;
         use UndefinedBehaviorInfo::*;
+
+        use crate::fluent_generated::*;
         match self {
             Ub(msg) => msg.clone().into(),
             Custom(x) => (x.msg)(),
@@ -471,14 +499,15 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
             DivisionOverflow => const_eval_division_overflow,
             RemainderOverflow => const_eval_remainder_overflow,
             PointerArithOverflow => const_eval_pointer_arithmetic_overflow,
+            ArithOverflow { .. } => const_eval_overflow_arith,
+            ShiftOverflow { .. } => const_eval_overflow_shift,
             InvalidMeta(InvalidMetaKind::SliceTooBig) => const_eval_invalid_meta_slice,
             InvalidMeta(InvalidMetaKind::TooBig) => const_eval_invalid_meta,
             UnterminatedCString(_) => const_eval_unterminated_c_string,
             PointerUseAfterFree(_, _) => const_eval_pointer_use_after_free,
-            PointerOutOfBounds { ptr_size: Size::ZERO, .. } => const_eval_zst_pointer_out_of_bounds,
             PointerOutOfBounds { .. } => const_eval_pointer_out_of_bounds,
-            DanglingIntPointer(0, _) => const_eval_dangling_null_pointer,
-            DanglingIntPointer(_, _) => const_eval_dangling_int_pointer,
+            DanglingIntPointer { addr: 0, .. } => const_eval_dangling_null_pointer,
+            DanglingIntPointer { .. } => const_eval_dangling_int_pointer,
             AlignmentCheckFailed { .. } => const_eval_alignment_check_failed,
             WriteToReadOnly(_) => const_eval_write_to_read_only,
             DerefFunctionPointer(_) => const_eval_deref_function_pointer,
@@ -488,6 +517,7 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
             InvalidTag(_) => const_eval_invalid_tag,
             InvalidFunctionPointer(_) => const_eval_invalid_function_pointer,
             InvalidVTablePointer(_) => const_eval_invalid_vtable_pointer,
+            InvalidVTableTrait { .. } => const_eval_invalid_vtable_trait,
             InvalidStr(_) => const_eval_invalid_str,
             InvalidUninitBytes(None) => const_eval_invalid_uninit_bytes_unknown,
             InvalidUninitBytes(Some(_)) => const_eval_invalid_uninit_bytes,
@@ -527,6 +557,17 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
             | DeadLocal
             | UninhabitedEnumVariantWritten(_)
             | UninhabitedEnumVariantRead(_) => {}
+
+            ArithOverflow { intrinsic } => {
+                diag.arg("intrinsic", intrinsic);
+            }
+            ShiftOverflow { intrinsic, shift_amount } => {
+                diag.arg("intrinsic", intrinsic);
+                diag.arg("shift_amount", match shift_amount {
+                    Either::Left(v) => v.to_string(),
+                    Either::Right(v) => v.to_string(),
+                });
+            }
             BoundsCheckFailed { len, index } => {
                 diag.arg("len", len);
                 diag.arg("index", index);
@@ -534,22 +575,45 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
             UnterminatedCString(ptr) | InvalidFunctionPointer(ptr) | InvalidVTablePointer(ptr) => {
                 diag.arg("pointer", ptr);
             }
+            InvalidVTableTrait { expected_dyn_type, vtable_dyn_type } => {
+                diag.arg("expected_dyn_type", expected_dyn_type.to_string());
+                diag.arg("vtable_dyn_type", vtable_dyn_type.to_string());
+            }
             PointerUseAfterFree(alloc_id, msg) => {
                 diag.arg("alloc_id", alloc_id)
                     .arg("bad_pointer_message", bad_pointer_message(msg, dcx));
             }
-            PointerOutOfBounds { alloc_id, alloc_size, ptr_offset, ptr_size, msg } => {
-                diag.arg("alloc_id", alloc_id)
-                    .arg("alloc_size", alloc_size.bytes())
-                    .arg("ptr_offset", ptr_offset)
-                    .arg("ptr_size", ptr_size.bytes())
-                    .arg("bad_pointer_message", bad_pointer_message(msg, dcx));
+            PointerOutOfBounds { alloc_id, alloc_size, ptr_offset, inbounds_size, msg } => {
+                diag.arg("alloc_size", alloc_size.bytes());
+                diag.arg("bad_pointer_message", bad_pointer_message(msg, dcx));
+                diag.arg("pointer", {
+                    let mut out = format!("{:?}", alloc_id);
+                    if ptr_offset > 0 {
+                        write!(out, "+{:#x}", ptr_offset).unwrap();
+                    } else if ptr_offset < 0 {
+                        write!(out, "-{:#x}", ptr_offset.unsigned_abs()).unwrap();
+                    }
+                    out
+                });
+                diag.arg("inbounds_size_is_neg", inbounds_size < 0);
+                diag.arg("inbounds_size_abs", inbounds_size.unsigned_abs());
+                diag.arg("ptr_offset_is_neg", ptr_offset < 0);
+                diag.arg("ptr_offset_abs", ptr_offset.unsigned_abs());
+                diag.arg(
+                    "alloc_size_minus_ptr_offset",
+                    alloc_size.bytes().saturating_sub(ptr_offset as u64),
+                );
             }
-            DanglingIntPointer(ptr, msg) => {
-                if ptr != 0 {
-                    diag.arg("pointer", format!("{ptr:#x}[noalloc]"));
+            DanglingIntPointer { addr, inbounds_size, msg } => {
+                if addr != 0 {
+                    diag.arg(
+                        "pointer",
+                        Pointer::<Option<CtfeProvenance>>::from_addr_invalid(addr).to_string(),
+                    );
                 }
 
+                diag.arg("inbounds_size_is_neg", inbounds_size < 0);
+                diag.arg("inbounds_size_abs", inbounds_size.unsigned_abs());
                 diag.arg("bad_pointer_message", bad_pointer_message(msg, dcx));
             }
             AlignmentCheckFailed(Misalignment { required, has }, msg) => {
@@ -595,8 +659,9 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
 
 impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
     fn diagnostic_message(&self) -> DiagMessage {
-        use crate::fluent_generated::*;
         use rustc_middle::mir::interpret::ValidationErrorKind::*;
+
+        use crate::fluent_generated::*;
         match self.kind {
             PtrToUninhabited { ptr_kind: PointerKind::Box, .. } => {
                 const_eval_validation_box_to_uninhabited
@@ -604,9 +669,6 @@ impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
             PtrToUninhabited { ptr_kind: PointerKind::Ref(_), .. } => {
                 const_eval_validation_ref_to_uninhabited
             }
-
-            PtrToStatic { ptr_kind: PointerKind::Box } => const_eval_validation_box_to_static,
-            PtrToStatic { ptr_kind: PointerKind::Ref(_) } => const_eval_validation_ref_to_static,
 
             PointerAsInt { .. } => const_eval_validation_pointer_as_int,
             PartialPointer => const_eval_validation_partial_pointer,
@@ -624,6 +686,7 @@ impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
             UninhabitedEnumVariant => const_eval_validation_uninhabited_enum_variant,
             Uninit { .. } => const_eval_validation_uninit,
             InvalidVTablePtr { .. } => const_eval_validation_invalid_vtable_ptr,
+            InvalidMetaWrongTrait { .. } => const_eval_validation_invalid_vtable_trait,
             InvalidMetaSliceTooLarge { ptr_kind: PointerKind::Box } => {
                 const_eval_validation_invalid_box_slice_meta
             }
@@ -669,8 +732,9 @@ impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
     }
 
     fn add_args<G: EmissionGuarantee>(self, err: &mut Diag<'_, G>) {
-        use crate::fluent_generated as fluent;
         use rustc_middle::mir::interpret::ValidationErrorKind::*;
+
+        use crate::fluent_generated as fluent;
 
         if let PointerAsInt { .. } | PartialPointer = self.kind {
             err.help(fluent::const_eval_ptr_as_bytes_1);
@@ -763,8 +827,11 @@ impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
             DanglingPtrNoProvenance { pointer, .. } => {
                 err.arg("pointer", pointer);
             }
+            InvalidMetaWrongTrait { vtable_dyn_type, expected_dyn_type } => {
+                err.arg("vtable_dyn_type", vtable_dyn_type.to_string());
+                err.arg("expected_dyn_type", expected_dyn_type.to_string());
+            }
             NullPtr { .. }
-            | PtrToStatic { .. }
             | ConstRefToMutable
             | ConstRefToExtern
             | MutableRefToImmutable
@@ -786,6 +853,7 @@ impl ReportErrorExt for UnsupportedOpInfo {
         use crate::fluent_generated::*;
         match self {
             UnsupportedOpInfo::Unsupported(s) => s.clone().into(),
+            UnsupportedOpInfo::ExternTypeField => const_eval_extern_type_field,
             UnsupportedOpInfo::UnsizedLocal => const_eval_unsized_local,
             UnsupportedOpInfo::OverwritePartialPointer(_) => const_eval_partial_pointer_overwrite,
             UnsupportedOpInfo::ReadPartialPointer(_) => const_eval_partial_pointer_copy,
@@ -795,9 +863,9 @@ impl ReportErrorExt for UnsupportedOpInfo {
         }
     }
     fn add_args<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
-        use crate::fluent_generated::*;
-
         use UnsupportedOpInfo::*;
+
+        use crate::fluent_generated::*;
         if let ReadPointerAsInt(_) | OverwritePartialPointer(_) | ReadPartialPointer(_) = self {
             diag.help(const_eval_ptr_as_bytes_1);
             diag.help(const_eval_ptr_as_bytes_2);
@@ -806,7 +874,10 @@ impl ReportErrorExt for UnsupportedOpInfo {
             // `ReadPointerAsInt(Some(info))` is never printed anyway, it only serves as an error to
             // be further processed by validity checking which then turns it into something nice to
             // print. So it's not worth the effort of having diagnostics that can print the `info`.
-            UnsizedLocal | Unsupported(_) | ReadPointerAsInt(_) => {}
+            UnsizedLocal
+            | UnsupportedOpInfo::ExternTypeField
+            | Unsupported(_)
+            | ReadPointerAsInt(_) => {}
             OverwritePartialPointer(ptr) | ReadPartialPointer(ptr) => {
                 diag.arg("ptr", ptr);
             }
@@ -817,23 +888,23 @@ impl ReportErrorExt for UnsupportedOpInfo {
     }
 }
 
-impl<'tcx> ReportErrorExt for InterpError<'tcx> {
+impl<'tcx> ReportErrorExt for InterpErrorKind<'tcx> {
     fn diagnostic_message(&self) -> DiagMessage {
         match self {
-            InterpError::UndefinedBehavior(ub) => ub.diagnostic_message(),
-            InterpError::Unsupported(e) => e.diagnostic_message(),
-            InterpError::InvalidProgram(e) => e.diagnostic_message(),
-            InterpError::ResourceExhaustion(e) => e.diagnostic_message(),
-            InterpError::MachineStop(e) => e.diagnostic_message(),
+            InterpErrorKind::UndefinedBehavior(ub) => ub.diagnostic_message(),
+            InterpErrorKind::Unsupported(e) => e.diagnostic_message(),
+            InterpErrorKind::InvalidProgram(e) => e.diagnostic_message(),
+            InterpErrorKind::ResourceExhaustion(e) => e.diagnostic_message(),
+            InterpErrorKind::MachineStop(e) => e.diagnostic_message(),
         }
     }
     fn add_args<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
         match self {
-            InterpError::UndefinedBehavior(ub) => ub.add_args(diag),
-            InterpError::Unsupported(e) => e.add_args(diag),
-            InterpError::InvalidProgram(e) => e.add_args(diag),
-            InterpError::ResourceExhaustion(e) => e.add_args(diag),
-            InterpError::MachineStop(e) => e.add_args(&mut |name, value| {
+            InterpErrorKind::UndefinedBehavior(ub) => ub.add_args(diag),
+            InterpErrorKind::Unsupported(e) => e.add_args(diag),
+            InterpErrorKind::InvalidProgram(e) => e.add_args(diag),
+            InterpErrorKind::ResourceExhaustion(e) => e.add_args(diag),
+            InterpErrorKind::MachineStop(e) => e.add_args(&mut |name, value| {
                 diag.arg(name, value);
             }),
         }
@@ -858,8 +929,7 @@ impl<'tcx> ReportErrorExt for InvalidProgramInfo<'tcx> {
             InvalidProgramInfo::Layout(e) => {
                 // The level doesn't matter, `dummy_diag` is consumed without it being used.
                 let dummy_level = Level::Bug;
-                let dummy_diag: Diag<'_, ()> =
-                    e.into_diagnostic().into_diagnostic(diag.dcx, dummy_level);
+                let dummy_diag: Diag<'_, ()> = e.into_diagnostic().into_diag(diag.dcx, dummy_level);
                 for (name, val) in dummy_diag.args.iter() {
                     diag.arg(name.clone(), val.clone());
                 }
@@ -882,13 +952,14 @@ impl ReportErrorExt for ResourceExhaustionInfo {
             ResourceExhaustionInfo::StackFrameLimitReached => const_eval_stack_frame_limit_reached,
             ResourceExhaustionInfo::MemoryExhausted => const_eval_memory_exhausted,
             ResourceExhaustionInfo::AddressSpaceFull => const_eval_address_space_full,
+            ResourceExhaustionInfo::Interrupted => const_eval_interrupted,
         }
     }
     fn add_args<G: EmissionGuarantee>(self, _: &mut Diag<'_, G>) {}
 }
 
-impl rustc_errors::IntoDiagnosticArg for InternKind {
-    fn into_diagnostic_arg(self) -> DiagArgValue {
+impl rustc_errors::IntoDiagArg for InternKind {
+    fn into_diag_arg(self) -> DiagArgValue {
         DiagArgValue::Str(Cow::Borrowed(match self {
             InternKind::Static(Mutability::Not) => "static",
             InternKind::Static(Mutability::Mut) => "static_mut",

@@ -1,15 +1,15 @@
-use crate::un_derefer::UnDerefer;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_index::{IndexSlice, IndexVec};
-use rustc_middle::mir::*;
-use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
-use rustc_span::Span;
-use smallvec::SmallVec;
-
 use std::fmt;
 use std::ops::{Index, IndexMut};
 
-use self::abs_domain::{AbstractElem, Lift};
+use rustc_data_structures::fx::FxHashMap;
+use rustc_index::{IndexSlice, IndexVec};
+use rustc_middle::mir::*;
+use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_span::Span;
+use smallvec::SmallVec;
+
+use self::abs_domain::Lift;
+use crate::un_derefer::UnDerefer;
 
 mod abs_domain;
 
@@ -300,7 +300,7 @@ pub struct MovePathLookup<'tcx> {
     /// subsequent search so that it is solely relative to that
     /// base-place). For the remaining lookup, we map the projection
     /// elem to the associated MovePathIndex.
-    projections: FxHashMap<(MovePathIndex, AbstractElem), MovePathIndex>,
+    projections: FxHashMap<(MovePathIndex, ProjectionKind), MovePathIndex>,
 
     un_derefer: UnDerefer<'tcx>,
 }
@@ -352,26 +352,20 @@ impl<'tcx> MoveData<'tcx> {
     pub fn gather_moves(
         body: &Body<'tcx>,
         tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
         filter: impl Fn(Ty<'tcx>) -> bool,
     ) -> MoveData<'tcx> {
-        builder::gather_moves(body, tcx, param_env, filter)
+        builder::gather_moves(body, tcx, filter)
     }
 
-    /// For the move path `mpi`, returns the root local variable (if any) that starts the path.
-    /// (e.g., for a path like `a.b.c` returns `Some(a)`)
-    pub fn base_local(&self, mut mpi: MovePathIndex) -> Option<Local> {
+    /// For the move path `mpi`, returns the root local variable that starts the path.
+    /// (e.g., for a path like `a.b.c` returns `a`)
+    pub fn base_local(&self, mut mpi: MovePathIndex) -> Local {
         loop {
             let path = &self.move_paths[mpi];
             if let Some(l) = path.place.as_local() {
-                return Some(l);
+                return l;
             }
-            if let Some(parent) = path.parent {
-                mpi = parent;
-                continue;
-            } else {
-                return None;
-            }
+            mpi = path.parent.expect("root move paths should be locals");
         }
     }
 

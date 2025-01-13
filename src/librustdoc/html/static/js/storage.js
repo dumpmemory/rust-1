@@ -196,29 +196,34 @@ updateTheme();
 // This needs to be done here because this JS is render-blocking,
 // so that the sidebar doesn't "jump" after appearing on screen.
 // The user interaction to change this is set up in main.js.
+//
+// At this point in page load, `document.body` is not available yet.
+// Set a class on the `<html>` element instead.
 if (getSettingValue("source-sidebar-show") === "true") {
-    // At this point in page load, `document.body` is not available yet.
-    // Set a class on the `<html>` element instead.
     addClass(document.documentElement, "src-sidebar-expanded");
 }
 if (getSettingValue("hide-sidebar") === "true") {
-    // At this point in page load, `document.body` is not available yet.
-    // Set a class on the `<html>` element instead.
     addClass(document.documentElement, "hide-sidebar");
+}
+if (getSettingValue("hide-toc") === "true") {
+    addClass(document.documentElement, "hide-toc");
+}
+if (getSettingValue("hide-modnav") === "true") {
+    addClass(document.documentElement, "hide-modnav");
 }
 function updateSidebarWidth() {
     const desktopSidebarWidth = getSettingValue("desktop-sidebar-width");
     if (desktopSidebarWidth && desktopSidebarWidth !== "null") {
         document.documentElement.style.setProperty(
             "--desktop-sidebar-width",
-            desktopSidebarWidth + "px"
+            desktopSidebarWidth + "px",
         );
     }
     const srcSidebarWidth = getSettingValue("src-sidebar-width");
     if (srcSidebarWidth && srcSidebarWidth !== "null") {
         document.documentElement.style.setProperty(
             "--src-sidebar-width",
-            srcSidebarWidth + "px"
+            srcSidebarWidth + "px",
         );
     }
 }
@@ -239,3 +244,59 @@ window.addEventListener("pageshow", ev => {
         setTimeout(updateSidebarWidth, 0);
     }
 });
+
+// Custom elements are used to insert some JS-dependent features into Rustdoc,
+// because the [parser] runs the connected callback
+// synchronously. It needs to be added synchronously so that nothing below it
+// becomes visible until after it's done. Otherwise, you get layout jank.
+//
+// That's also why this is in storage.js and not main.js.
+//
+// [parser]: https://html.spec.whatwg.org/multipage/parsing.html
+class RustdocSearchElement extends HTMLElement {
+    constructor() {
+        super();
+    }
+    connectedCallback() {
+        const rootPath = getVar("root-path");
+        const currentCrate = getVar("current-crate");
+        this.innerHTML = `<nav class="sub">
+            <form class="search-form">
+                <span></span> <!-- This empty span is a hacky fix for Safari - See #93184 -->
+                <div id="sidebar-button" tabindex="-1">
+                    <a href="${rootPath}${currentCrate}/all.html" title="show sidebar"></a>
+                </div>
+                <input
+                    class="search-input"
+                    name="search"
+                    aria-label="Run search in the documentation"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="Type ‘S’ or ‘/’ to search, ‘?’ for more options…"
+                    type="search">
+            </form>
+        </nav>`;
+    }
+}
+window.customElements.define("rustdoc-search", RustdocSearchElement);
+class RustdocToolbarElement extends HTMLElement {
+    constructor() {
+        super();
+    }
+    connectedCallback() {
+        // Avoid replacing the children after they're already here.
+        if (this.firstElementChild) {
+            return;
+        }
+        const rootPath = getVar("root-path");
+        this.innerHTML = `
+        <div id="settings-menu" tabindex="-1">
+            <a href="${rootPath}settings.html"><span class="label">Settings</span></a>
+        </div>
+        <div id="help-button" tabindex="-1">
+            <a href="${rootPath}help.html"><span class="label">Help</span></a>
+        </div>
+        <button id="toggle-all-docs"><span class="label">Summary</span></button>`;
+    }
+}
+window.customElements.define("rustdoc-toolbar", RustdocToolbarElement);

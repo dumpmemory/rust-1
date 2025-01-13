@@ -1,29 +1,30 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{expr_or_init, get_trait_def_id, path_def_id};
+use clippy_utils::{expr_or_init, fn_def_id_with_node_args, path_def_id};
 use rustc_ast::BinOpKind;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::intravisit::{walk_body, walk_expr, FnKind, Visitor};
+use rustc_hir::intravisit::{FnKind, Visitor, walk_body, walk_expr};
 use rustc_hir::{Body, Expr, ExprKind, FnDecl, HirId, Item, ItemKind, Node, QPath, TyKind};
-use rustc_hir_analysis::hir_ty_to_ty;
+use rustc_hir_analysis::lower_ty;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, AssocKind, Ty, TyCtxt};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::{kw, Ident};
-use rustc_span::{sym, Span};
-use rustc_trait_selection::traits::error_reporting::suggestions::ReturnsVisitor;
+use rustc_span::symbol::{Ident, kw};
+use rustc_span::{Span, sym};
+use rustc_trait_selection::error_reporting::traits::suggestions::ReturnsVisitor;
+use std::ops::ControlFlow;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks that there isn't an infinite recursion in `PartialEq` trait
-    /// implementation.
+    /// Checks that there isn't an infinite recursion in trait
+    /// implementations.
     ///
     /// ### Why is this bad?
-    /// This is a hard to find infinite recursion which will crashing any code
+    /// This is a hard to find infinite recursion that will crash any code
     /// using it.
     ///
     /// ### Example
@@ -42,7 +43,7 @@ declare_clippy_lint! {
     /// Use instead:
     ///
     /// In such cases, either use `#[derive(PartialEq)]` or don't implement it.
-    #[clippy::version = "1.76.0"]
+    #[clippy::version = "1.77.0"]
     pub UNCONDITIONAL_RECURSION,
     suspicious,
     "detect unconditional recursion in some traits implementation"
@@ -74,7 +75,7 @@ fn get_hir_ty_def_id<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: rustc_hir::Ty<'tcx>) -> Op
     match qpath {
         QPath::Resolved(_, path) => path.res.opt_def_id(),
         QPath::TypeRelative(_, _) => {
-            let ty = hir_ty_to_ty(tcx, &hir_ty);
+            let ty = lower_ty(tcx, &hir_ty);
 
             match ty.kind() {
                 ty::Alias(ty::Projection, proj) => {
@@ -201,7 +202,6 @@ fn check_partial_eq(cx: &LateContext<'_>, method_span: Span, method_def_id: Loca
     }
 }
 
-#[allow(clippy::unnecessary_def_path)]
 fn check_to_string(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId, name: Ident, expr: &Expr<'_>) {
     let args = cx
         .tcx
@@ -224,7 +224,7 @@ fn check_to_string(cx: &LateContext<'_>, method_span: Span, method_def_id: Local
         && let Some(trait_) = impl_.of_trait
         && let Some(trait_def_id) = trait_.trait_def_id()
         // The trait is `ToString`.
-        && Some(trait_def_id) == get_trait_def_id(cx, &["alloc", "string", "ToString"])
+        && cx.tcx.is_diagnostic_item(sym::ToString, trait_def_id)
     {
         let is_bad = match expr.kind {
             ExprKind::MethodCall(segment, _receiver, &[_arg], _) if segment.ident.name == name.name => {
@@ -257,13 +257,10 @@ fn is_default_method_on_current_ty<'tcx>(tcx: TyCtxt<'tcx>, qpath: QPath<'tcx>, 
             }
             if matches!(
                 ty.kind,
-                TyKind::Path(QPath::Resolved(
-                    _,
-                    hir::Path {
-                        res: Res::SelfTyAlias { .. },
-                        ..
-                    },
-                ))
+                TyKind::Path(QPath::Resolved(_, hir::Path {
+                    res: Res::SelfTyAlias { .. },
+                    ..
+                },))
             ) {
                 return true;
             }
@@ -277,7 +274,6 @@ struct CheckCalls<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     map: Map<'tcx>,
     implemented_ty_id: DefId,
-    found_default_call: bool,
     method_span: Span,
 }
 
@@ -286,36 +282,33 @@ where
     'tcx: 'a,
 {
     type NestedFilter = nested_filter::OnlyBodies;
+    type Result = ControlFlow<()>;
 
     fn nested_visit_map(&mut self) -> Self::Map {
         self.map
     }
 
-    #[allow(clippy::unnecessary_def_path)]
-    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if self.found_default_call {
-            return;
-        }
-        walk_expr(self, expr);
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) -> ControlFlow<()> {
+        walk_expr(self, expr)?;
 
         if let ExprKind::Call(f, _) = expr.kind
             && let ExprKind::Path(qpath) = f.kind
             && is_default_method_on_current_ty(self.cx.tcx, qpath, self.implemented_ty_id)
             && let Some(method_def_id) = path_def_id(self.cx, f)
             && let Some(trait_def_id) = self.cx.tcx.trait_of_item(method_def_id)
-            && Some(trait_def_id) == get_trait_def_id(self.cx, &["core", "default", "Default"])
+            && self.cx.tcx.is_diagnostic_item(sym::Default, trait_def_id)
         {
-            self.found_default_call = true;
             span_error(self.cx, self.method_span, expr);
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
     }
 }
 
 impl UnconditionalRecursion {
-    #[allow(clippy::unnecessary_def_path)]
     fn init_default_impl_for_type_if_needed(&mut self, cx: &LateContext<'_>) {
         if self.default_impl_for_type.is_empty()
-            && let Some(default_trait_id) = get_trait_def_id(cx, &["core", "default", "Default"])
+            && let Some(default_trait_id) = cx.tcx.get_diagnostic_item(sym::Default)
         {
             let impls = cx.tcx.trait_impls_of(default_trait_id);
             for (ty, impl_def_ids) in impls.non_blanket_impls() {
@@ -339,7 +332,7 @@ impl UnconditionalRecursion {
                         // We need to use typeck here to infer the actual function being called.
                         && let body_def_id = cx.tcx.hir().enclosing_body_owner(call_expr.hir_id)
                         && let Some(body_owner) = cx.tcx.hir().maybe_body_owned_by(body_def_id)
-                        && let typeck = cx.tcx.typeck_body(body_owner)
+                        && let typeck = cx.tcx.typeck_body(body_owner.id())
                         && let Some(call_def_id) = typeck.type_dependent_def_id(call_expr.hir_id)
                     {
                         self.default_impl_for_type.insert(self_def_id, call_def_id);
@@ -386,11 +379,38 @@ impl UnconditionalRecursion {
                 cx,
                 map: cx.tcx.hir(),
                 implemented_ty_id,
-                found_default_call: false,
                 method_span,
             };
             walk_body(&mut c, body);
         }
+    }
+}
+
+fn check_from(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId, expr: &Expr<'_>) {
+    let Some(sig) = cx
+        .typeck_results()
+        .liberated_fn_sigs()
+        .get(cx.tcx.local_def_id_to_hir_id(method_def_id))
+    else {
+        return;
+    };
+
+    // Check if we are calling `Into::into` where the node args match with our `From::from` signature:
+    // From::from signature: fn(S1) -> S2
+    // <S1 as Into<S2>>::into(s1), node_args=[S1, S2]
+    // If they do match, then it must mean that it is the blanket impl,
+    // which calls back into our `From::from` again (`Into` is not specializable).
+    // rustc's unconditional_recursion already catches calling `From::from` directly
+    if let Some((fn_def_id, node_args)) = fn_def_id_with_node_args(cx, expr)
+        && let [s1, s2] = **node_args
+        && let (Some(s1), Some(s2)) = (s1.as_type(), s2.as_type())
+        && let Some(trait_def_id) = cx.tcx.trait_of_item(fn_def_id)
+        && cx.tcx.is_diagnostic_item(sym::Into, trait_def_id)
+        && get_impl_trait_def_id(cx, method_def_id) == cx.tcx.get_diagnostic_item(sym::From)
+        && s1 == sig.inputs()[0]
+        && s2 == sig.output()
+    {
+        span_error(cx, method_span, expr);
     }
 }
 
@@ -410,10 +430,11 @@ impl<'tcx> LateLintPass<'tcx> for UnconditionalRecursion {
             // Doesn't have a conditional return.
             && !has_conditional_return(body, expr)
         {
-            if name.name == sym::eq || name.name == sym::ne {
-                check_partial_eq(cx, method_span, method_def_id, name, expr);
-            } else if name.name == sym::to_string {
-                check_to_string(cx, method_span, method_def_id, name, expr);
+            match name.name {
+                sym::eq | sym::ne => check_partial_eq(cx, method_span, method_def_id, name, expr),
+                sym::to_string => check_to_string(cx, method_span, method_def_id, name, expr),
+                sym::from => check_from(cx, method_span, method_def_id, expr),
+                _ => {},
             }
             self.check_default_new(cx, decl, body, method_span, method_def_id);
         }

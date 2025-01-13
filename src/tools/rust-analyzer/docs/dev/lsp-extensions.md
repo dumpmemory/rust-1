@@ -1,5 +1,5 @@
 <!---
-lsp/ext.rs hash: 6bc140531b403717
+lsp/ext.rs hash: 6dd762ae19630ec0
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -372,16 +372,52 @@ interface Runnable {
 }
 ```
 
-rust-analyzer supports only one `kind`, `"cargo"`. The `args` for `"cargo"` look like this:
+rust-analyzer supports two `kind`s of runnables, `"cargo"` and `"shell"`. The `args` for `"cargo"` look like this:
 
 ```typescript
 {
+    /**
+     * Environment variables to set before running the command.
+     */
+    environment?: Record<string, string>;
+    /**
+     * The working directory to run the command in.
+     */
+    cwd: string;
+    /**
+     * The workspace root directory of the cargo project.
+     */
     workspaceRoot?: string;
+    /**
+     * The cargo command to run.
+     */
     cargoArgs: string[];
-    cargoExtraArgs: string[];
+    /**
+     * Arguments to pass to the executable, these will be passed to the command after a `--` argument.
+     */
     executableArgs: string[];
-    expectTest?: boolean;
+    /**
+     * Command to execute instead of `cargo`.
+     */
     overrideCargo?: string;
+}
+```
+
+The args for `"shell"` look like this:
+
+```typescript
+{
+    /**
+     * Environment variables to set before running the command.
+     */
+    environment?: Record<string, string>;
+    /**
+     * The working directory to run the command in.
+     */
+    cwd: string;
+    kind: string;
+    program: string;
+    args: string[];
 }
 ```
 
@@ -417,7 +453,7 @@ interface TestItem {
     // A human readable name for this test
     label: string;
     // The kind of this test item. Based on the kind,
-	// an icon is chosen by the editor. 
+	// an icon is chosen by the editor.
     kind: "package" | "module" | "test";
     // True if this test may have children not available eagerly
     canResolveChildren: boolean;
@@ -440,7 +476,11 @@ interface DiscoverTestResults {
     // For each test which its id is in this list, the response
     // contains all tests that are children of this test, and
     // client should remove old tests not included in the response.
-    scope: string[];
+    scope: string[] | undefined;
+    // For each file which its uri is in this list, the response
+    // contains all tests that are located in this file, and
+    // client should remove old tests not included in the response.
+    scopeFile: lc.TextDocumentIdentifier[] | undefined;
 }
 ```
 
@@ -492,9 +532,9 @@ a `experimental/endRunTest` when is done.
 **Notification:** `ChangeTestStateParams`
 
 ```typescript
-type TestState = { tag: "passed" } 
+type TestState = { tag: "passed" }
     | {
-        tag: "failed"; 
+        tag: "failed";
         // The standard error of the test, containing the panic message. Clients should
         // render it similar to a terminal, and e.g. handle ansi colors.
         message: string;
@@ -508,6 +548,13 @@ interface ChangeTestStateParams {
     state: TestState;
 }
 ```
+
+**Method:** `experimental/appendOutputToRunTest`
+
+**Notification:** `string`
+
+This notification is used for reporting messages independent of any single test and related to the run session
+in general, e.g. cargo compiling progress messages or warnings.
 
 ## Open External Documentation
 
@@ -568,25 +615,6 @@ Reloads project information (that is, re-executes `cargo metadata`).
 **Response:** `null`
 
 Rebuilds build scripts and proc-macros, and runs the build scripts to reseed the build data.
-
-## Unindexed Project
-
-**Experimental Client Capability:** `{ "unindexedProject": boolean }`
-
-**Method:** `rust-analyzer/unindexedProject`
-
-**Notification:**
-
-```typescript
-interface UnindexedProjectParams {
-    /// A list of documents that rust-analyzer has determined are not indexed.
-    textDocuments: lc.TextDocumentIdentifier[]
-}
-```
-
-This notification is sent from the server to the client. The client is expected
-to determine the appropriate owners of `textDocuments` and update `linkedProjects`
-if an owner can be determined successfully.
 
 ## Server Status
 
@@ -760,14 +788,6 @@ interface ViewCrateGraphParams {
 Renders rust-analyzer's crate graph as an SVG image.
 
 If `full` is `true`, the graph includes non-workspace crates (crates.io dependencies as well as sysroot crates).
-
-## Shuffle Crate Graph
-
-**Method:** `rust-analyzer/shuffleCrateGraph`
-
-**Request:** `null`
-
-Shuffles the crate IDs in the crate graph, for debugging purposes.
 
 ## Expand Macro
 

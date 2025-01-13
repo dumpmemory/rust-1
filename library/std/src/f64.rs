@@ -15,17 +15,17 @@
 #[cfg(test)]
 mod tests;
 
+#[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
+pub use core::f64::{
+    DIGITS, EPSILON, INFINITY, MANTISSA_DIGITS, MAX, MAX_10_EXP, MAX_EXP, MIN, MIN_10_EXP, MIN_EXP,
+    MIN_POSITIVE, NAN, NEG_INFINITY, RADIX, consts,
+};
+
 #[cfg(not(test))]
 use crate::intrinsics;
 #[cfg(not(test))]
 use crate::sys::cmath;
-
-#[stable(feature = "rust1", since = "1.0.0")]
-#[allow(deprecated, deprecated_in_future)]
-pub use core::f64::{
-    consts, DIGITS, EPSILON, INFINITY, MANTISSA_DIGITS, MAX, MAX_10_EXP, MAX_EXP, MIN, MIN_10_EXP,
-    MIN_EXP, MIN_POSITIVE, NAN, NEG_INFINITY, RADIX,
-};
 
 #[cfg(not(test))]
 impl f64 {
@@ -176,82 +176,6 @@ impl f64 {
         self - self.trunc()
     }
 
-    /// Computes the absolute value of `self`.
-    ///
-    /// This function always returns the precise result.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let x = 3.5_f64;
-    /// let y = -3.5_f64;
-    ///
-    /// assert_eq!(x.abs(), x);
-    /// assert_eq!(y.abs(), -y);
-    ///
-    /// assert!(f64::NAN.abs().is_nan());
-    /// ```
-    #[rustc_allow_incoherent_impl]
-    #[must_use = "method returns a new number and does not mutate the original value"]
-    #[stable(feature = "rust1", since = "1.0.0")]
-    #[inline]
-    pub fn abs(self) -> f64 {
-        unsafe { intrinsics::fabsf64(self) }
-    }
-
-    /// Returns a number that represents the sign of `self`.
-    ///
-    /// - `1.0` if the number is positive, `+0.0` or `INFINITY`
-    /// - `-1.0` if the number is negative, `-0.0` or `NEG_INFINITY`
-    /// - NaN if the number is NaN
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let f = 3.5_f64;
-    ///
-    /// assert_eq!(f.signum(), 1.0);
-    /// assert_eq!(f64::NEG_INFINITY.signum(), -1.0);
-    ///
-    /// assert!(f64::NAN.signum().is_nan());
-    /// ```
-    #[rustc_allow_incoherent_impl]
-    #[must_use = "method returns a new number and does not mutate the original value"]
-    #[stable(feature = "rust1", since = "1.0.0")]
-    #[inline]
-    pub fn signum(self) -> f64 {
-        if self.is_nan() { Self::NAN } else { 1.0_f64.copysign(self) }
-    }
-
-    /// Returns a number composed of the magnitude of `self` and the sign of
-    /// `sign`.
-    ///
-    /// Equal to `self` if the sign of `self` and `sign` are the same, otherwise
-    /// equal to `-self`. If `self` is a NaN, then a NaN with the sign bit of
-    /// `sign` is returned. Note, however, that conserving the sign bit on NaN
-    /// across arithmetical operations is not generally guaranteed.
-    /// See [explanation of NaN as a special value](primitive@f32) for more info.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let f = 3.5_f64;
-    ///
-    /// assert_eq!(f.copysign(0.42), 3.5_f64);
-    /// assert_eq!(f.copysign(-0.42), -3.5_f64);
-    /// assert_eq!((-f).copysign(0.42), 3.5_f64);
-    /// assert_eq!((-f).copysign(-0.42), -3.5_f64);
-    ///
-    /// assert!(f64::NAN.copysign(1.0).is_nan());
-    /// ```
-    #[rustc_allow_incoherent_impl]
-    #[must_use = "method returns a new number and does not mutate the original value"]
-    #[stable(feature = "copysign", since = "1.35.0")]
-    #[inline]
-    pub fn copysign(self, sign: f64) -> f64 {
-        unsafe { intrinsics::copysignf64(self, sign) }
-    }
-
     /// Fused multiply-add. Computes `(self * a) + b` with only one rounding
     /// error, yielding a more accurate result than an unfused multiply-add.
     ///
@@ -286,6 +210,7 @@ impl f64 {
     /// assert_eq!(one_plus_eps * one_minus_eps + minus_one, 0.0);
     /// ```
     #[rustc_allow_incoherent_impl]
+    #[doc(alias = "fma", alias = "fusedMultiplyAdd")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
@@ -371,9 +296,10 @@ impl f64 {
     /// It might have a different sequence of rounding operations than `powf`,
     /// so the results are not guaranteed to agree.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -393,9 +319,10 @@ impl f64 {
 
     /// Raises a number to a floating point power.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -434,6 +361,7 @@ impl f64 {
     /// assert!(negative.sqrt().is_nan());
     /// assert!(negative_zero.sqrt() == negative_zero);
     /// ```
+    #[doc(alias = "squareRoot")]
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -444,9 +372,10 @@ impl f64 {
 
     /// Returns `e^(self)`, (the exponential function).
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -470,9 +399,10 @@ impl f64 {
 
     /// Returns `2^(self)`.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -494,9 +424,10 @@ impl f64 {
 
     /// Returns the natural logarithm of the number.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -515,7 +446,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn ln(self) -> f64 {
-        crate::sys::log_wrapper(self, |n| unsafe { intrinsics::logf64(n) })
+        unsafe { intrinsics::logf64(self) }
     }
 
     /// Returns the logarithm of the number with respect to an arbitrary base.
@@ -524,9 +455,10 @@ impl f64 {
     /// `self.log2()` can produce more accurate results for base 2, and
     /// `self.log10()` can produce more accurate results for base 10.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -548,9 +480,10 @@ impl f64 {
 
     /// Returns the base 2 logarithm of the number.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -567,14 +500,15 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn log2(self) -> f64 {
-        crate::sys::log_wrapper(self, crate::sys::log2f64)
+        unsafe { intrinsics::log2f64(self) }
     }
 
     /// Returns the base 10 logarithm of the number.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -591,7 +525,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn log10(self) -> f64 {
-        crate::sys::log_wrapper(self, |n| unsafe { intrinsics::log10f64(n) })
+        unsafe { intrinsics::log10f64(self) }
     }
 
     /// The positive difference of two numbers.
@@ -599,9 +533,10 @@ impl f64 {
     /// * If `self <= other`: `0.0`
     /// * Else: `self - other`
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `fdim` from libc on Unix and
     /// Windows. Note that this might change in the future.
     ///
@@ -637,9 +572,10 @@ impl f64 {
 
     /// Returns the cube root of a number.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `cbrt` from libc on Unix and
     /// Windows. Note that this might change in the future.
     ///
@@ -666,9 +602,10 @@ impl f64 {
     /// right-angle triangle with other sides having length `x.abs()` and
     /// `y.abs()`.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `hypot` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -693,9 +630,10 @@ impl f64 {
 
     /// Computes the sine of a number (in radians).
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -716,9 +654,10 @@ impl f64 {
 
     /// Computes the cosine of a number (in radians).
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -739,9 +678,10 @@ impl f64 {
 
     /// Computes the tangent of a number (in radians).
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `tan` from libc on Unix and
     /// Windows. Note that this might change in the future.
     ///
@@ -765,9 +705,10 @@ impl f64 {
     /// the range [-pi/2, pi/2] or NaN if the number is outside the range
     /// [-1, 1].
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `asin` from libc on Unix and
     /// Windows. Note that this might change in the future.
     ///
@@ -794,9 +735,10 @@ impl f64 {
     /// the range [0, pi] or NaN if the number is outside the range
     /// [-1, 1].
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `acos` from libc on Unix and
     /// Windows. Note that this might change in the future.
     ///
@@ -822,9 +764,10 @@ impl f64 {
     /// Computes the arctangent of a number. Return value is in radians in the
     /// range [-pi/2, pi/2];
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `atan` from libc on Unix and
     /// Windows. Note that this might change in the future.
     ///
@@ -854,9 +797,10 @@ impl f64 {
     /// * `y >= 0`: `arctan(y/x) + pi` -> `(pi/2, pi]`
     /// * `y < 0`: `arctan(y/x) - pi` -> `(-pi, -pi/2)`
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `atan2` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -890,9 +834,10 @@ impl f64 {
     /// Simultaneously computes the sine and cosine of the number, `x`. Returns
     /// `(sin(x), cos(x))`.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `(f64::sin(x),
     /// f64::cos(x))`. Note that this might change in the future.
     ///
@@ -919,9 +864,10 @@ impl f64 {
     /// Returns `e^(self) - 1` in a way that is accurate even if the
     /// number is close to zero.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `expm1` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -947,9 +893,10 @@ impl f64 {
     /// Returns `ln(1+n)` (natural logarithm) more accurately than if
     /// the operations were performed separately.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `log1p` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -975,9 +922,10 @@ impl f64 {
 
     /// Hyperbolic sine function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `sinh` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -1004,9 +952,10 @@ impl f64 {
 
     /// Hyperbolic cosine function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `cosh` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -1033,9 +982,10 @@ impl f64 {
 
     /// Hyperbolic tangent function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `tanh` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -1062,9 +1012,10 @@ impl f64 {
 
     /// Inverse hyperbolic sine function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -1089,9 +1040,10 @@ impl f64 {
 
     /// Inverse hyperbolic cosine function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -1118,9 +1070,10 @@ impl f64 {
 
     /// Inverse hyperbolic tangent function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     ///
     /// # Examples
     ///
@@ -1143,9 +1096,10 @@ impl f64 {
 
     /// Gamma function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `tgamma` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///
@@ -1171,9 +1125,10 @@ impl f64 {
     ///
     /// The integer part of the tuple indicates the sign of the gamma function.
     ///
-    /// # Platform-specific precision
+    /// # Unspecified precision
     ///
-    /// The precision of this function varies by platform and Rust version.
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
     /// This function currently corresponds to the `lgamma_r` from libc on Unix
     /// and Windows. Note that this might change in the future.
     ///

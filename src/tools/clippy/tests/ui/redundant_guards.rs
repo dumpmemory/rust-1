@@ -1,6 +1,6 @@
 //@aux-build:proc_macros.rs
 #![feature(if_let_guard)]
-#![allow(clippy::no_effect, unused, clippy::single_match)]
+#![allow(clippy::no_effect, unused, clippy::single_match, invalid_nan_comparisons)]
 #![warn(clippy::redundant_guards)]
 
 #[macro_use]
@@ -20,11 +20,20 @@ struct FloatWrapper(f32);
 fn issue11304() {
     match 0.1 {
         x if x == 0.0 => todo!(),
+        // Pattern matching NAN is illegal
+        x if x == f64::NAN => todo!(),
         _ => todo!(),
     }
     match FloatWrapper(0.1) {
         x if x == FloatWrapper(0.0) => todo!(),
         _ => todo!(),
+    }
+}
+
+fn issue13681() {
+    match c"hi" {
+        x if x == c"hi" => (),
+        _ => (),
     }
 }
 
@@ -132,6 +141,18 @@ fn f(s: Option<std::ffi::OsString>) {
     match s {
         Some(x) if x == "a" => {},
         Some(x) if "a" == x => {},
+        _ => {},
+    }
+}
+
+fn not_matches() {
+    match Some(42) {
+        // The pattern + guard is not equivalent to `Some(42)` because of the `panic!`
+        Some(v)
+            if match v {
+                42 => true,
+                _ => panic!(),
+            } => {},
         _ => {},
     }
 }

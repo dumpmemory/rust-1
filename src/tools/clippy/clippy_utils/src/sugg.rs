@@ -11,7 +11,6 @@ use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::{Closure, ExprKind, HirId, MutTy, TyKind};
 use rustc_hir_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
-use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{EarlyContext, LateContext, LintContext};
 use rustc_middle::hir::place::ProjectionKind;
 use rustc_middle::mir::{FakeReadCause, Mutability};
@@ -41,7 +40,7 @@ pub const ONE: Sugg<'static> = Sugg::NonParen(Cow::Borrowed("1"));
 pub const EMPTY: Sugg<'static> = Sugg::NonParen(Cow::Borrowed(""));
 
 impl Display for Sugg<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match *self {
             Sugg::NonParen(ref s) | Sugg::MaybeParen(ref s) => s.fmt(f),
             Sugg::BinOp(op, ref lhs, ref rhs) => binop_to_string(op, lhs, rhs).fmt(f),
@@ -53,7 +52,8 @@ impl Display for Sugg<'_> {
 impl<'a> Sugg<'a> {
     /// Prepare a suggestion from an expression.
     pub fn hir_opt(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Self> {
-        let get_snippet = |span| snippet(cx, span, "");
+        let ctxt = expr.span.ctxt();
+        let get_snippet = |span| snippet_with_context(cx, span, ctxt, "", &mut Applicability::Unspecified).0;
         snippet_opt(cx, expr.span).map(|_| Self::hir_from_snippet(expr, get_snippet))
     }
 
@@ -68,8 +68,7 @@ impl<'a> Sugg<'a> {
     /// - Applicability level `Unspecified` will never be changed.
     /// - If the span is inside a macro, change the applicability level to `MaybeIncorrect`.
     /// - If the default value is used and the applicability level is `MachineApplicable`, change it
-    ///   to
-    /// `HasPlaceholders`
+    ///   to `HasPlaceholders`
     pub fn hir_with_applicability(
         cx: &LateContext<'_>,
         expr: &hir::Expr<'_>,
@@ -102,7 +101,9 @@ impl<'a> Sugg<'a> {
         applicability: &mut Applicability,
     ) -> Self {
         if expr.span.ctxt() == ctxt {
-            Self::hir_from_snippet(expr, |span| snippet(cx, span, default))
+            Self::hir_from_snippet(expr, |span| {
+                snippet_with_context(cx, span, ctxt, default, applicability).0
+            })
         } else {
             let (snip, _) = snippet_with_context(cx, expr.span, ctxt, default, applicability);
             Sugg::NonParen(snip)
@@ -111,7 +112,7 @@ impl<'a> Sugg<'a> {
 
     /// Generate a suggestion for an expression with the given snippet. This is used by the `hir_*`
     /// function variants of `Sugg`, since these use different snippet functions.
-    fn hir_from_snippet(expr: &hir::Expr<'_>, get_snippet: impl Fn(Span) -> Cow<'a, str>) -> Self {
+    fn hir_from_snippet(expr: &hir::Expr<'_>, mut get_snippet: impl FnMut(Span) -> Cow<'a, str>) -> Self {
         if let Some(range) = higher::Range::hir(expr) {
             let op = match range.limits {
                 ast::RangeLimits::HalfOpen => AssocOp::DotDot,
@@ -124,48 +125,49 @@ impl<'a> Sugg<'a> {
         }
 
         match expr.kind {
-            hir::ExprKind::AddrOf(..)
-            | hir::ExprKind::If(..)
-            | hir::ExprKind::Let(..)
-            | hir::ExprKind::Closure { .. }
-            | hir::ExprKind::Unary(..)
-            | hir::ExprKind::Match(..) => Sugg::MaybeParen(get_snippet(expr.span)),
-            hir::ExprKind::Continue(..)
-            | hir::ExprKind::Yield(..)
-            | hir::ExprKind::Array(..)
-            | hir::ExprKind::Block(..)
-            | hir::ExprKind::Break(..)
-            | hir::ExprKind::Call(..)
-            | hir::ExprKind::Field(..)
-            | hir::ExprKind::Index(..)
-            | hir::ExprKind::InlineAsm(..)
-            | hir::ExprKind::OffsetOf(..)
-            | hir::ExprKind::ConstBlock(..)
-            | hir::ExprKind::Lit(..)
-            | hir::ExprKind::Loop(..)
-            | hir::ExprKind::MethodCall(..)
-            | hir::ExprKind::Path(..)
-            | hir::ExprKind::Repeat(..)
-            | hir::ExprKind::Ret(..)
-            | hir::ExprKind::Become(..)
-            | hir::ExprKind::Struct(..)
-            | hir::ExprKind::Tup(..)
-            | hir::ExprKind::Err(_) => Sugg::NonParen(get_snippet(expr.span)),
-            hir::ExprKind::DropTemps(inner) => Self::hir_from_snippet(inner, get_snippet),
-            hir::ExprKind::Assign(lhs, rhs, _) => {
+            ExprKind::AddrOf(..)
+            | ExprKind::If(..)
+            | ExprKind::Let(..)
+            | ExprKind::Closure { .. }
+            | ExprKind::Unary(..)
+            | ExprKind::Match(..) => Sugg::MaybeParen(get_snippet(expr.span)),
+            ExprKind::Continue(..)
+            | ExprKind::Yield(..)
+            | ExprKind::Array(..)
+            | ExprKind::Block(..)
+            | ExprKind::Break(..)
+            | ExprKind::Call(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..)
+            | ExprKind::InlineAsm(..)
+            | ExprKind::OffsetOf(..)
+            | ExprKind::ConstBlock(..)
+            | ExprKind::Lit(..)
+            | ExprKind::Loop(..)
+            | ExprKind::MethodCall(..)
+            | ExprKind::Path(..)
+            | ExprKind::Repeat(..)
+            | ExprKind::Ret(..)
+            | ExprKind::Become(..)
+            | ExprKind::Struct(..)
+            | ExprKind::Tup(..)
+            | ExprKind::Err(_)
+            | ExprKind::UnsafeBinderCast(..) => Sugg::NonParen(get_snippet(expr.span)),
+            ExprKind::DropTemps(inner) => Self::hir_from_snippet(inner, get_snippet),
+            ExprKind::Assign(lhs, rhs, _) => {
                 Sugg::BinOp(AssocOp::Assign, get_snippet(lhs.span), get_snippet(rhs.span))
             },
-            hir::ExprKind::AssignOp(op, lhs, rhs) => {
+            ExprKind::AssignOp(op, lhs, rhs) => {
                 Sugg::BinOp(hirbinop2assignop(op), get_snippet(lhs.span), get_snippet(rhs.span))
             },
-            hir::ExprKind::Binary(op, lhs, rhs) => Sugg::BinOp(
+            ExprKind::Binary(op, lhs, rhs) => Sugg::BinOp(
                 AssocOp::from_ast_binop(op.node),
                 get_snippet(lhs.span),
                 get_snippet(rhs.span),
             ),
-            hir::ExprKind::Cast(lhs, ty) |
+            ExprKind::Cast(lhs, ty) |
             //FIXME(chenyukang), remove this after type ascription is removed from AST
-            hir::ExprKind::Type(lhs, ty) => Sugg::BinOp(AssocOp::As, get_snippet(lhs.span), get_snippet(ty.span)),
+            ExprKind::Type(lhs, ty) => Sugg::BinOp(AssocOp::As, get_snippet(lhs.span), get_snippet(ty.span)),
         }
     }
 
@@ -179,8 +181,10 @@ impl<'a> Sugg<'a> {
     ) -> Self {
         use rustc_ast::ast::RangeLimits;
 
+        let mut snippet = |span: Span| snippet_with_context(cx, span, ctxt, default, app).0;
+
         match expr.kind {
-            _ if expr.span.ctxt() != ctxt => Sugg::NonParen(snippet_with_context(cx, expr.span, ctxt, default, app).0),
+            _ if expr.span.ctxt() != ctxt => Sugg::NonParen(snippet(expr.span)),
             ast::ExprKind::AddrOf(..)
             | ast::ExprKind::Closure { .. }
             | ast::ExprKind::If(..)
@@ -223,46 +227,39 @@ impl<'a> Sugg<'a> {
             | ast::ExprKind::While(..)
             | ast::ExprKind::Await(..)
             | ast::ExprKind::Err(_)
-            | ast::ExprKind::Dummy => Sugg::NonParen(snippet_with_context(cx, expr.span, ctxt, default, app).0),
+            | ast::ExprKind::Dummy
+            | ast::ExprKind::UnsafeBinderCast(..) => Sugg::NonParen(snippet(expr.span)),
             ast::ExprKind::Range(ref lhs, ref rhs, RangeLimits::HalfOpen) => Sugg::BinOp(
                 AssocOp::DotDot,
-                lhs.as_ref().map_or("".into(), |lhs| {
-                    snippet_with_context(cx, lhs.span, ctxt, default, app).0
-                }),
-                rhs.as_ref().map_or("".into(), |rhs| {
-                    snippet_with_context(cx, rhs.span, ctxt, default, app).0
-                }),
+                lhs.as_ref().map_or("".into(), |lhs| snippet(lhs.span)),
+                rhs.as_ref().map_or("".into(), |rhs| snippet(rhs.span)),
             ),
             ast::ExprKind::Range(ref lhs, ref rhs, RangeLimits::Closed) => Sugg::BinOp(
                 AssocOp::DotDotEq,
-                lhs.as_ref().map_or("".into(), |lhs| {
-                    snippet_with_context(cx, lhs.span, ctxt, default, app).0
-                }),
-                rhs.as_ref().map_or("".into(), |rhs| {
-                    snippet_with_context(cx, rhs.span, ctxt, default, app).0
-                }),
+                lhs.as_ref().map_or("".into(), |lhs| snippet(lhs.span)),
+                rhs.as_ref().map_or("".into(), |rhs| snippet(rhs.span)),
             ),
             ast::ExprKind::Assign(ref lhs, ref rhs, _) => Sugg::BinOp(
                 AssocOp::Assign,
-                snippet_with_context(cx, lhs.span, ctxt, default, app).0,
-                snippet_with_context(cx, rhs.span, ctxt, default, app).0,
+                snippet(lhs.span),
+                snippet(rhs.span),
             ),
             ast::ExprKind::AssignOp(op, ref lhs, ref rhs) => Sugg::BinOp(
                 astbinop2assignop(op),
-                snippet_with_context(cx, lhs.span, ctxt, default, app).0,
-                snippet_with_context(cx, rhs.span, ctxt, default, app).0,
+                snippet(lhs.span),
+                snippet(rhs.span),
             ),
             ast::ExprKind::Binary(op, ref lhs, ref rhs) => Sugg::BinOp(
                 AssocOp::from_ast_binop(op.node),
-                snippet_with_context(cx, lhs.span, ctxt, default, app).0,
-                snippet_with_context(cx, rhs.span, ctxt, default, app).0,
+                snippet(lhs.span),
+                snippet(rhs.span),
             ),
             ast::ExprKind::Cast(ref lhs, ref ty) |
             //FIXME(chenyukang), remove this after type ascription is removed from AST
             ast::ExprKind::Type(ref lhs, ref ty) => Sugg::BinOp(
                 AssocOp::As,
-                snippet_with_context(cx, lhs.span, ctxt, default, app).0,
-                snippet_with_context(cx, ty.span, ctxt, default, app).0,
+                snippet(lhs.span),
+                snippet(ty.span),
             ),
         }
     }
@@ -356,6 +353,13 @@ impl<'a> Sugg<'a> {
                 let sugg = binop_to_string(op, &lhs, &rhs);
                 Sugg::NonParen(format!("({sugg})").into())
             },
+        }
+    }
+
+    pub fn into_string(self) -> String {
+        match self {
+            Sugg::NonParen(p) | Sugg::MaybeParen(p) => p.into_owned(),
+            Sugg::BinOp(b, l, r) => binop_to_string(b, &l, &r),
         }
     }
 }
@@ -508,7 +512,7 @@ impl<T> ParenHelper<T> {
 }
 
 impl<T: Display> Display for ParenHelper<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         if self.paren {
             write!(f, "({})", self.wrapped)
         } else {
@@ -801,7 +805,7 @@ pub struct DerefClosure {
 ///
 /// note: this only works on single line immutable closures with exactly one input parameter.
 pub fn deref_closure_args(cx: &LateContext<'_>, closure: &hir::Expr<'_>) -> Option<DerefClosure> {
-    if let hir::ExprKind::Closure(&Closure {
+    if let ExprKind::Closure(&Closure {
         fn_decl, def_id, body, ..
     }) = closure.kind
     {
@@ -824,8 +828,9 @@ pub fn deref_closure_args(cx: &LateContext<'_>, closure: &hir::Expr<'_>) -> Opti
             applicability: Applicability::MachineApplicable,
         };
 
-        let infcx = cx.tcx.infer_ctxt().build();
-        ExprUseVisitor::new(&mut visitor, &infcx, def_id, cx.param_env, cx.typeck_results()).consume_body(closure_body);
+        ExprUseVisitor::for_clippy(cx, def_id, &mut visitor)
+            .consume_body(closure_body)
+            .into_ok();
 
         if !visitor.suggestion_start.is_empty() {
             return Some(DerefClosure {
@@ -902,7 +907,7 @@ impl<'tcx> DerefDelegate<'_, 'tcx> {
             _ => return false,
         };
 
-        ty.map_or(false, |ty| matches!(ty.kind(), ty::Ref(_, inner, _) if inner.is_ref()))
+        ty.is_some_and(|ty| matches!(ty.kind(), ty::Ref(_, inner, _) if inner.is_ref()))
     }
 }
 

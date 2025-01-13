@@ -72,9 +72,7 @@ impl ImportScope {
     fn from(syntax: SyntaxNode) -> Option<Self> {
         use syntax::match_ast;
         fn contains_cfg_attr(attrs: &dyn HasAttrs) -> bool {
-            attrs
-                .attrs()
-                .any(|attr| attr.as_simple_call().map_or(false, |(ident, _)| ident == "cfg"))
+            attrs.attrs().any(|attr| attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg"))
         }
         match_ast! {
             match syntax {
@@ -102,9 +100,7 @@ impl ImportScope {
         sema: &Semantics<'_, RootDatabase>,
     ) -> Option<Self> {
         fn contains_cfg_attr(attrs: &dyn HasAttrs) -> bool {
-            attrs
-                .attrs()
-                .any(|attr| attr.as_simple_call().map_or(false, |(ident, _)| ident == "cfg"))
+            attrs.attrs().any(|attr| attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg"))
         }
 
         // Walk up the ancestor tree searching for a suitable node to do insertions on
@@ -176,7 +172,7 @@ pub fn insert_use(scope: &ImportScope, path: ast::Path, cfg: &InsertUseConfig) {
 
 pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUseConfig) {
     let text: &str = "use foo as _";
-    let parse = syntax::SourceFile::parse(text);
+    let parse = syntax::SourceFile::parse(text, span::Edition::CURRENT_FIXME);
     let node = parse
         .tree()
         .syntax()
@@ -194,7 +190,7 @@ fn insert_use_with_alias_option(
     cfg: &InsertUseConfig,
     alias: Option<ast::Rename>,
 ) {
-    let _p = tracing::span!(tracing::Level::INFO, "insert_use").entered();
+    let _p = tracing::info_span!("insert_use_with_alias_option").entered();
     let mut mb = match cfg.granularity {
         ImportGranularity::Crate => Some(MergeBehavior::Crate),
         ImportGranularity::Module => Some(MergeBehavior::Module),
@@ -487,7 +483,7 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
                     .contains(&token.kind())
             }
         })
-        .filter(|child| child.as_token().map_or(true, |t| t.kind() != SyntaxKind::WHITESPACE))
+        .filter(|child| child.as_token().is_none_or(|t| t.kind() != SyntaxKind::WHITESPACE))
         .last()
     {
         cov_mark::hit!(insert_empty_inner_attr);

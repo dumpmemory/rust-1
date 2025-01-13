@@ -1,10 +1,9 @@
 //@ aux-build:block-on.rs
 //@ edition:2018
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 //@ build-pass (since it ICEs during mono)
-
-#![feature(async_closure)]
 
 extern crate block_on;
 
@@ -14,7 +13,7 @@ async fn f(arg: &i32) {}
 
 async fn func<F>(f: F)
 where
-    F: async for<'a> Fn(&'a i32),
+    F: for<'a> AsyncFn(&'a i32),
 {
     let x: i32 = 0;
     f(&x).await;

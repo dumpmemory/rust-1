@@ -2,17 +2,16 @@
 //!
 //! Algorithm based on Loukas Georgiadis,
 //! "Linear-Time Algorithms for Dominators and Related Problems",
-//! <ftp://ftp.cs.princeton.edu/techreports/2005/737.pdf>
+//! <https://www.cs.princeton.edu/techreports/2005/737.pdf>
 //!
 //! Additionally useful is the original Lengauer-Tarjan paper on this subject,
 //! "A Fast Algorithm for Finding Dominators in a Flowgraph"
 //! Thomas Lengauer and Robert Endre Tarjan.
 //! <https://www.cs.princeton.edu/courses/archive/spr03/cs423/download/dominators.pdf>
 
-use super::ControlFlowGraph;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 
-use std::cmp::Ordering;
+use super::ControlFlowGraph;
 
 #[cfg(test)]
 mod tests;
@@ -63,16 +62,13 @@ fn is_small_path_graph<G: ControlFlowGraph>(g: &G) -> bool {
 }
 
 fn dominators_impl<G: ControlFlowGraph>(graph: &G) -> Inner<G::Node> {
-    // compute the post order index (rank) for each node
-    let mut post_order_rank = IndexVec::from_elem_n(0, graph.num_nodes());
-
     // We allocate capacity for the full set of nodes, because most of the time
     // most of the nodes *are* reachable.
     let mut parent: IndexVec<PreorderIndex, PreorderIndex> =
         IndexVec::with_capacity(graph.num_nodes());
 
     let mut stack = vec![PreOrderFrame {
-        pre_order_idx: PreorderIndex::new(0),
+        pre_order_idx: PreorderIndex::ZERO,
         iter: graph.successors(graph.start_node()),
     }];
     let mut pre_order_to_real: IndexVec<PreorderIndex, G::Node> =
@@ -80,20 +76,18 @@ fn dominators_impl<G: ControlFlowGraph>(graph: &G) -> Inner<G::Node> {
     let mut real_to_pre_order: IndexVec<G::Node, Option<PreorderIndex>> =
         IndexVec::from_elem_n(None, graph.num_nodes());
     pre_order_to_real.push(graph.start_node());
-    parent.push(PreorderIndex::new(0)); // the parent of the root node is the root for now.
-    real_to_pre_order[graph.start_node()] = Some(PreorderIndex::new(0));
-    let mut post_order_idx = 0;
+    parent.push(PreorderIndex::ZERO); // the parent of the root node is the root for now.
+    real_to_pre_order[graph.start_node()] = Some(PreorderIndex::ZERO);
 
     // Traverse the graph, collecting a number of things:
     //
     // * Preorder mapping (to it, and back to the actual ordering)
-    // * Postorder mapping (used exclusively for `cmp_in_dominator_order` on the final product)
     // * Parents for each vertex in the preorder tree
     //
     // These are all done here rather than through one of the 'standard'
     // graph traversals to help make this fast.
     'recurse: while let Some(frame) = stack.last_mut() {
-        while let Some(successor) = frame.iter.next() {
+        for successor in frame.iter.by_ref() {
             if real_to_pre_order[successor].is_none() {
                 let pre_order_idx = pre_order_to_real.push(successor);
                 real_to_pre_order[successor] = Some(pre_order_idx);
@@ -103,15 +97,13 @@ fn dominators_impl<G: ControlFlowGraph>(graph: &G) -> Inner<G::Node> {
                 continue 'recurse;
             }
         }
-        post_order_rank[pre_order_to_real[frame.pre_order_idx]] = post_order_idx;
-        post_order_idx += 1;
 
         stack.pop();
     }
 
     let reachable_vertices = pre_order_to_real.len();
 
-    let mut idom = IndexVec::from_elem_n(PreorderIndex::new(0), reachable_vertices);
+    let mut idom = IndexVec::from_elem_n(PreorderIndex::ZERO, reachable_vertices);
     let mut semi = IndexVec::from_fn_n(std::convert::identity, reachable_vertices);
     let mut label = semi.clone();
     let mut bucket = IndexVec::from_elem_n(vec![], reachable_vertices);
@@ -281,7 +273,7 @@ fn dominators_impl<G: ControlFlowGraph>(graph: &G) -> Inner<G::Node> {
 
     let time = compute_access_time(start_node, &immediate_dominators);
 
-    Inner { post_order_rank, immediate_dominators, time }
+    Inner { immediate_dominators, time }
 }
 
 /// Evaluate the link-eval virtual forest, providing the currently minimum semi
@@ -347,7 +339,6 @@ fn compress(
 /// Tracks the list of dominators for each node.
 #[derive(Clone, Debug)]
 struct Inner<N: Idx> {
-    post_order_rank: IndexVec<N, usize>,
     // Even though we track only the immediate dominator of each node, it's
     // possible to get its full list of dominators by looking up the dominator
     // of each dominator.
@@ -375,17 +366,6 @@ impl<Node: Idx> Dominators<Node> {
                 }
             }
             Kind::General(g) => g.immediate_dominators[node],
-        }
-    }
-
-    /// Provide deterministic ordering of nodes such that, if any two nodes have a dominator
-    /// relationship, the dominator will always precede the dominated. (The relative ordering
-    /// of two unrelated nodes will also be consistent, but otherwise the order has no
-    /// meaning.) This method cannot be used to determine if either Node dominates the other.
-    pub fn cmp_in_dominator_order(&self, lhs: Node, rhs: Node) -> Ordering {
-        match &self.kind {
-            Kind::Path => lhs.index().cmp(&rhs.index()),
-            Kind::General(g) => g.post_order_rank[rhs].cmp(&g.post_order_rank[lhs]),
         }
     }
 

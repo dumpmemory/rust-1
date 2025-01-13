@@ -1,4 +1,4 @@
-//! Implementation of `make clean` in rustbuild.
+//! `./x.py clean`
 //!
 //! Responsible for cleaning out a build directory of all old and stale
 //! artifacts to prepare for a fresh build. Currently doesn't remove the
@@ -9,9 +9,10 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-use crate::core::builder::{crate_description, Builder, RunConfig, ShouldRun, Step};
+use crate::core::builder::{Builder, RunConfig, ShouldRun, Step, crate_description};
+use crate::utils::build_stamp::BuildStamp;
 use crate::utils::helpers::t;
-use crate::{Build, Compiler, Mode, Subcommand};
+use crate::{Build, Compiler, Kind, Mode, Subcommand};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CleanAll {}
@@ -66,7 +67,7 @@ macro_rules! clean_crate_tree {
             fn run(self, builder: &Builder<'_>) -> Self::Output {
                 let compiler = self.compiler;
                 let target = compiler.host;
-                let mut cargo = builder.bare_cargo(compiler, $mode, target, "clean");
+                let mut cargo = builder.bare_cargo(compiler, $mode, target, Kind::Clean);
 
                 // Since https://github.com/rust-lang/rust/pull/111076 enables
                 // unstable cargo feature (`public-dependency`), we need to ensure
@@ -85,7 +86,7 @@ macro_rules! clean_crate_tree {
 
                 // NOTE: doesn't use `run_cargo` because we don't want to save a stamp file,
                 // and doesn't use `stream_cargo` to avoid passing `--message-format` which `clean` doesn't accept.
-                builder.run(&mut cargo);
+                cargo.run(builder);
             }
         }
     )+ }
@@ -121,7 +122,7 @@ fn clean(build: &Build, all: bool, stage: Option<u32>) {
 
 fn clean_specific_stage(build: &Build, stage: u32) {
     for host in &build.hosts {
-        let entries = match build.out.join(host.triple).read_dir() {
+        let entries = match build.out.join(host).read_dir() {
             Ok(iter) => iter,
             Err(_) => continue,
         };
@@ -146,9 +147,9 @@ fn clean_default(build: &Build) {
     rm_rf(&build.out.join("dist"));
     rm_rf(&build.out.join("bootstrap").join(".last-warned-change-id"));
     rm_rf(&build.out.join("bootstrap-shims-dump"));
-    rm_rf(&build.out.join("rustfmt.stamp"));
+    rm_rf(BuildStamp::new(&build.out).with_prefix("rustfmt").path());
 
-    let mut hosts: Vec<_> = build.hosts.iter().map(|t| build.out.join(t.triple)).collect();
+    let mut hosts: Vec<_> = build.hosts.iter().map(|t| build.out.join(t)).collect();
     // After cross-compilation, artifacts of the host architecture (which may differ from build.host)
     // might not get removed.
     // Adding its path (linked one for easier accessibility) will solve this problem.
@@ -181,39 +182,31 @@ fn rm_rf(path: &Path) {
         }
         Ok(metadata) => {
             if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                do_op(path, "remove file", |p| {
-                    fs::remove_file(p).or_else(|e| {
-                        // Work around the fact that we cannot
-                        // delete an executable while it runs on Windows.
-                        #[cfg(windows)]
+                do_op(path, "remove file", |p| match fs::remove_file(p) {
+                    #[cfg(windows)]
+                    Err(e)
                         if e.kind() == std::io::ErrorKind::PermissionDenied
                             && p.file_name().and_then(std::ffi::OsStr::to_str)
-                                == Some("bootstrap.exe")
-                        {
-                            eprintln!("WARNING: failed to delete '{}'.", p.display());
-                            return Ok(());
-                        }
-                        Err(e)
-                    })
+                                == Some("bootstrap.exe") =>
+                    {
+                        eprintln!("WARNING: failed to delete '{}'.", p.display());
+                        Ok(())
+                    }
+                    r => r,
                 });
+
                 return;
             }
 
             for file in t!(fs::read_dir(path)) {
                 rm_rf(&t!(file).path());
             }
-            do_op(path, "remove dir", |p| {
-                fs::remove_dir(p).or_else(|e| {
-                    // Check for dir not empty on Windows
-                    // FIXME: Once `ErrorKind::DirectoryNotEmpty` is stabilized,
-                    // match on `e.kind()` instead.
-                    #[cfg(windows)]
-                    if e.raw_os_error() == Some(145) {
-                        return Ok(());
-                    }
 
-                    Err(e)
-                })
+            do_op(path, "remove dir", |p| match fs::remove_dir(p) {
+                // Check for dir not empty on Windows
+                #[cfg(windows)]
+                Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => Ok(()),
+                r => r,
             });
         }
     };
@@ -228,14 +221,16 @@ where
         // On windows we can't remove a readonly file, and git will often clone files as readonly.
         // As a result, we have some special logic to remove readonly files on windows.
         // This is also the reason that we can't use things like fs::remove_dir_all().
-        Err(ref e) if cfg!(windows) && e.kind() == ErrorKind::PermissionDenied => {
+        #[cfg(windows)]
+        Err(ref e) if e.kind() == ErrorKind::PermissionDenied => {
             let m = t!(path.symlink_metadata());
             let mut p = m.permissions();
+            // this os not unix, so clippy gives FP
+            #[expect(clippy::permissions_set_readonly_false)]
             p.set_readonly(false);
             t!(fs::set_permissions(path, p));
             f(path).unwrap_or_else(|e| {
                 // Delete symlinked directories on Windows
-                #[cfg(windows)]
                 if m.file_type().is_symlink() && path.is_dir() && fs::remove_dir(path).is_ok() {
                     return;
                 }

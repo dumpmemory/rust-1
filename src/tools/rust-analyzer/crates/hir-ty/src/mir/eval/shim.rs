@@ -8,12 +8,17 @@ use hir_def::{
     builtin_type::{BuiltinInt, BuiltinUint},
     resolver::HasResolver,
 };
+use hir_expand::name::Name;
+use intern::{sym, Symbol};
 
-use crate::mir::eval::{
-    name, pad16, static_lifetime, Address, AdtId, Arc, BuiltinType, Evaluator, FunctionId,
-    HasModule, HirDisplay, Interned, InternedClosure, Interner, Interval, IntervalAndTy,
-    IntervalOrOwned, ItemContainerId, LangItem, Layout, Locals, Lookup, MirEvalError, MirSpan,
-    ModPath, Mutability, Result, Substitution, Ty, TyBuilder, TyExt,
+use crate::{
+    error_lifetime,
+    mir::eval::{
+        pad16, Address, AdtId, Arc, BuiltinType, Evaluator, FunctionId, HasModule, HirDisplay,
+        InternedClosure, Interner, Interval, IntervalAndTy, IntervalOrOwned, ItemContainerId,
+        LangItem, Layout, Locals, Lookup, MirEvalError, MirSpan, Mutability, Result, Substitution,
+        Ty, TyBuilder, TyExt,
+    },
 };
 
 mod simd;
@@ -22,6 +27,7 @@ macro_rules! from_bytes {
     ($ty:tt, $value:expr) => {
         ($ty::from_le_bytes(match ($value).try_into() {
             Ok(it) => it,
+            #[allow(unreachable_patterns)]
             Err(_) => return Err(MirEvalError::InternalError("mismatched size".into())),
         }))
     };
@@ -46,80 +52,62 @@ impl Evaluator<'_> {
         if self.not_special_fn_cache.borrow().contains(&def) {
             return Ok(false);
         }
+
         let function_data = self.db.function_data(def);
-        let is_intrinsic = match &function_data.abi {
-            Some(abi) => *abi == Interned::new_str("rust-intrinsic"),
-            None => match def.lookup(self.db.upcast()).container {
-                hir_def::ItemContainerId::ExternBlockId(block) => {
-                    let id = block.lookup(self.db.upcast()).id;
-                    id.item_tree(self.db.upcast())[id.value].abi.as_deref()
-                        == Some("rust-intrinsic")
-                }
-                _ => false,
-            },
-        };
+        let attrs = self.db.attrs(def.into());
+        let is_intrinsic = attrs.by_key(&sym::rustc_intrinsic).exists()
+            // Keep this around for a bit until extern "rustc-intrinsic" abis are no longer used
+            || (match &function_data.abi {
+                Some(abi) => *abi == sym::rust_dash_intrinsic,
+                None => match def.lookup(self.db.upcast()).container {
+                    hir_def::ItemContainerId::ExternBlockId(block) => {
+                        let id = block.lookup(self.db.upcast()).id;
+                        id.item_tree(self.db.upcast())[id.value].abi.as_ref()
+                            == Some(&sym::rust_dash_intrinsic)
+                    }
+                    _ => false,
+                },
+            });
+
         if is_intrinsic {
-            self.exec_intrinsic(
-                function_data.name.as_text().unwrap_or_default().as_str(),
+            return self.exec_intrinsic(
+                function_data.name.as_str(),
                 args,
                 generic_args,
                 destination,
                 locals,
                 span,
-            )?;
-            return Ok(true);
-        }
-        let is_platform_intrinsic = match &function_data.abi {
-            Some(abi) => *abi == Interned::new_str("platform-intrinsic"),
-            None => match def.lookup(self.db.upcast()).container {
-                hir_def::ItemContainerId::ExternBlockId(block) => {
-                    let id = block.lookup(self.db.upcast()).id;
-                    id.item_tree(self.db.upcast())[id.value].abi.as_deref()
-                        == Some("platform-intrinsic")
-                }
-                _ => false,
-            },
-        };
-        if is_platform_intrinsic {
-            self.exec_platform_intrinsic(
-                function_data.name.as_text().unwrap_or_default().as_str(),
-                args,
-                generic_args,
-                destination,
-                locals,
-                span,
-            )?;
-            return Ok(true);
+                !function_data.has_body()
+                    || attrs.by_key(&sym::rustc_intrinsic_must_be_overridden).exists(),
+            );
         }
         let is_extern_c = match def.lookup(self.db.upcast()).container {
             hir_def::ItemContainerId::ExternBlockId(block) => {
                 let id = block.lookup(self.db.upcast()).id;
-                id.item_tree(self.db.upcast())[id.value].abi.as_deref() == Some("C")
+                id.item_tree(self.db.upcast())[id.value].abi.as_ref() == Some(&sym::C)
             }
             _ => false,
         };
         if is_extern_c {
-            self.exec_extern_c(
-                function_data.name.as_text().unwrap_or_default().as_str(),
-                args,
-                generic_args,
-                destination,
-                locals,
-                span,
-            )?;
-            return Ok(true);
+            return self
+                .exec_extern_c(
+                    function_data.name.as_str(),
+                    args,
+                    generic_args,
+                    destination,
+                    locals,
+                    span,
+                )
+                .map(|()| true);
         }
-        let alloc_fn = function_data
-            .attrs
-            .iter()
-            .filter_map(|it| it.path().as_ident())
-            .filter_map(|it| it.as_str())
-            .find(|it| {
+
+        let alloc_fn =
+            attrs.iter().filter_map(|it| it.path().as_ident()).map(|it| it.symbol()).find(|it| {
                 [
-                    "rustc_allocator",
-                    "rustc_deallocator",
-                    "rustc_reallocator",
-                    "rustc_allocator_zeroed",
+                    &sym::rustc_allocator,
+                    &sym::rustc_deallocator,
+                    &sym::rustc_reallocator,
+                    &sym::rustc_allocator_zeroed,
                 ]
                 .contains(it)
             });
@@ -128,9 +116,7 @@ impl Evaluator<'_> {
             return Ok(true);
         }
         if let Some(it) = self.detect_lang_function(def) {
-            let arg_bytes =
-                args.iter().map(|it| Ok(it.get(self)?.to_owned())).collect::<Result<Vec<_>>>()?;
-            let result = self.exec_lang_item(it, generic_args, &arg_bytes, locals, span)?;
+            let result = self.exec_lang_item(it, generic_args, args, locals, span)?;
             destination.write_from_bytes(self, &result)?;
             return Ok(true);
         }
@@ -156,6 +142,25 @@ impl Evaluator<'_> {
         }
         self.not_special_fn_cache.borrow_mut().insert(def);
         Ok(false)
+    }
+
+    pub(super) fn detect_and_redirect_special_function(
+        &mut self,
+        def: FunctionId,
+    ) -> Result<Option<FunctionId>> {
+        // `PanicFmt` is redirected to `ConstPanicFmt`
+        if let Some(LangItem::PanicFmt) = self.db.lang_attr(def.into()) {
+            let resolver =
+                self.db.crate_def_map(self.crate_id).crate_root().resolver(self.db.upcast());
+
+            let Some(hir_def::lang_item::LangItemTarget::Function(const_panic_fmt)) =
+                self.db.lang_item(resolver.krate(), LangItem::ConstPanicFmt)
+            else {
+                not_supported!("const_panic_fmt lang item not found or not a function");
+            };
+            return Ok(Some(const_panic_fmt));
+        }
+        Ok(None)
     }
 
     /// Clone has special impls for tuples and function pointers
@@ -228,7 +233,7 @@ impl Evaluator<'_> {
             let tmp = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
             let arg = IntervalAndTy {
                 interval: Interval { addr: tmp, size: self.ptr_size() },
-                ty: TyKind::Ref(Mutability::Not, static_lifetime(), ty.clone()).intern(Interner),
+                ty: TyKind::Ref(Mutability::Not, error_lifetime(), ty.clone()).intern(Interner),
             };
             let offset = layout.fields.offset(i).bytes_usize();
             self.write_memory(tmp, &addr.offset(offset).to_bytes())?;
@@ -246,12 +251,12 @@ impl Evaluator<'_> {
 
     fn exec_alloc_fn(
         &mut self,
-        alloc_fn: &str,
+        alloc_fn: &Symbol,
         args: &[IntervalAndTy],
         destination: Interval,
     ) -> Result<()> {
         match alloc_fn {
-            "rustc_allocator_zeroed" | "rustc_allocator" => {
+            _ if *alloc_fn == sym::rustc_allocator_zeroed || *alloc_fn == sym::rustc_allocator => {
                 let [size, align] = args else {
                     return Err(MirEvalError::InternalError(
                         "rustc_allocator args are not provided".into(),
@@ -262,8 +267,8 @@ impl Evaluator<'_> {
                 let result = self.heap_allocate(size, align)?;
                 destination.write_from_bytes(self, &result.to_bytes())?;
             }
-            "rustc_deallocator" => { /* no-op for now */ }
-            "rustc_reallocator" => {
+            _ if *alloc_fn == sym::rustc_deallocator => { /* no-op for now */ }
+            _ if *alloc_fn == sym::rustc_reallocator => {
                 let [ptr, old_size, align, new_size] = args else {
                     return Err(MirEvalError::InternalError(
                         "rustc_allocator args are not provided".into(),
@@ -289,11 +294,20 @@ impl Evaluator<'_> {
 
     fn detect_lang_function(&self, def: FunctionId) -> Option<LangItem> {
         use LangItem::*;
-        let candidate = self.db.lang_attr(def.into())?;
+        let attrs = self.db.attrs(def.into());
+
+        if attrs.by_key(&sym::rustc_const_panic_str).exists() {
+            // `#[rustc_const_panic_str]` is treated like `lang = "begin_panic"` by rustc CTFE.
+            return Some(LangItem::BeginPanic);
+        }
+
+        let candidate = attrs.lang_item()?;
         // We want to execute these functions with special logic
-        if [PanicFmt, BeginPanic, SliceLen, DropInPlace].contains(&candidate) {
+        // `PanicFmt` is not detected here as it's redirected later.
+        if [BeginPanic, SliceLen, DropInPlace].contains(&candidate) {
             return Some(candidate);
         }
+
         None
     }
 
@@ -301,55 +315,52 @@ impl Evaluator<'_> {
         &mut self,
         it: LangItem,
         generic_args: &Substitution,
-        args: &[Vec<u8>],
+        args: &[IntervalAndTy],
         locals: &Locals,
         span: MirSpan,
     ) -> Result<Vec<u8>> {
         use LangItem::*;
         let mut args = args.iter();
         match it {
-            BeginPanic => Err(MirEvalError::Panic("<unknown-panic-payload>".to_owned())),
-            PanicFmt => {
-                let message = (|| {
-                    let resolver = self
-                        .db
-                        .crate_def_map(self.crate_id)
-                        .crate_root()
-                        .resolver(self.db.upcast());
-                    let Some(format_fn) = resolver.resolve_path_in_value_ns_fully(
-                        self.db.upcast(),
-                        &hir_def::path::Path::from_known_path_with_no_generic(
-                            ModPath::from_segments(
-                                hir_expand::mod_path::PathKind::Abs,
-                                [name![std], name![fmt], name![format]],
-                            ),
-                        ),
-                    ) else {
-                        not_supported!("std::fmt::format not found");
+            BeginPanic => {
+                let mut arg = args
+                    .next()
+                    .ok_or(MirEvalError::InternalError(
+                        "argument of BeginPanic is not provided".into(),
+                    ))?
+                    .clone();
+                while let TyKind::Ref(_, _, ty) = arg.ty.kind(Interner) {
+                    if ty.is_str() {
+                        let (pointee, metadata) = arg.interval.get(self)?.split_at(self.ptr_size());
+                        let len = from_bytes!(usize, metadata);
+
+                        return {
+                            Err(MirEvalError::Panic(
+                                std::str::from_utf8(
+                                    self.read_memory(Address::from_bytes(pointee)?, len)?,
+                                )
+                                .unwrap()
+                                .to_owned(),
+                            ))
+                        };
+                    }
+                    let size = self.size_of_sized(ty, locals, "begin panic arg")?;
+                    let pointee = arg.interval.get(self)?;
+                    arg = IntervalAndTy {
+                        interval: Interval::new(Address::from_bytes(pointee)?, size),
+                        ty: ty.clone(),
                     };
-                    let hir_def::resolver::ValueNs::FunctionId(format_fn) = format_fn else {
-                        not_supported!("std::fmt::format is not a function")
-                    };
-                    let interval = self.interpret_mir(
-                        self.db
-                            .mir_body(format_fn.into())
-                            .map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
-                        args.map(|x| IntervalOrOwned::Owned(x.clone())),
-                    )?;
-                    let message_string = interval.get(self)?;
-                    let addr =
-                        Address::from_bytes(&message_string[self.ptr_size()..2 * self.ptr_size()])?;
-                    let size = from_bytes!(usize, message_string[2 * self.ptr_size()..]);
-                    Ok(std::string::String::from_utf8_lossy(self.read_memory(addr, size)?)
-                        .into_owned())
-                })()
-                .unwrap_or_else(|e| format!("Failed to render panic format args: {e:?}"));
-                Err(MirEvalError::Panic(message))
+                }
+                Err(MirEvalError::Panic(format!(
+                    "unknown-panic-payload: {:?}",
+                    arg.ty.kind(Interner)
+                )))
             }
             SliceLen => {
                 let arg = args.next().ok_or(MirEvalError::InternalError(
                     "argument of <[T]>::len() is not provided".into(),
                 ))?;
+                let arg = arg.get(self)?;
                 let ptr_size = arg.len() / 2;
                 Ok(arg[ptr_size..].into())
             }
@@ -363,6 +374,7 @@ impl Evaluator<'_> {
                 let arg = args.next().ok_or(MirEvalError::InternalError(
                     "argument of drop_in_place is not provided".into(),
                 ))?;
+                let arg = arg.interval.get(self)?.to_owned();
                 self.run_drop_glue_deep(
                     ty.clone(),
                     locals,
@@ -572,21 +584,6 @@ impl Evaluator<'_> {
         }
     }
 
-    fn exec_platform_intrinsic(
-        &mut self,
-        name: &str,
-        args: &[IntervalAndTy],
-        generic_args: &Substitution,
-        destination: Interval,
-        locals: &Locals,
-        span: MirSpan,
-    ) -> Result<()> {
-        if let Some(name) = name.strip_prefix("simd_") {
-            return self.exec_simd_intrinsic(name, args, generic_args, destination, locals, span);
-        }
-        not_supported!("unknown platform intrinsic {name}");
-    }
-
     fn exec_intrinsic(
         &mut self,
         name: &str,
@@ -595,10 +592,19 @@ impl Evaluator<'_> {
         destination: Interval,
         locals: &Locals,
         span: MirSpan,
-    ) -> Result<()> {
+        needs_override: bool,
+    ) -> Result<bool> {
         if let Some(name) = name.strip_prefix("atomic_") {
-            return self.exec_atomic_intrinsic(name, args, generic_args, destination, locals, span);
+            return self
+                .exec_atomic_intrinsic(name, args, generic_args, destination, locals, span)
+                .map(|()| true);
         }
+        if let Some(name) = name.strip_prefix("simd_") {
+            return self
+                .exec_simd_intrinsic(name, args, generic_args, destination, locals, span)
+                .map(|()| true);
+        }
+        // FIXME(#17451): Add `f16` and `f128` intrinsics.
         if let Some(name) = name.strip_suffix("f64") {
             let result = match name {
                 "sqrt" | "sin" | "cos" | "exp" | "exp2" | "log" | "log10" | "log2" | "fabs"
@@ -669,7 +675,7 @@ impl Evaluator<'_> {
                 }
                 _ => not_supported!("unknown f64 intrinsic {name}"),
             };
-            return destination.write_from_bytes(self, &result.to_le_bytes());
+            return destination.write_from_bytes(self, &result.to_le_bytes()).map(|()| true);
         }
         if let Some(name) = name.strip_suffix("f32") {
             let result = match name {
@@ -741,7 +747,7 @@ impl Evaluator<'_> {
                 }
                 _ => not_supported!("unknown f32 intrinsic {name}"),
             };
-            return destination.write_from_bytes(self, &result.to_le_bytes());
+            return destination.write_from_bytes(self, &result.to_le_bytes()).map(|()| true);
         }
         match name {
             "size_of" => {
@@ -824,7 +830,11 @@ impl Evaluator<'_> {
                     Ok(ty_name) => ty_name,
                     // Fallback to human readable display in case of `Err`. Ideally we want to use `display_source_code` to
                     // render full paths.
-                    Err(_) => ty.display(self.db).to_string(),
+                    Err(_) => {
+                        let krate = locals.body.owner.krate(self.db.upcast());
+                        let edition = self.db.crate_graph()[krate].edition;
+                        ty.display(self.db, edition).to_string()
+                    }
                 };
                 let len = ty_name.len();
                 let addr = self.heap_allocate(len, 1)?;
@@ -1110,12 +1120,6 @@ impl Evaluator<'_> {
                 };
                 destination.write_from_interval(self, arg.interval)
             }
-            "likely" | "unlikely" => {
-                let [arg] = args else {
-                    return Err(MirEvalError::InternalError("likely arg is not provided".into()));
-                };
-                destination.write_from_interval(self, arg.interval)
-            }
             "ctpop" => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctpop arg is not provided".into()));
@@ -1245,10 +1249,11 @@ impl Evaluator<'_> {
                     args.push(IntervalAndTy::new(addr, field, self, locals)?);
                 }
                 if let Some(target) = self.db.lang_item(self.crate_id, LangItem::FnOnce) {
-                    if let Some(def) = target
-                        .as_trait()
-                        .and_then(|it| self.db.trait_data(it).method_by_name(&name![call_once]))
-                    {
+                    if let Some(def) = target.as_trait().and_then(|it| {
+                        self.db
+                            .trait_data(it)
+                            .method_by_name(&Name::new_symbol_root(sym::call_once.clone()))
+                    }) {
                         self.exec_fn_trait(
                             def,
                             &args,
@@ -1259,7 +1264,7 @@ impl Evaluator<'_> {
                             None,
                             span,
                         )?;
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
                 not_supported!("FnOnce was not available for executing const_eval_select");
@@ -1312,8 +1317,10 @@ impl Evaluator<'_> {
                 self.write_memory_using_ref(dst, size)?.fill(val);
                 Ok(())
             }
-            _ => not_supported!("unknown intrinsic {name}"),
+            _ if needs_override => not_supported!("intrinsic {name} is not implemented"),
+            _ => return Ok(false),
         }
+        .map(|()| true)
     }
 
     fn size_align_of_unsized(

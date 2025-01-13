@@ -1,6 +1,9 @@
 //! Completion of names from the current scope in expression position.
 
-use hir::ScopeDef;
+use std::ops::ControlFlow;
+
+use hir::{sym, Name, PathCandidateCallback, ScopeDef};
+use ide_db::FxHashSet;
 use syntax::ast;
 
 use crate::{
@@ -9,13 +12,45 @@ use crate::{
     CompletionContext, Completions,
 };
 
+struct PathCallback<'a, F> {
+    ctx: &'a CompletionContext<'a>,
+    acc: &'a mut Completions,
+    add_assoc_item: F,
+    seen: FxHashSet<hir::AssocItem>,
+}
+
+impl<F> PathCandidateCallback for PathCallback<'_, F>
+where
+    F: FnMut(&mut Completions, hir::AssocItem),
+{
+    fn on_inherent_item(&mut self, item: hir::AssocItem) -> ControlFlow<()> {
+        if self.seen.insert(item) {
+            (self.add_assoc_item)(self.acc, item);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn on_trait_item(&mut self, item: hir::AssocItem) -> ControlFlow<()> {
+        // The excluded check needs to come before the `seen` test, so that if we see the same method twice,
+        // once as inherent and once not, we will include it.
+        if item
+            .container_trait(self.ctx.db)
+            .is_none_or(|trait_| !self.ctx.exclude_traits.contains(&trait_))
+            && self.seen.insert(item)
+        {
+            (self.add_assoc_item)(self.acc, item);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 pub(crate) fn complete_expr_path(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
     expr_ctx: &PathExprCtx,
 ) {
-    let _p = tracing::span!(tracing::Level::INFO, "complete_expr_path").entered();
+    let _p = tracing::info_span!("complete_expr_path").entered();
     if !ctx.qualifier_ctx.none() {
         return;
     }
@@ -50,12 +85,18 @@ pub(crate) fn complete_expr_path(
     };
 
     match qualified {
+        // We exclude associated types/consts of excluded traits here together with methods,
+        // even though we don't exclude them when completing in type position, because it's easier.
         Qualified::TypeAnchor { ty: None, trait_: None } => ctx
             .traits_in_scope()
             .iter()
-            .flat_map(|&it| hir::Trait::from(it).items(ctx.sema.db))
+            .copied()
+            .map(hir::Trait::from)
+            .filter(|it| !ctx.exclude_traits.contains(it))
+            .flat_map(|it| it.items(ctx.sema.db))
             .for_each(|item| add_assoc_item(acc, item)),
         Qualified::TypeAnchor { trait_: Some(trait_), .. } => {
+            // Don't filter excluded traits here, user requested this specific trait.
             trait_.items(ctx.sema.db).into_iter().for_each(|item| add_assoc_item(acc, item))
         }
         Qualified::TypeAnchor { ty: Some(ty), trait_: None } => {
@@ -64,9 +105,14 @@ pub(crate) fn complete_expr_path(
                 acc.add_enum_variants(ctx, path_ctx, e);
             }
 
-            ctx.iterate_path_candidates(ty, |item| {
-                add_assoc_item(acc, item);
-            });
+            ty.iterate_path_candidates_split_inherent(
+                ctx.db,
+                &ctx.scope,
+                &ctx.traits_in_scope(),
+                Some(ctx.module),
+                None,
+                PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
+            );
 
             // Iterate assoc types separately
             ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
@@ -121,9 +167,14 @@ pub(crate) fn complete_expr_path(
                     // XXX: For parity with Rust bug #22519, this does not complete Ty::AssocType.
                     // (where AssocType is defined on a trait, not an inherent impl)
 
-                    ctx.iterate_path_candidates(&ty, |item| {
-                        add_assoc_item(acc, item);
-                    });
+                    ty.iterate_path_candidates_split_inherent(
+                        ctx.db,
+                        &ctx.scope,
+                        &ctx.traits_in_scope(),
+                        Some(ctx.module),
+                        None,
+                        PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
+                    );
 
                     // Iterate assoc types separately
                     ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
@@ -134,6 +185,7 @@ pub(crate) fn complete_expr_path(
                     });
                 }
                 hir::PathResolution::Def(hir::ModuleDef::Trait(t)) => {
+                    // Don't filter excluded traits here, user requested this specific trait.
                     // Handles `Trait::assoc` as well as `<Ty as Trait>::assoc`.
                     for item in t.items(ctx.db) {
                         add_assoc_item(acc, item);
@@ -151,9 +203,14 @@ pub(crate) fn complete_expr_path(
                         acc.add_enum_variants(ctx, path_ctx, e);
                     }
 
-                    ctx.iterate_path_candidates(&ty, |item| {
-                        add_assoc_item(acc, item);
-                    });
+                    ty.iterate_path_candidates_split_inherent(
+                        ctx.db,
+                        &ctx.scope,
+                        &ctx.traits_in_scope(),
+                        Some(ctx.module),
+                        None,
+                        PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
+                    );
                 }
                 _ => (),
             }
@@ -171,11 +228,10 @@ pub(crate) fn complete_expr_path(
                     hir::Adt::Struct(strukt) => {
                         let path = ctx
                             .module
-                            .find_use_path(
+                            .find_path(
                                 ctx.db,
                                 hir::ModuleDef::from(strukt),
-                                ctx.config.prefer_no_std,
-                                ctx.config.prefer_prelude,
+                                ctx.config.import_path_config(),
                             )
                             .filter(|it| it.len() > 1);
 
@@ -187,24 +243,28 @@ pub(crate) fn complete_expr_path(
                                 path_ctx,
                                 strukt,
                                 None,
-                                Some(hir::known::SELF_TYPE),
+                                Some(Name::new_symbol_root(sym::Self_.clone())),
                             );
                         }
                     }
                     hir::Adt::Union(un) => {
                         let path = ctx
                             .module
-                            .find_use_path(
+                            .find_path(
                                 ctx.db,
                                 hir::ModuleDef::from(un),
-                                ctx.config.prefer_no_std,
-                                ctx.config.prefer_prelude,
+                                ctx.config.import_path_config(),
                             )
                             .filter(|it| it.len() > 1);
 
                         acc.add_union_literal(ctx, un, path, None);
                         if complete_self {
-                            acc.add_union_literal(ctx, un, None, Some(hir::known::SELF_TYPE));
+                            acc.add_union_literal(
+                                ctx,
+                                un,
+                                None,
+                                Some(Name::new_symbol_root(sym::Self_.clone())),
+                            );
                         }
                     }
                     hir::Adt::Enum(e) => {
@@ -233,9 +293,17 @@ pub(crate) fn complete_expr_path(
                         [..] => acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases),
                     }
                 }
+                // synthetic names currently leak out as we lack synthetic hygiene, so filter them
+                // out here
+                ScopeDef::Local(_) => {
+                    if !name.as_str().starts_with('<') {
+                        acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases)
+                    }
+                }
                 _ if scope_def_applicable(def) => {
                     acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases)
                 }
+
                 _ => (),
             });
 
@@ -330,7 +398,7 @@ pub(crate) fn complete_expr_path(
 }
 
 pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) {
-    let _p = tracing::span!(tracing::Level::INFO, "complete_expr").entered();
+    let _p = tracing::info_span!("complete_expr").entered();
 
     if !ctx.config.enable_term_search {
         return;
@@ -353,7 +421,7 @@ pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) 
             config: hir::term_search::TermSearchConfig {
                 enable_borrowcheck: false,
                 many_alternatives_threshold: 1,
-                depth: 6,
+                fuel: 200,
             },
         };
         let exprs = hir::term_search::term_search(&term_search_ctx);

@@ -1,13 +1,11 @@
-use std::{
-    io::Error,
-    path::{Path, PathBuf},
-};
+use std::io::Error;
+use std::path::{Path, PathBuf};
 
-use rustc_errors::{codes::*, Diag, DiagCtxt, EmissionGuarantee, IntoDiagnostic, Level};
-use rustc_macros::Diagnostic;
-use rustc_session::config;
-use rustc_span::{sym, Span, Symbol};
-use rustc_target::spec::{PanicStrategy, TargetTriple};
+use rustc_errors::codes::*;
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level};
+use rustc_macros::{Diagnostic, Subdiagnostic};
+use rustc_span::{Span, Symbol, sym};
+use rustc_target::spec::{PanicStrategy, TargetTuple};
 
 use crate::fluent_generated as fluent;
 use crate::locator::CrateFlavor;
@@ -38,7 +36,21 @@ pub struct RustcLibRequired<'a> {
 #[help]
 pub struct CrateDepMultiple {
     pub crate_name: Symbol,
+    #[subdiagnostic]
+    pub non_static_deps: Vec<NonStaticCrateDep>,
+    #[subdiagnostic]
+    pub rustc_driver_help: Option<RustcDriverHelp>,
 }
+
+#[derive(Subdiagnostic)]
+#[note(metadata_crate_dep_not_static)]
+pub struct NonStaticCrateDep {
+    pub crate_name: Symbol,
+}
+
+#[derive(Subdiagnostic)]
+#[help(metadata_crate_dep_rustc_driver)]
+pub struct RustcDriverHelp;
 
 #[derive(Diagnostic)]
 #[diag(metadata_two_panic_runtimes)]
@@ -135,8 +147,8 @@ pub struct LinkFrameworkApple {
 }
 
 #[derive(Diagnostic)]
-#[diag(metadata_framework_only_windows, code = E0455)]
-pub struct FrameworkOnlyWindows {
+#[diag(metadata_raw_dylib_only_windows, code = E0455)]
+pub struct RawDylibOnlyWindows {
     #[primary_span]
     pub span: Span,
 }
@@ -328,10 +340,6 @@ pub struct NoPanicStrategy {
 }
 
 #[derive(Diagnostic)]
-#[diag(metadata_profiler_builtins_needs_core)]
-pub struct ProfilerBuiltinsNeedsCore;
-
-#[derive(Diagnostic)]
 #[diag(metadata_not_profiler_runtime)]
 pub struct NotProfilerRuntime {
     pub crate_name: Symbol,
@@ -495,8 +503,8 @@ pub(crate) struct MultipleCandidates {
     pub candidates: Vec<PathBuf>,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for MultipleCandidates {
-    fn into_diagnostic(self, dcx: &'_ DiagCtxt, level: Level) -> Diag<'_, G> {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for MultipleCandidates {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
         let mut diag = Diag::new(dcx, level, fluent::metadata_multiple_candidates);
         diag.arg("crate_name", self.crate_name);
         diag.arg("flavor", self.flavor);
@@ -593,9 +601,9 @@ pub struct InvalidMetadataFiles {
     pub crate_rejections: Vec<String>,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for InvalidMetadataFiles {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for InvalidMetadataFiles {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'_ DiagCtxt, level: Level) -> Diag<'_, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
         let mut diag = Diag::new(dcx, level, fluent::metadata_invalid_meta_files);
         diag.arg("crate_name", self.crate_name);
         diag.arg("add_info", self.add_info);
@@ -618,23 +626,21 @@ pub struct CannotFindCrate {
     pub current_crate: String,
     pub is_nightly_build: bool,
     pub profiler_runtime: Symbol,
-    pub locator_triple: TargetTriple,
+    pub locator_triple: TargetTuple,
     pub is_ui_testing: bool,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for CannotFindCrate {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for CannotFindCrate {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'_ DiagCtxt, level: Level) -> Diag<'_, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
         let mut diag = Diag::new(dcx, level, fluent::metadata_cannot_find_crate);
         diag.arg("crate_name", self.crate_name);
         diag.arg("current_crate", self.current_crate);
         diag.arg("add_info", self.add_info);
-        diag.arg("locator_triple", self.locator_triple.triple());
+        diag.arg("locator_triple", self.locator_triple.tuple());
         diag.code(E0463);
         diag.span(self.span);
-        if (self.crate_name == sym::std || self.crate_name == sym::core)
-            && self.locator_triple != TargetTriple::from_triple(config::host_triple())
-        {
+        if self.crate_name == sym::std || self.crate_name == sym::core {
             if self.missing_core {
                 diag.note(fluent::metadata_target_not_installed);
             } else {

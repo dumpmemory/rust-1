@@ -36,10 +36,10 @@ LL | trait Project {
    | ^^^^^^^^^^^^^
 
 error[E0277]: the trait bound `(): Project` is not satisfied
-  --> $DIR/bad-projection.rs:14:40
+  --> $DIR/bad-projection.rs:14:1
    |
 LL | pub fn uwu() -> <() as Project>::Assoc {}
-   |                                        ^^ the trait `Project` is not implemented for `()`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Project` is not implemented for `()`
    |
 help: this trait has no implementations, consider adding one
   --> $DIR/bad-projection.rs:9:1
@@ -47,7 +47,20 @@ help: this trait has no implementations, consider adding one
 LL | trait Project {
    | ^^^^^^^^^^^^^
 
-error: aborting due to 4 previous errors
+error[E0277]: the trait bound `(): Project` is not satisfied
+  --> $DIR/bad-projection.rs:14:17
+   |
+LL | pub fn uwu() -> <() as Project>::Assoc {}
+   |                 ^^^^^^^^^^^^^^^^^^^^^^ the trait `Project` is not implemented for `()`
+   |
+help: this trait has no implementations, consider adding one
+  --> $DIR/bad-projection.rs:9:1
+   |
+LL | trait Project {
+   | ^^^^^^^^^^^^^
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: aborting due to 5 previous errors
 
 Some errors have detailed explanations: E0277, E0593.
 For more information about an error, try `rustc --explain E0277`.

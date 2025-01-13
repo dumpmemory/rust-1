@@ -1,8 +1,8 @@
-//@ compile-flags: -Z mir-opt-level=3 -Z inline-mir
+//@ compile-flags: -Z mir-opt-level=3 -Z inline-mir -C debuginfo=full
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 #![crate_type = "lib"]
 
-// EMIT_MIR issue_78442.bar.RevealAll.diff
+// EMIT_MIR issue_78442.bar.PostAnalysisNormalize.diff
 // EMIT_MIR issue_78442.bar.Inline.diff
 pub fn bar<P>(
     // Error won't happen if "bar" is not generic

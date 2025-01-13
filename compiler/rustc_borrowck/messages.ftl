@@ -16,6 +16,9 @@ borrowck_borrow_due_to_use_closure =
 borrowck_borrow_due_to_use_coroutine =
     borrow occurs due to use in coroutine
 
+borrowck_calling_operator_moves =
+    calling this operator moves the value
+
 borrowck_calling_operator_moves_lhs =
     calling this operator moves the left-hand side
 
@@ -59,6 +62,9 @@ borrowck_could_not_normalize =
 borrowck_could_not_prove =
     could not prove `{$predicate}`
 
+borrowck_dereference_suggestion =
+    dereference the return value
+
 borrowck_func_take_self_moved_place =
     `{$func}` takes ownership of the receiver `self`, which moves {$place_name}
 
@@ -71,8 +77,23 @@ borrowck_higher_ranked_lifetime_error =
 borrowck_higher_ranked_subtype_error =
     higher-ranked subtype error
 
+borrowck_implicit_static =
+    this has an implicit `'static` lifetime requirement
+
+borrowck_implicit_static_introduced =
+    calling this method introduces the `impl`'s `'static` requirement
+
+borrowck_implicit_static_relax =
+    consider relaxing the implicit `'static` requirement
+
 borrowck_lifetime_constraints_error =
     lifetime may not live long enough
+
+borrowck_limitations_implies_static =
+    due to current limitations in the borrow checker, this implies a `'static` lifetime
+
+borrowck_move_closure_suggestion =
+    consider adding 'move' keyword before the nested closure
 
 borrowck_move_out_place_here =
     {$place} is moved here
@@ -83,6 +104,12 @@ borrowck_move_unsized =
 
 borrowck_moved_a_fn_once_in_call =
     this value implements `FnOnce`, which causes it to be moved when called
+
+borrowck_moved_a_fn_once_in_call_call =
+    `FnOnce` closures can only be called once
+
+borrowck_moved_a_fn_once_in_call_def =
+    `{$ty}` is made to be an `FnOnce` closure here
 
 borrowck_moved_due_to_await =
     {$place_name} {$is_partial ->
@@ -129,6 +156,12 @@ borrowck_moved_due_to_usage_in_operator =
         *[false] operator
     }
 
+borrowck_opaque_type_lifetime_mismatch =
+    opaque type used twice with different lifetimes
+    .label = lifetime `{$arg}` used here
+    .prev_lifetime_label = lifetime `{$prev}` previously used here
+    .note = if all non-lifetime generic parameters are the same, but the lifetime parameters differ, it is not possible to differentiate the opaque types
+
 borrowck_opaque_type_non_generic_param =
     expected generic {$kind} parameter, found `{$ty}`
     .label = {STREQ($ty, "'static") ->
@@ -147,6 +180,9 @@ borrowck_partial_var_move_by_use_in_coroutine =
         [true] partially moved
         *[false] moved
     } due to use in coroutine
+
+borrowck_restrict_to_static =
+    consider restricting the type parameter to the `'static` lifetime
 
 borrowck_returned_async_block_escaped =
     returns an `async` block that contains a reference to a captured variable, which then escapes the closure body
@@ -171,11 +207,15 @@ borrowck_simd_intrinsic_arg_const =
         *[other] {$arg}th
     } argument of `{$intrinsic}` is required to be a `const` item
 
-borrowck_suggest_create_freash_reborrow =
+borrowck_suggest_create_fresh_reborrow =
     consider reborrowing the `Pin` instead of moving it
 
 borrowck_suggest_iterate_over_slice =
     consider iterating over a slice of the `{$ty}`'s content to avoid moving into the `for` loop
+
+borrowck_tail_expr_drop_order = relative drop order changing in Rust 2024
+    .label = this temporary value will be dropped at the end of the block
+    .note = consider using a `let` binding to ensure the value will live long enough
 
 borrowck_ty_no_impl_copy =
     {$is_partial_move ->

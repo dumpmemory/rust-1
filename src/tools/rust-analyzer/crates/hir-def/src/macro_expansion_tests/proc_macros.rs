@@ -16,12 +16,12 @@ fn attribute_macro_attr_censoring() {
 #[attr1] #[proc_macros::identity] #[attr2]
 struct S;
 "#,
-        expect![[r##"
+        expect![[r#"
 #[attr1] #[proc_macros::identity] #[attr2]
 struct S;
 
 #[attr1]
-#[attr2] struct S;"##]],
+#[attr2] struct S;"#]],
     );
 }
 
@@ -39,7 +39,7 @@ fn derive_censoring() {
 #[attr2]
 struct S;
 "#,
-        expect![[r##"
+        expect![[r#"
 #[attr1]
 #[derive(Foo)]
 #[derive(proc_macros::DeriveIdentity)]
@@ -49,7 +49,7 @@ struct S;
 
 #[attr1]
 #[derive(Bar)]
-#[attr2] struct S;"##]],
+#[attr2] struct S;"#]],
     );
 }
 
@@ -62,14 +62,14 @@ fn attribute_macro_syntax_completion_1() {
 #[proc_macros::identity_when_valid]
 fn foo() { bar.baz(); blub }
 "#,
-        expect![[r##"
+        expect![[r#"
 #[proc_macros::identity_when_valid]
 fn foo() { bar.baz(); blub }
 
 fn foo() {
     bar.baz();
     blub
-}"##]],
+}"#]],
     );
 }
 
@@ -184,5 +184,35 @@ fn foo(&self) {
 fn#0:1@45..47#0# foo#0:1@48..51#0#(#0:1@51..52#0#&#0:1@52..53#0#self#0:1@53..57#0# )#0:1@57..58#0# {#0:1@59..60#0#
     self#0:1@65..69#0# .#0:1@69..70#0#0#0:1@70..71#0#.#0:1@71..72#0#1#0:1@73..74#0#;#0:1@74..75#0#
 }#0:1@76..77#0#"#]],
+    );
+}
+
+#[test]
+fn attribute_macro_doc_desugaring() {
+    check(
+        r#"
+//- proc_macros: identity
+#[proc_macros::identity]
+/// doc string \n with newline
+/**
+     MultiLines Doc
+     MultiLines Doc
+*/
+#[doc = "doc attr"]
+struct S;
+"#,
+        expect![[r##"
+#[proc_macros::identity]
+/// doc string \n with newline
+/**
+     MultiLines Doc
+     MultiLines Doc
+*/
+#[doc = "doc attr"]
+struct S;
+
+#[doc = " doc string \\n with newline"]
+#[doc = "\n     MultiLines Doc\n     MultiLines Doc\n"]
+#[doc = "doc attr"] struct S;"##]],
     );
 }

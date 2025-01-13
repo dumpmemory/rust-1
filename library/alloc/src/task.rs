@@ -7,14 +7,14 @@
 //! This may be detected at compile time using
 //! `#[cfg(target_has_atomic = "ptr")]`.
 
-use crate::rc::Rc;
 use core::mem::ManuallyDrop;
-use core::task::{LocalWaker, RawWaker, RawWakerVTable};
-
-#[cfg(target_has_atomic = "ptr")]
-use crate::sync::Arc;
 #[cfg(target_has_atomic = "ptr")]
 use core::task::Waker;
+use core::task::{LocalWaker, RawWaker, RawWakerVTable};
+
+use crate::rc::Rc;
+#[cfg(target_has_atomic = "ptr")]
+use crate::sync::Arc;
 
 /// The implementation of waking a task on an executor.
 ///
@@ -148,7 +148,7 @@ fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
     unsafe fn clone_waker<W: Wake + Send + Sync + 'static>(waker: *const ()) -> RawWaker {
         unsafe { Arc::increment_strong_count(waker as *const W) };
         RawWaker::new(
-            waker as *const (),
+            waker,
             &RawWakerVTable::new(clone_waker::<W>, wake::<W>, wake_by_ref::<W>, drop_waker::<W>),
         )
     }
@@ -176,9 +176,11 @@ fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
     )
 }
 
-/// An analogous trait to `Wake` but used to construct a `LocalWaker`. This API
-/// works in exactly the same way as `Wake`, except that it uses an `Rc` instead
-/// of an `Arc`, and the result is a `LocalWaker` instead of a `Waker`.
+/// An analogous trait to `Wake` but used to construct a `LocalWaker`.
+///
+/// This API works in exactly the same way as `Wake`,
+/// except that it uses an `Rc` instead of an `Arc`,
+/// and the result is a `LocalWaker` instead of a `Waker`.
 ///
 /// The benefits of using `LocalWaker` over `Waker` are that it allows the local waker
 /// to hold data that does not implement `Send` and `Sync`. Additionally, it saves calls
@@ -197,7 +199,6 @@ fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
 ///
 /// ```rust
 /// #![feature(local_waker)]
-/// #![feature(noop_waker)]
 /// use std::task::{LocalWake, ContextBuilder, LocalWaker, Waker};
 /// use std::future::Future;
 /// use std::pin::Pin;
@@ -320,7 +321,7 @@ fn local_raw_waker<W: LocalWake + 'static>(waker: Rc<W>) -> RawWaker {
     unsafe fn clone_waker<W: LocalWake + 'static>(waker: *const ()) -> RawWaker {
         unsafe { Rc::increment_strong_count(waker as *const W) };
         RawWaker::new(
-            waker as *const (),
+            waker,
             &RawWakerVTable::new(clone_waker::<W>, wake::<W>, wake_by_ref::<W>, drop_waker::<W>),
         )
     }

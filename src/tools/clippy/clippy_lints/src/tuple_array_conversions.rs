@@ -1,5 +1,6 @@
-use clippy_config::msrvs::{self, Msrv};
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::visitors::for_each_local_use_after_expr;
 use clippy_utils::{is_from_proc_macro, path_to_local};
 use itertools::Itertools;
@@ -42,9 +43,15 @@ declare_clippy_lint! {
 }
 impl_lint_pass!(TupleArrayConversions => [TUPLE_ARRAY_CONVERSIONS]);
 
-#[derive(Clone)]
 pub struct TupleArrayConversions {
-    pub msrv: Msrv,
+    msrv: Msrv,
+}
+impl TupleArrayConversions {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
+    }
 }
 
 impl LateLintPass<'_> for TupleArrayConversions {
@@ -159,7 +166,7 @@ fn all_bindings_are_for_conv<'tcx>(
         .iter()
         .map(|node| match node {
             Node::Pat(pat) => kind.eq(&pat.kind).then_some(pat.hir_id),
-            Node::Local(l) => Some(l.hir_id),
+            Node::LetStmt(l) => Some(l.hir_id),
             _ => None,
         })
         .all_equal()
@@ -170,7 +177,7 @@ fn all_bindings_are_for_conv<'tcx>(
         && local_parents.first().is_some_and(|node| {
             let Some(ty) = match node {
                 Node::Pat(pat) => Some(pat.hir_id),
-                Node::Local(l) => Some(l.hir_id),
+                Node::LetStmt(l) => Some(l.hir_id),
                 _ => None,
             }
             .map(|hir_id| cx.typeck_results().node_type(hir_id)) else {
@@ -183,7 +190,7 @@ fn all_bindings_are_for_conv<'tcx>(
                     tys.len() == elements.len() && tys.iter().chain(final_tys.iter().copied()).all_equal()
                 },
                 (ToType::Tuple, ty::Array(ty, len)) => {
-                    let Some(len) = len.try_eval_target_usize(cx.tcx, cx.param_env) else { return false };
+                    let Some(len) = len.try_to_target_usize(cx.tcx) else { return false };
                     len as usize == elements.len() && final_tys.iter().chain(once(ty)).all_equal()
                 },
                 _ => false,

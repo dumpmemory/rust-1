@@ -1,19 +1,20 @@
-use crate::dep_graph::dep_kinds;
-use crate::query::plumbing::CyclePlaceholder;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{codes::*, pluralize, struct_span_code_err, Applicability, MultiSpan};
-use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
-use rustc_middle::ty::Representability;
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_query_system::query::{report_cycle, CycleError};
-use rustc_query_system::Value;
-use rustc_span::def_id::LocalDefId;
-use rustc_span::{ErrorGuaranteed, Span};
-
 use std::collections::VecDeque;
 use std::fmt::Write;
 use std::ops::ControlFlow;
+
+use rustc_data_structures::fx::FxHashSet;
+use rustc_errors::codes::*;
+use rustc_errors::{Applicability, MultiSpan, pluralize, struct_span_code_err};
+use rustc_hir as hir;
+use rustc_hir::def::{DefKind, Res};
+use rustc_middle::ty::{self, Representability, Ty, TyCtxt};
+use rustc_query_system::Value;
+use rustc_query_system::query::{CycleError, report_cycle};
+use rustc_span::def_id::LocalDefId;
+use rustc_span::{ErrorGuaranteed, Span};
+
+use crate::dep_graph::dep_kinds;
+use crate::query::plumbing::CyclePlaceholder;
 
 impl<'tcx> Value<TyCtxt<'tcx>> for Ty<'_> {
     fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &CycleError, guar: ErrorGuaranteed) -> Self {
@@ -23,7 +24,7 @@ impl<'tcx> Value<TyCtxt<'tcx>> for Ty<'_> {
     }
 }
 
-impl<'tcx> Value<TyCtxt<'tcx>> for Result<ty::EarlyBinder<Ty<'_>>, CyclePlaceholder> {
+impl<'tcx> Value<TyCtxt<'tcx>> for Result<ty::EarlyBinder<'_, Ty<'_>>, CyclePlaceholder> {
     fn from_cycle_error(_tcx: TyCtxt<'tcx>, _: &CycleError, guar: ErrorGuaranteed) -> Self {
         Err(CyclePlaceholder(guar))
     }
@@ -55,7 +56,7 @@ impl<'tcx> Value<TyCtxt<'tcx>> for ty::Binder<'_, ty::FnSig<'_>> {
             && let Some(node) = tcx.hir().get_if_local(def_id)
             && let Some(sig) = node.fn_sig()
         {
-            sig.decl.inputs.len() + sig.decl.implicit_self.has_implicit_self() as usize
+            sig.decl.inputs.len()
         } else {
             tcx.dcx().abort_if_errors();
             unreachable!()
@@ -65,8 +66,8 @@ impl<'tcx> Value<TyCtxt<'tcx>> for ty::Binder<'_, ty::FnSig<'_>> {
             std::iter::repeat(err).take(arity),
             err,
             false,
-            rustc_hir::Unsafety::Normal,
-            rustc_target::spec::abi::Abi::Rust,
+            rustc_hir::Safety::Safe,
+            rustc_abi::ExternAbi::Rust,
         ));
 
         // SAFETY: This is never called when `Self` is not `ty::Binder<'tcx, ty::FnSig<'tcx>>`.
@@ -99,19 +100,19 @@ impl<'tcx> Value<TyCtxt<'tcx>> for Representability {
         }
         for info in &cycle_error.cycle {
             if info.query.dep_kind == dep_kinds::representability_adt_ty
-                && let Some(def_id) = info.query.ty_def_id
+                && let Some(def_id) = info.query.def_id_for_ty_in_cycle
                 && let Some(def_id) = def_id.as_local()
                 && !item_and_field_ids.iter().any(|&(id, _)| id == def_id)
             {
                 representable_ids.insert(def_id);
             }
         }
-        recursive_type_error(tcx, item_and_field_ids, &representable_ids);
-        Representability::Infinite
+        let guar = recursive_type_error(tcx, item_and_field_ids, &representable_ids);
+        Representability::Infinite(guar)
     }
 }
 
-impl<'tcx> Value<TyCtxt<'tcx>> for ty::EarlyBinder<Ty<'_>> {
+impl<'tcx> Value<TyCtxt<'tcx>> for ty::EarlyBinder<'_, Ty<'_>> {
     fn from_cycle_error(
         tcx: TyCtxt<'tcx>,
         cycle_error: &CycleError,
@@ -121,7 +122,7 @@ impl<'tcx> Value<TyCtxt<'tcx>> for ty::EarlyBinder<Ty<'_>> {
     }
 }
 
-impl<'tcx> Value<TyCtxt<'tcx>> for ty::EarlyBinder<ty::Binder<'_, ty::FnSig<'_>>> {
+impl<'tcx> Value<TyCtxt<'tcx>> for ty::EarlyBinder<'_, ty::Binder<'_, ty::FnSig<'_>>> {
     fn from_cycle_error(
         tcx: TyCtxt<'tcx>,
         cycle_error: &CycleError,
@@ -141,8 +142,8 @@ impl<'tcx> Value<TyCtxt<'tcx>> for &[ty::Variance] {
             && frame.query.dep_kind == dep_kinds::variances_of
             && let Some(def_id) = frame.query.def_id
         {
-            let n = tcx.generics_of(def_id).params.len();
-            vec![ty::Variance::Bivariant; n].leak()
+            let n = tcx.generics_of(def_id).own_params.len();
+            vec![ty::Bivariant; n].leak()
         } else {
             span_bug!(
                 cycle_error.usage.as_ref().unwrap().0,
@@ -181,7 +182,7 @@ impl<'tcx, T> Value<TyCtxt<'tcx>> for Result<T, &'_ ty::layout::LayoutError<'_>>
             &cycle_error.cycle,
             |cycle| {
                 if cycle[0].query.dep_kind == dep_kinds::layout_of
-                    && let Some(def_id) = cycle[0].query.ty_def_id
+                    && let Some(def_id) = cycle[0].query.def_id_for_ty_in_cycle
                     && let Some(def_id) = def_id.as_local()
                     && let def_kind = tcx.def_kind(def_id)
                     && matches!(def_kind, DefKind::Closure)
@@ -208,7 +209,7 @@ impl<'tcx, T> Value<TyCtxt<'tcx>> for Result<T, &'_ ty::layout::LayoutError<'_>>
                         if frame.query.dep_kind != dep_kinds::layout_of {
                             continue;
                         }
-                        let Some(frame_def_id) = frame.query.ty_def_id else {
+                        let Some(frame_def_id) = frame.query.def_id_for_ty_in_cycle else {
                             continue;
                         };
                         let Some(frame_coroutine_kind) = tcx.coroutine_kind(frame_def_id) else {
@@ -268,7 +269,7 @@ pub fn recursive_type_error(
     tcx: TyCtxt<'_>,
     mut item_and_field_ids: Vec<(LocalDefId, LocalDefId)>,
     representable_ids: &FxHashSet<LocalDefId>,
-) {
+) -> ErrorGuaranteed {
     const ITEM_LIMIT: usize = 5;
 
     // Rotate the cycle so that the item with the lowest span is first
@@ -344,7 +345,7 @@ pub fn recursive_type_error(
         suggestion,
         Applicability::HasPlaceholders,
     )
-    .emit();
+    .emit()
 }
 
 fn find_item_ty_spans(
@@ -357,7 +358,7 @@ fn find_item_ty_spans(
     match ty.kind {
         hir::TyKind::Path(hir::QPath::Resolved(_, path)) => {
             if let Res::Def(kind, def_id) = path.res
-                && !matches!(kind, DefKind::TyAlias)
+                && matches!(kind, DefKind::Enum | DefKind::Struct | DefKind::Union)
             {
                 let check_params = def_id.as_local().map_or(true, |def_id| {
                     if def_id == needle {

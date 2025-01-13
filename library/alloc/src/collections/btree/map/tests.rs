@@ -1,3 +1,10 @@
+use core::assert_matches::assert_matches;
+use std::iter;
+use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+
 use super::*;
 use crate::boxed::Box;
 use crate::fmt::Debug;
@@ -6,11 +13,6 @@ use crate::string::{String, ToString};
 use crate::testing::crash_test::{CrashTestDummy, Panic};
 use crate::testing::ord_chaos::{Cyclic3, Governed, Governor};
 use crate::testing::rng::DeterministicRng;
-use core::assert_matches::assert_matches;
-use std::iter;
-use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 // Minimum number of elements to insert, to guarantee a tree with 2 levels,
 // i.e., a tree who's root is an internal node at height 1, with edges to leaf nodes.
@@ -1214,7 +1216,7 @@ mod test_extract_if {
         {
             let mut it = map.extract_if(|dummy, _| dummy.query(true));
             catch_unwind(AssertUnwindSafe(|| while it.next().is_some() {})).unwrap_err();
-            // Iterator behaviour after a panic is explicitly unspecified,
+            // Iterator behavior after a panic is explicitly unspecified,
             // so this is just the current implementation:
             let result = catch_unwind(AssertUnwindSafe(|| it.next()));
             assert!(matches!(result, Ok(None)));
@@ -1796,18 +1798,18 @@ fn test_ord_absence() {
     }
 
     fn map_debug<K: Debug>(mut map: BTreeMap<K, ()>) {
-        format!("{map:?}");
-        format!("{:?}", map.iter());
-        format!("{:?}", map.iter_mut());
-        format!("{:?}", map.keys());
-        format!("{:?}", map.values());
-        format!("{:?}", map.values_mut());
+        let _ = format!("{map:?}");
+        let _ = format!("{:?}", map.iter());
+        let _ = format!("{:?}", map.iter_mut());
+        let _ = format!("{:?}", map.keys());
+        let _ = format!("{:?}", map.values());
+        let _ = format!("{:?}", map.values_mut());
         if true {
-            format!("{:?}", map.into_iter());
+            let _ = format!("{:?}", map.into_iter());
         } else if true {
-            format!("{:?}", map.into_keys());
+            let _ = format!("{:?}", map.into_keys());
         } else {
-            format!("{:?}", map.into_values());
+            let _ = format!("{:?}", map.into_values());
         }
     }
 
@@ -2266,6 +2268,54 @@ fn test_into_iter_drop_leak_height_0() {
     assert_eq!(c.dropped(), 1);
     assert_eq!(d.dropped(), 1);
     assert_eq!(e.dropped(), 1);
+}
+
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_into_iter_drop_leak_kv_panic_in_key() {
+    let a_k = CrashTestDummy::new(0);
+    let a_v = CrashTestDummy::new(1);
+    let b_k = CrashTestDummy::new(2);
+    let b_v = CrashTestDummy::new(3);
+    let c_k = CrashTestDummy::new(4);
+    let c_v = CrashTestDummy::new(5);
+    let mut map = BTreeMap::new();
+    map.insert(a_k.spawn(Panic::Never), a_v.spawn(Panic::Never));
+    map.insert(b_k.spawn(Panic::InDrop), b_v.spawn(Panic::Never));
+    map.insert(c_k.spawn(Panic::Never), c_v.spawn(Panic::Never));
+
+    catch_unwind(move || drop(map.into_iter())).unwrap_err();
+
+    assert_eq!(a_k.dropped(), 1);
+    assert_eq!(a_v.dropped(), 1);
+    assert_eq!(b_k.dropped(), 1);
+    assert_eq!(b_v.dropped(), 1);
+    assert_eq!(c_k.dropped(), 1);
+    assert_eq!(c_v.dropped(), 1);
+}
+
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_into_iter_drop_leak_kv_panic_in_val() {
+    let a_k = CrashTestDummy::new(0);
+    let a_v = CrashTestDummy::new(1);
+    let b_k = CrashTestDummy::new(2);
+    let b_v = CrashTestDummy::new(3);
+    let c_k = CrashTestDummy::new(4);
+    let c_v = CrashTestDummy::new(5);
+    let mut map = BTreeMap::new();
+    map.insert(a_k.spawn(Panic::Never), a_v.spawn(Panic::Never));
+    map.insert(b_k.spawn(Panic::Never), b_v.spawn(Panic::InDrop));
+    map.insert(c_k.spawn(Panic::Never), c_v.spawn(Panic::Never));
+
+    catch_unwind(move || drop(map.into_iter())).unwrap_err();
+
+    assert_eq!(a_k.dropped(), 1);
+    assert_eq!(a_v.dropped(), 1);
+    assert_eq!(b_k.dropped(), 1);
+    assert_eq!(b_v.dropped(), 1);
+    assert_eq!(c_k.dropped(), 1);
+    assert_eq!(c_v.dropped(), 1);
 }
 
 #[test]

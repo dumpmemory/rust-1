@@ -4,7 +4,7 @@
 //! Expansion, and Definition Contexts,” *Journal of Functional Programming* 22, no. 2
 //! (March 1, 2012): 181–216, <https://doi.org/10.1017/S0956796812000093>.
 //!
-//! Also see https://rustc-dev-guide.rust-lang.org/macro-expansion.html#hygiene-and-hierarchies
+//! Also see <https://rustc-dev-guide.rust-lang.org/macro-expansion.html#hygiene-and-hierarchies>
 //!
 //! # The Expansion Order Hierarchy
 //!
@@ -65,7 +65,7 @@ pub(super) fn apply_mark(
         return apply_mark_internal(db, ctxt, call_id, transparency);
     }
 
-    let call_site_ctxt = db.lookup_intern_macro_call(call_id).call_site.ctx;
+    let call_site_ctxt = db.lookup_intern_macro_call(call_id).ctxt;
     let mut call_site_ctxt = if transparency == Transparency::SemiTransparent {
         call_site_ctxt.normalize_to_macros_2_0(db)
     } else {
@@ -97,7 +97,7 @@ fn apply_mark_internal(
     call_id: MacroCallId,
     transparency: Transparency,
 ) -> SyntaxContextId {
-    use base_db::salsa;
+    use base_db::ra_salsa;
 
     let call_id = Some(call_id);
 
@@ -107,7 +107,7 @@ fn apply_mark_internal(
 
     if transparency >= Transparency::Opaque {
         let parent = opaque;
-        opaque = salsa::plumbing::get_query_table::<InternSyntaxContextQuery>(db).get_or_insert(
+        opaque = ra_salsa::plumbing::get_query_table::<InternSyntaxContextQuery>(db).get_or_insert(
             (parent, call_id, transparency),
             |new_opaque| SyntaxContextData {
                 outer_expn: call_id,
@@ -122,7 +122,7 @@ fn apply_mark_internal(
     if transparency >= Transparency::SemiTransparent {
         let parent = opaque_and_semitransparent;
         opaque_and_semitransparent =
-            salsa::plumbing::get_query_table::<InternSyntaxContextQuery>(db).get_or_insert(
+            ra_salsa::plumbing::get_query_table::<InternSyntaxContextQuery>(db).get_or_insert(
                 (parent, call_id, transparency),
                 |new_opaque_and_semitransparent| SyntaxContextData {
                     outer_expn: call_id,
@@ -151,6 +151,7 @@ pub trait SyntaxContextExt {
     fn remove_mark(&mut self, db: &dyn ExpandDatabase) -> (Option<MacroCallId>, Transparency);
     fn outer_mark(self, db: &dyn ExpandDatabase) -> (Option<MacroCallId>, Transparency);
     fn marks(self, db: &dyn ExpandDatabase) -> Vec<(MacroCallId, Transparency)>;
+    fn is_opaque(self, db: &dyn ExpandDatabase) -> bool;
 }
 
 impl SyntaxContextExt for SyntaxContextId {
@@ -177,6 +178,9 @@ impl SyntaxContextExt for SyntaxContextId {
         marks.reverse();
         marks
     }
+    fn is_opaque(self, db: &dyn ExpandDatabase) -> bool {
+        !self.is_root() && db.lookup_intern_syntax_context(self).outer_transparency.is_opaque()
+    }
 }
 
 // FIXME: Make this a SyntaxContextExt method once we have RPIT
@@ -196,7 +200,7 @@ pub fn marks_rev(
 
 pub(crate) fn dump_syntax_contexts(db: &dyn ExpandDatabase) -> String {
     use crate::db::{InternMacroCallLookupQuery, InternSyntaxContextLookupQuery};
-    use base_db::salsa::debug::DebugQueryTable;
+    use base_db::ra_salsa::debug::DebugQueryTable;
 
     let mut s = String::from("Expansions:");
     let mut entries = InternMacroCallLookupQuery.in_db(db).entries::<Vec<_>>();
@@ -205,11 +209,10 @@ pub(crate) fn dump_syntax_contexts(db: &dyn ExpandDatabase) -> String {
         let id = e.key;
         let expn_data = e.value.as_ref().unwrap();
         s.push_str(&format!(
-            "\n{:?}: parent: {:?}, call_site_ctxt: {:?}, def_site_ctxt: {:?}, kind: {:?}",
+            "\n{:?}: parent: {:?}, call_site_ctxt: {:?}, kind: {:?}",
             id,
             expn_data.kind.file_id(),
-            expn_data.call_site,
-            SyntaxContextId::ROOT, // FIXME expn_data.def_site,
+            expn_data.ctxt,
             expn_data.kind.descr(),
         ));
     }
@@ -224,7 +227,7 @@ pub(crate) fn dump_syntax_contexts(db: &dyn ExpandDatabase) -> String {
             &'a SyntaxContextData,
         );
 
-        impl<'a> std::fmt::Debug for SyntaxContextDebug<'a> {
+        impl std::fmt::Debug for SyntaxContextDebug<'_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 fancy_debug(self.2, self.1, self.0, f)
             }

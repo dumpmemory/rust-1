@@ -1,3 +1,5 @@
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@ check-fail
 //@ failure-status: 101
 //@ dont-check-compiler-stderr

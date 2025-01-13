@@ -1,151 +1,107 @@
-use std::env;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+//! `run-make-support` is a support library for run-make tests. It provides command wrappers and
+//! convenience utility functions to help test writers reduce duplication. The support library
+//! notably is built via cargo: this means that if your test wants some non-trivial utility, such
+//! as `object` or `wasmparser`, they can be re-exported and be made available through this library.
 
-fn setup_common_build_cmd() -> Command {
-    let rustc = env::var("RUSTC").unwrap();
-    let mut cmd = Command::new(rustc);
-    cmd.arg("--out-dir")
-        .arg(env::var("TMPDIR").unwrap())
-        .arg("-L")
-        .arg(env::var("TMPDIR").unwrap());
-    cmd
+// We want to control use declaration ordering and spacing (and preserve use group comments), so
+// skip rustfmt on this file.
+#![cfg_attr(rustfmt, rustfmt::skip)]
+#![warn(unreachable_pub)]
+
+mod command;
+mod macros;
+mod util;
+
+pub mod artifact_names;
+pub mod assertion_helpers;
+pub mod diff;
+pub mod env;
+pub mod external_deps;
+pub mod path_helpers;
+pub mod run;
+pub mod scoped_run;
+pub mod string;
+pub mod targets;
+pub mod symbols;
+
+// Internally we call our fs-related support module as `fs`, but re-export its content as `rfs`
+// to tests to avoid colliding with commonly used `use std::fs;`.
+mod fs;
+
+/// [`std::fs`] wrappers and assorted filesystem-related helpers. Public to tests as `rfs` to not be
+/// confused with [`std::fs`].
+pub mod rfs {
+    pub use crate::fs::*;
 }
 
-fn handle_failed_output(cmd: &str, output: Output, caller_line_number: u32) -> ! {
-    eprintln!("command failed at line {caller_line_number}");
-    eprintln!("{cmd}");
-    eprintln!("output status: `{}`", output.status);
-    eprintln!("=== STDOUT ===\n{}\n\n", String::from_utf8(output.stdout).unwrap());
-    eprintln!("=== STDERR ===\n{}\n\n", String::from_utf8(output.stderr).unwrap());
-    std::process::exit(1)
-}
+// Re-exports of third-party library crates.
+// tidy-alphabetical-start
+pub use bstr;
+pub use gimli;
+pub use libc;
+pub use object;
+pub use regex;
+pub use serde_json;
+pub use similar;
+pub use wasmparser;
+// tidy-alphabetical-end
 
-pub fn rustc() -> RustcInvocationBuilder {
-    RustcInvocationBuilder::new()
-}
+// Re-exports of external dependencies.
+pub use external_deps::{c_build, c_cxx_compiler, clang, htmldocck, llvm, python, rustc, rustdoc};
 
-pub fn aux_build() -> AuxBuildInvocationBuilder {
-    AuxBuildInvocationBuilder::new()
-}
+// These rely on external dependencies.
+pub use c_cxx_compiler::{Cc, Gcc, cc, cxx, extra_c_flags, extra_cxx_flags, gcc};
+pub use c_build::{
+    build_native_dynamic_lib, build_native_static_lib, build_native_static_lib_cxx,
+    build_native_static_lib_optimized,
+};
+pub use cargo::cargo;
+pub use clang::{clang, Clang};
+pub use htmldocck::htmldocck;
+pub use llvm::{
+    llvm_ar, llvm_bcanalyzer, llvm_dis, llvm_dwarfdump, llvm_filecheck, llvm_nm, llvm_objcopy,
+    llvm_objdump, llvm_profdata, llvm_readobj, LlvmAr, LlvmBcanalyzer, LlvmDis, LlvmDwarfdump,
+    LlvmFilecheck, LlvmNm, LlvmObjcopy, LlvmObjdump, LlvmProfdata, LlvmReadobj,
+};
+pub use python::python_command;
+pub use rustc::{aux_build, bare_rustc, rustc, rustc_path, Rustc};
+pub use rustdoc::{bare_rustdoc, rustdoc, Rustdoc};
 
-#[derive(Debug)]
-pub struct RustcInvocationBuilder {
-    cmd: Command,
-}
+/// [`diff`][mod@diff] is implemented in terms of the [similar] library.
+///
+/// [similar]: https://github.com/mitsuhiko/similar
+pub use diff::{diff, Diff};
 
-impl RustcInvocationBuilder {
-    fn new() -> Self {
-        let cmd = setup_common_build_cmd();
-        Self { cmd }
-    }
+/// Panic-on-fail [`std::env::var`] and [`std::env::var_os`] wrappers.
+pub use env::{env_var, env_var_os, set_current_dir};
 
-    pub fn arg(&mut self, arg: &str) -> &mut RustcInvocationBuilder {
-        self.cmd.arg(arg);
-        self
-    }
+/// Convenience helpers for running binaries and other commands.
+pub use run::{cmd, run, run_fail, run_with_args};
 
-    #[track_caller]
-    pub fn run(&mut self) -> Output {
-        let caller_location = std::panic::Location::caller();
-        let caller_line_number = caller_location.line();
+/// Helpers for checking target information.
+pub use targets::{is_aix, is_darwin, is_msvc, is_windows, llvm_components_contain, target, uname, apple_os};
 
-        let output = self.cmd.output().unwrap();
-        if !output.status.success() {
-            handle_failed_output(&format!("{:#?}", self.cmd), output, caller_line_number);
-        }
-        output
-    }
-}
+/// Helpers for building names of output artifacts that are potentially target-specific.
+pub use artifact_names::{
+    bin_name, dynamic_lib_extension, dynamic_lib_name, msvc_import_dynamic_lib_name, rust_lib_name,
+    static_lib_name,
+};
 
-#[derive(Debug)]
-pub struct AuxBuildInvocationBuilder {
-    cmd: Command,
-}
+/// Path-related helpers.
+pub use path_helpers::{
+    cwd, filename_contains, filename_not_in_denylist, has_extension, has_prefix, has_suffix,
+    not_contains, path, shallow_find_files, source_root,
+};
 
-impl AuxBuildInvocationBuilder {
-    fn new() -> Self {
-        let mut cmd = setup_common_build_cmd();
-        cmd.arg("--crate-type=lib");
-        Self { cmd }
-    }
+/// Helpers for scoped test execution where certain properties are attempted to be maintained.
+pub use scoped_run::{run_in_tmpdir, test_while_readonly};
 
-    pub fn arg(&mut self, arg: &str) -> &mut AuxBuildInvocationBuilder {
-        self.cmd.arg(arg);
-        self
-    }
+pub use assertion_helpers::{
+    assert_contains, assert_contains_regex, assert_count_is, assert_dirs_are_equal, assert_equals,
+    assert_not_contains, assert_not_contains_regex,
+};
 
-    #[track_caller]
-    pub fn run(&mut self) -> Output {
-        let caller_location = std::panic::Location::caller();
-        let caller_line_number = caller_location.line();
-
-        let output = self.cmd.output().unwrap();
-        if !output.status.success() {
-            handle_failed_output(&format!("{:#?}", self.cmd), output, caller_line_number);
-        }
-        output
-    }
-}
-
-fn run_common(bin_name: &str) -> (Command, Output) {
-    let target = env::var("TARGET").unwrap();
-
-    let bin_name =
-        if target.contains("windows") { format!("{}.exe", bin_name) } else { bin_name.to_owned() };
-
-    let mut bin_path = PathBuf::new();
-    bin_path.push(env::var("TMPDIR").unwrap());
-    bin_path.push(&bin_name);
-    let ld_lib_path_envvar = env::var("LD_LIB_PATH_ENVVAR").unwrap();
-    let mut cmd = Command::new(bin_path);
-    cmd.env(&ld_lib_path_envvar, {
-        let mut paths = vec![];
-        paths.push(PathBuf::from(env::var("TMPDIR").unwrap()));
-        for p in env::split_paths(&env::var("TARGET_RPATH_ENV").unwrap()) {
-            paths.push(p.to_path_buf());
-        }
-        for p in env::split_paths(&env::var(&ld_lib_path_envvar).unwrap()) {
-            paths.push(p.to_path_buf());
-        }
-        env::join_paths(paths.iter()).unwrap()
-    });
-
-    if target.contains("windows") {
-        let mut paths = vec![];
-        for p in env::split_paths(&std::env::var("PATH").unwrap_or(String::new())) {
-            paths.push(p.to_path_buf());
-        }
-        paths.push(Path::new(&std::env::var("TARGET_RPATH_DIR").unwrap()).to_path_buf());
-        cmd.env("PATH", env::join_paths(paths.iter()).unwrap());
-    }
-
-    let output = cmd.output().unwrap();
-    (cmd, output)
-}
-
-/// Run a built binary and make sure it succeeds.
-#[track_caller]
-pub fn run(bin_name: &str) -> Output {
-    let caller_location = std::panic::Location::caller();
-    let caller_line_number = caller_location.line();
-
-    let (cmd, output) = run_common(bin_name);
-    if !output.status.success() {
-        handle_failed_output(&format!("{:#?}", cmd), output, caller_line_number);
-    }
-    output
-}
-
-/// Run a built binary and make sure it fails.
-#[track_caller]
-pub fn run_fail(bin_name: &str) -> Output {
-    let caller_location = std::panic::Location::caller();
-    let caller_line_number = caller_location.line();
-
-    let (cmd, output) = run_common(bin_name);
-    if output.status.success() {
-        handle_failed_output(&format!("{:#?}", cmd), output, caller_line_number);
-    }
-    output
-}
+pub use string::{
+    count_regex_matches_in_files_with_extension, invalid_utf8_contains, invalid_utf8_not_contains,
+};
+use crate::external_deps::cargo;

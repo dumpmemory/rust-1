@@ -4,11 +4,12 @@
 //! def-path. This is used for unit testing the code that generates
 //! paths etc in all kinds of annoying scenarios.
 
-use crate::errors::{Kind, TestOutput};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{GenericArgs, Instance, TyCtxt};
-use rustc_span::symbol::{sym, Symbol};
+use rustc_span::{Symbol, sym};
+
+use crate::errors::{Kind, TestOutput};
 
 const SYMBOL_NAME: Symbol = sym::rustc_symbol_name;
 const DEF_PATH: Symbol = sym::rustc_def_path;
@@ -17,7 +18,7 @@ pub fn report_symbol_names(tcx: TyCtxt<'_>) {
     // if the `rustc_attrs` feature is not enabled, then the
     // attributes we are interested in cannot be present anyway, so
     // skip the walk.
-    if !tcx.features().rustc_attrs {
+    if !tcx.features().rustc_attrs() {
         return;
     }
 
@@ -25,7 +26,7 @@ pub fn report_symbol_names(tcx: TyCtxt<'_>) {
         let mut symbol_names = SymbolNamesTest { tcx };
         let crate_items = tcx.hir_crate_items(());
 
-        for id in crate_items.items() {
+        for id in crate_items.free_items() {
             symbol_names.process_attrs(id.owner_id.def_id);
         }
 

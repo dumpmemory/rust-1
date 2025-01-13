@@ -1,4 +1,5 @@
 use expect_test::{expect, Expect};
+use span::Edition;
 use test_fixture::WithFixture;
 
 use crate::{db::DefDatabase, test_db::TestDB};
@@ -6,7 +7,7 @@ use crate::{db::DefDatabase, test_db::TestDB};
 fn check(ra_fixture: &str, expect: Expect) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
     let item_tree = db.file_item_tree(file_id.into());
-    let pretty = item_tree.pretty_print(&db);
+    let pretty = item_tree.pretty_print(&db, Edition::CURRENT);
     expect.assert_eq(&pretty);
 }
 
@@ -129,40 +130,34 @@ enum E {
             #[derive(Debug)]
             // AstId: 2
             pub(self) struct Struct {
-                // AstId: 6
                 #[doc = " fld docs"]
                 pub(self) fld: (),
             }
 
             // AstId: 3
             pub(self) struct Tuple(
-                // AstId: 7
                 #[attr]
                 pub(self) 0: u8,
             );
 
             // AstId: 4
             pub(self) union Ize {
-                // AstId: 8
                 pub(self) a: (),
-                // AstId: 9
                 pub(self) b: (),
             }
 
             // AstId: 5
             pub(self) enum E {
-                // AstId: 10
+                // AstId: 6
                 #[doc = " comment on Unit"]
                 Unit,
-                // AstId: 11
+                // AstId: 7
                 #[doc = " comment on Tuple"]
                 Tuple(
-                    // AstId: 13
                     pub(self) 0: u8,
                 ),
-                // AstId: 12
+                // AstId: 8
                 Struct {
-                    // AstId: 14
                     #[doc = " comment on a: u8"]
                     pub(self) a: u8,
                 },
@@ -201,9 +196,7 @@ trait Tr: SuperTrait + 'lifetime {
             // AstId: 3
             pub(self) fn f(
                 #[attr]
-                // AstId: 5
                 u8,
-                // AstId: 6
                 (),
             ) -> () { ... }
 
@@ -213,12 +206,11 @@ trait Tr: SuperTrait + 'lifetime {
                 Self: SuperTrait,
                 Self: 'lifetime
             {
-                // AstId: 8
+                // AstId: 6
                 pub(self) type Assoc: AssocBound = Default;
 
-                // AstId: 9
+                // AstId: 7
                 pub(self) fn method(
-                    // AstId: 10
                     self: &Self,
                 ) -> ();
             }
@@ -278,7 +270,7 @@ m!();
             // AstId: 2
             pub macro m2 { ... }
 
-            // AstId: 3, Span: 0:3@0..5#0, ExpandTo: Items
+            // AstId: 3, SyntaxContext: 0, ExpandTo: Items
             m!(...);
         "#]],
     );
@@ -300,17 +292,11 @@ struct S {
         expect![[r#"
             // AstId: 1
             pub(self) struct S {
-                // AstId: 2
                 pub(self) a: self::Ty,
-                // AstId: 3
                 pub(self) b: super::SuperTy,
-                // AstId: 4
                 pub(self) c: super::super::SuperSuperTy,
-                // AstId: 5
                 pub(self) d: ::abs::Path,
-                // AstId: 6
                 pub(self) e: crate::Crate,
-                // AstId: 7
                 pub(self) f: plain::path::Ty,
             }
         "#]],
@@ -331,13 +317,9 @@ struct S {
         expect![[r#"
             // AstId: 1
             pub(self) struct S {
-                // AstId: 2
                 pub(self) a: Mixed::<'a, T, Item = (), OtherItem = u8>,
-                // AstId: 3
                 pub(self) b: Qualified::<Self=Fully>::Syntax,
-                // AstId: 4
                 pub(self) c: <TypeAnchored>::Path::<'a>,
-                // AstId: 5
                 pub(self) d: dyn for<'a> Trait::<'a>,
             }
         "#]],
@@ -369,17 +351,15 @@ trait Tr<'a, T: 'a>: Super where Self: for<'a> Tr<'a, T> {}
             where
                 T: Copy,
                 T: 'a,
-                T: 'b
+                T: 'b,
+                'b: 'a
             {
-                // AstId: 8
                 pub(self) field: &'a &'b T,
             }
 
             // AstId: 2
             pub(self) struct Tuple<T, U>(
-                // AstId: 9
                 pub(self) 0: T,
-                // AstId: 10
                 pub(self) 1: U,
             )
             where
@@ -391,11 +371,11 @@ trait Tr<'a, T: 'a>: Super where Self: for<'a> Tr<'a, T> {}
             where
                 T: Copy,
                 T: 'a,
-                T: 'b
+                T: 'b,
+                'b: 'a
             {
-                // AstId: 12
+                // AstId: 9
                 pub(self) fn f<G>(
-                    // AstId: 13
                     impl Copy,
                 ) -> impl Copy
                 where
@@ -427,10 +407,18 @@ fn generics_with_attributes() {
     check(
         r#"
 struct S<#[cfg(never)] T>;
+struct S<A, B, #[cfg(never)] C>;
+struct S<A, #[cfg(never)] B, C>;
         "#,
         expect![[r#"
             // AstId: 1
             pub(self) struct S<#[cfg(never)] T>;
+
+            // AstId: 2
+            pub(self) struct S<A, B, #[cfg(never)] C>;
+
+            // AstId: 3
+            pub(self) struct S<A, #[cfg(never)] B, C>;
         "#]],
     )
 }

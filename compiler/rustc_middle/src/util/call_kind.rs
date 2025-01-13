@@ -2,17 +2,19 @@
 //! as well as errors when attempting to call a non-const function in a const
 //! context.
 
-use crate::ty::GenericArgsRef;
-use crate::ty::{AssocItemContainer, Instance, ParamEnv, Ty, TyCtxt};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{lang_items, LangItem};
-use rustc_span::symbol::Ident;
-use rustc_span::{sym, DesugaringKind, Span};
+use rustc_hir::{LangItem, lang_items};
+use rustc_span::{DesugaringKind, Ident, Span, sym};
+use tracing::debug;
+
+use crate::ty::{AssocItemContainer, GenericArgsRef, Instance, Ty, TyCtxt, TypingEnv};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CallDesugaringKind {
     /// for _ in x {} calls x.into_iter()
     ForLoopIntoIter,
+    /// for _ in x {} calls iter.next()
+    ForLoopNext,
     /// x? calls x.branch()
     QuestionBranch,
     /// x? calls type_of(x)::from_residual()
@@ -27,6 +29,7 @@ impl CallDesugaringKind {
     pub fn trait_def_id(self, tcx: TyCtxt<'_>) -> DefId {
         match self {
             Self::ForLoopIntoIter => tcx.get_diagnostic_item(sym::IntoIterator).unwrap(),
+            Self::ForLoopNext => tcx.require_lang_item(LangItem::Iterator, None),
             Self::QuestionBranch | Self::TryBlockFromOutput => {
                 tcx.require_lang_item(LangItem::Try, None)
             }
@@ -61,7 +64,7 @@ pub enum CallKind<'tcx> {
 
 pub fn call_kind<'tcx>(
     tcx: TyCtxt<'tcx>,
-    param_env: ParamEnv<'tcx>,
+    typing_env: TypingEnv<'tcx>,
     method_did: DefId,
     method_args: GenericArgsRef<'tcx>,
     fn_call_span: Span,
@@ -71,8 +74,8 @@ pub fn call_kind<'tcx>(
     let parent = tcx.opt_associated_item(method_did).and_then(|assoc| {
         let container_id = assoc.container_id(tcx);
         match assoc.container {
-            AssocItemContainer::ImplContainer => tcx.trait_id_of_impl(container_id),
-            AssocItemContainer::TraitContainer => Some(container_id),
+            AssocItemContainer::Impl => tcx.trait_id_of_impl(container_id),
+            AssocItemContainer::Trait => Some(container_id),
         }
     });
 
@@ -97,10 +100,10 @@ pub fn call_kind<'tcx>(
         Some(CallKind::Operator { self_arg, trait_id, self_ty: method_args.type_at(0) })
     } else if is_deref {
         let deref_target = tcx.get_diagnostic_item(sym::deref_target).and_then(|deref_target| {
-            Instance::resolve(tcx, param_env, deref_target, method_args).transpose()
+            Instance::try_resolve(tcx, typing_env, deref_target, method_args).transpose()
         });
         if let Some(Ok(instance)) = deref_target {
-            let deref_target_ty = instance.ty(tcx, param_env);
+            let deref_target_ty = instance.ty(tcx, typing_env);
             Some(CallKind::DerefCoercion {
                 deref_target: tcx.def_span(instance.def_id()),
                 deref_target_ty,
@@ -116,19 +119,23 @@ pub fn call_kind<'tcx>(
     kind.unwrap_or_else(|| {
         // This isn't a 'special' use of `self`
         debug!(?method_did, ?fn_call_span);
-        let desugaring = if Some(method_did) == tcx.lang_items().into_iter_fn()
+        let desugaring = if tcx.is_lang_item(method_did, LangItem::IntoIterIntoIter)
             && fn_call_span.desugaring_kind() == Some(DesugaringKind::ForLoop)
         {
             Some((CallDesugaringKind::ForLoopIntoIter, method_args.type_at(0)))
+        } else if tcx.is_lang_item(method_did, LangItem::IteratorNext)
+            && fn_call_span.desugaring_kind() == Some(DesugaringKind::ForLoop)
+        {
+            Some((CallDesugaringKind::ForLoopNext, method_args.type_at(0)))
         } else if fn_call_span.desugaring_kind() == Some(DesugaringKind::QuestionMark) {
-            if Some(method_did) == tcx.lang_items().branch_fn() {
+            if tcx.is_lang_item(method_did, LangItem::TryTraitBranch) {
                 Some((CallDesugaringKind::QuestionBranch, method_args.type_at(0)))
-            } else if Some(method_did) == tcx.lang_items().from_residual_fn() {
+            } else if tcx.is_lang_item(method_did, LangItem::TryTraitFromResidual) {
                 Some((CallDesugaringKind::QuestionFromResidual, method_args.type_at(0)))
             } else {
                 None
             }
-        } else if Some(method_did) == tcx.lang_items().from_output_fn()
+        } else if tcx.is_lang_item(method_did, LangItem::TryTraitFromOutput)
             && fn_call_span.desugaring_kind() == Some(DesugaringKind::TryBlock)
         {
             Some((CallDesugaringKind::TryBlockFromOutput, method_args.type_at(0)))

@@ -56,11 +56,6 @@
 //! [`Rc`]: rc
 //! [`RefCell`]: core::cell
 
-// To run alloc tests without x.py without ending up with two copies of alloc, Miri needs to be
-// able to "empty" this crate. See <https://github.com/rust-lang/miri-test-libstd/issues/4>.
-// rustc itself never sets the feature, so this line has no effect there.
-#![cfg(any(not(feature = "miri-test-libstd"), test, doctest))]
-//
 #![allow(unused_attributes)]
 #![stable(feature = "alloc", since = "1.36.0")]
 #![doc(
@@ -71,7 +66,6 @@
 #![doc(cfg_hide(
     not(test),
     not(any(test, bootstrap)),
-    any(not(feature = "miri-test-libstd"), test, doctest),
     no_global_oom_handling,
     not(no_global_oom_handling),
     not(no_rc),
@@ -92,14 +86,12 @@
 #![warn(multiple_supertrait_upcastable)]
 #![allow(internal_features)]
 #![allow(rustdoc::redundant_explicit_links)]
+#![warn(rustdoc::unescaped_backticks)]
 #![deny(ffi_unwind_calls)]
 //
 // Library features:
 // tidy-alphabetical-start
-#![cfg_attr(not(no_global_oom_handling), feature(const_alloc_error))]
-#![cfg_attr(not(no_global_oom_handling), feature(const_btree_len))]
-#![cfg_attr(test, feature(is_sorted))]
-#![cfg_attr(test, feature(new_uninit))]
+#![cfg_attr(test, feature(str_as_str))]
 #![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
 #![feature(array_chunks)]
@@ -109,66 +101,59 @@
 #![feature(assert_matches)]
 #![feature(async_fn_traits)]
 #![feature(async_iterator)]
+#![feature(box_uninit_write)]
+#![feature(clone_to_uninit)]
 #![feature(coerce_unsized)]
-#![feature(const_align_of_val)]
-#![feature(const_box)]
-#![feature(const_cow_is_borrowed)]
 #![feature(const_eval_select)]
-#![feature(const_maybe_uninit_as_mut_ptr)]
-#![feature(const_maybe_uninit_write)]
-#![feature(const_pin)]
-#![feature(const_refs_to_cell)]
-#![feature(const_size_of_val)]
-#![feature(const_waker)]
+#![feature(const_heap)]
 #![feature(core_intrinsics)]
 #![feature(deprecated_suggestion)]
+#![feature(deref_pure_trait)]
 #![feature(dispatch_from_dyn)]
 #![feature(error_generic_member_access)]
-#![feature(error_in_core)]
 #![feature(exact_size_is_empty)]
 #![feature(extend_one)]
+#![feature(extend_one_unchecked)]
 #![feature(fmt_internals)]
 #![feature(fn_traits)]
-#![feature(generic_nonzero)]
+#![feature(formatting_options)]
 #![feature(hasher_prefixfree_extras)]
-#![feature(hint_assert_unchecked)]
-#![feature(inline_const)]
 #![feature(inplace_iteration)]
 #![feature(iter_advance_by)]
 #![feature(iter_next_chunk)]
-#![feature(iter_repeat_n)]
 #![feature(layout_for_ptr)]
+#![feature(legacy_receiver_trait)]
 #![feature(local_waker)]
 #![feature(maybe_uninit_slice)]
-#![feature(maybe_uninit_uninit_array)]
 #![feature(maybe_uninit_uninit_array_transpose)]
-#![feature(non_null_convenience)]
+#![feature(nonnull_provenance)]
 #![feature(panic_internals)]
 #![feature(pattern)]
+#![feature(pin_coerce_unsized_trait)]
+#![feature(pointer_like_trait)]
 #![feature(ptr_internals)]
 #![feature(ptr_metadata)]
 #![feature(ptr_sub_ptr)]
-#![feature(receiver_trait)]
 #![feature(set_ptr_value)]
 #![feature(sized_type_properties)]
 #![feature(slice_from_ptr_range)]
 #![feature(slice_index_methods)]
+#![feature(slice_iter_mut_as_mut_slice)]
 #![feature(slice_ptr_get)]
-#![feature(slice_ptr_len)]
 #![feature(slice_range)]
 #![feature(std_internals)]
 #![feature(str_internals)]
-#![feature(strict_provenance)]
+#![feature(temporary_niche_types)]
 #![feature(trusted_fused)]
 #![feature(trusted_len)]
 #![feature(trusted_random_access)]
 #![feature(try_trait_v2)]
 #![feature(try_with_capacity)]
 #![feature(tuple_trait)]
-#![feature(unchecked_math)]
 #![feature(unicode_internals)]
 #![feature(unsize)]
-#![feature(utf8_chunks)]
+#![feature(unwrap_infallible)]
+#![feature(vec_pop_if)]
 // tidy-alphabetical-end
 //
 // Language features:
@@ -178,33 +163,29 @@
 #![cfg_attr(test, feature(test))]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unstable)]
-#![feature(associated_type_bounds)]
-#![feature(c_unwind)]
 #![feature(cfg_sanitize)]
-#![feature(const_mut_refs)]
 #![feature(const_precise_live_drops)]
-#![feature(const_ptr_write)]
-#![feature(const_trait_impl)]
-#![feature(const_try)]
 #![feature(decl_macro)]
 #![feature(dropck_eyepatch)]
-#![feature(exclusive_range_pattern)]
 #![feature(fundamental)]
 #![feature(hashmap_internals)]
+#![feature(intrinsics)]
 #![feature(lang_items)]
 #![feature(min_specialization)]
 #![feature(multiple_supertrait_upcastable)]
 #![feature(negative_impls)]
 #![feature(never_type)]
-#![feature(pointer_is_aligned)]
+#![feature(optimize_attribute)]
 #![feature(rustc_allow_const_fn_unstable)]
 #![feature(rustc_attrs)]
 #![feature(slice_internals)]
 #![feature(staged_api)]
 #![feature(stmt_expr_attributes)]
+#![feature(strict_provenance_lints)]
 #![feature(unboxed_closures)]
 #![feature(unsized_fn_params)]
 #![feature(with_negative_coherence)]
+#![rustc_preserve_ub_checks]
 // tidy-alphabetical-end
 //
 // Rustdoc features:
@@ -260,14 +241,13 @@ pub mod string;
 pub mod sync;
 #[cfg(all(not(no_global_oom_handling), not(no_rc), not(no_sync)))]
 pub mod task;
-#[cfg(test)]
-mod tests;
 pub mod vec;
 
 #[doc(hidden)]
 #[unstable(feature = "liballoc_internals", issue = "none", reason = "implementation detail")]
 pub mod __export {
     pub use core::format_args;
+    pub use core::hint::must_use;
 }
 
 #[cfg(test)]

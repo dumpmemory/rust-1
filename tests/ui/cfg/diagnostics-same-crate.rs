@@ -1,11 +1,19 @@
+#![allow(unexpected_cfgs)] // since we want to recognize them as unexpected
+
 pub mod inner {
-    #[cfg(FALSE)]
+    #[cfg(FALSE)] //~ NOTE the item is gated here
     pub fn uwu() {}
     //~^ NOTE found an item that was configured out
 
-    #[cfg(FALSE)]
-    pub mod doesnt_exist { //~ NOTE found an item that was configured out
+    #[cfg(FALSE)] //~ NOTE the item is gated here
+    //~^ NOTE the item is gated here
+    //~| NOTE the item is gated here
+    pub mod doesnt_exist {
+        //~^ NOTE found an item that was configured out
+        //~| NOTE found an item that was configured out
+        //~| NOTE found an item that was configured out
         pub fn hello() {}
+        pub mod hi {}
     }
 
     pub mod wrong {
@@ -14,10 +22,19 @@ pub mod inner {
     }
 
     pub mod right {
-        #[cfg(feature = "what-a-cool-feature")]
+        #[cfg(feature = "what-a-cool-feature")] //~ NOTE the item is gated behind the `what-a-cool-feature` feature
         pub fn meow() {}
         //~^ NOTE found an item that was configured out
     }
+}
+
+mod placeholder {
+    use super::inner::doesnt_exist;
+    //~^ ERROR unresolved import `super::inner::doesnt_exist`
+    //~| NOTE no `doesnt_exist` in `inner`
+    use super::inner::doesnt_exist::hi;
+    //~^ ERROR unresolved import `super::inner::doesnt_exist`
+    //~| NOTE could not find `doesnt_exist` in `inner`
 }
 
 #[cfg(i_dont_exist_and_you_can_do_nothing_about_it)]
@@ -40,7 +57,6 @@ fn main() {
     // It should find the one in the right module, not the wrong one.
     inner::right::meow(); //~ ERROR cannot find function
     //~| NOTE not found in `inner::right
-    //~| NOTE the item is gated behind the `what-a-cool-feature` feature
 
     // Exists in the crate root - we would generally want a diagnostic,
     // but currently don't have one.

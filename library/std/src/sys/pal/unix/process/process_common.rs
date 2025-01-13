@@ -1,24 +1,20 @@
 #[cfg(all(test, not(target_os = "emscripten")))]
 mod tests;
 
-use crate::os::unix::prelude::*;
+use libc::{EXIT_FAILURE, EXIT_SUCCESS, c_char, c_int, gid_t, pid_t, uid_t};
 
 use crate::collections::BTreeMap;
 use crate::ffi::{CStr, CString, OsStr, OsString};
-use crate::fmt;
-use crate::io;
+use crate::os::unix::prelude::*;
 use crate::path::Path;
-use crate::ptr;
 use crate::sys::fd::FileDesc;
 use crate::sys::fs::File;
+#[cfg(not(target_os = "fuchsia"))]
+use crate::sys::fs::OpenOptions;
 use crate::sys::pipe::{self, AnonPipe};
 use crate::sys_common::process::{CommandEnv, CommandEnvs};
 use crate::sys_common::{FromInner, IntoInner};
-
-#[cfg(not(target_os = "fuchsia"))]
-use crate::sys::fs::OpenOptions;
-
-use libc::{c_char, c_int, gid_t, pid_t, uid_t, EXIT_FAILURE, EXIT_SUCCESS};
+use crate::{fmt, io, ptr};
 
 cfg_if::cfg_if! {
     if #[cfg(target_os = "fuchsia")] {
@@ -128,6 +124,7 @@ pub struct StdioPipes {
 
 // passed to do_exec() with configuration of what the child stdio should look
 // like
+#[cfg_attr(target_os = "vita", allow(dead_code))]
 pub struct ChildPipes {
     pub stdin: ChildStdio,
     pub stdout: ChildStdio,
@@ -315,8 +312,8 @@ impl Command {
     }
 
     #[allow(dead_code)]
-    pub fn get_cwd(&self) -> &Option<CString> {
-        &self.cwd
+    pub fn get_cwd(&self) -> Option<&CStr> {
+        self.cwd.as_deref()
     }
     #[allow(dead_code)]
     pub fn get_uid(&self) -> Option<uid_t> {
@@ -396,7 +393,7 @@ impl Command {
 fn os2c(s: &OsStr, saw_nul: &mut bool) -> CString {
     CString::new(s.as_bytes()).unwrap_or_else(|_e| {
         *saw_nul = true;
-        CString::new("<string-with-nul>").unwrap()
+        c"<string-with-nul>".to_owned()
     })
 }
 

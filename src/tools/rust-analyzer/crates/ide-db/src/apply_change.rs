@@ -1,7 +1,7 @@
 //! Applies changes to the IDE state transactionally.
 
 use base_db::{
-    salsa::{
+    ra_salsa::{
         debug::{DebugQueryTable, TableEntry},
         Database, Durability, Query, QueryTable,
     },
@@ -15,13 +15,12 @@ use crate::{symbol_index::SymbolsDatabase, ChangeWithProcMacros, RootDatabase};
 
 impl RootDatabase {
     pub fn request_cancellation(&mut self) {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "RootDatabase::request_cancellation").entered();
+        let _p = tracing::info_span!("RootDatabase::request_cancellation").entered();
         self.synthetic_write(Durability::LOW);
     }
 
     pub fn apply_change(&mut self, change: ChangeWithProcMacros) {
-        let _p = tracing::span!(tracing::Level::INFO, "RootDatabase::apply_change").entered();
+        let _p = tracing::info_span!("RootDatabase::apply_change").entered();
         self.request_cancellation();
         tracing::trace!("apply_change {:?}", change);
         if let Some(roots) = &change.source_change.roots {
@@ -91,82 +90,118 @@ impl RootDatabase {
             crate::symbol_index::LocalRootsQuery
             crate::symbol_index::LibraryRootsQuery
             // HirDatabase
-            hir::db::MirBodyQuery
-            hir::db::BorrowckQuery
-            hir::db::TyQuery
-            hir::db::ValueTyQuery
-            hir::db::ImplSelfTyQuery
-            hir::db::ConstParamTyQuery
-            hir::db::ConstEvalQuery
-            hir::db::ConstEvalDiscriminantQuery
-            hir::db::ImplTraitQuery
-            hir::db::FieldTypesQuery
-            hir::db::LayoutOfAdtQuery
-            hir::db::TargetDataLayoutQuery
-            hir::db::CallableItemSignatureQuery
-            hir::db::ReturnTypeImplTraitsQuery
-            hir::db::GenericPredicatesForParamQuery
-            hir::db::GenericPredicatesQuery
-            hir::db::TraitEnvironmentQuery
-            hir::db::GenericDefaultsQuery
-            hir::db::InherentImplsInCrateQuery
-            hir::db::InherentImplsInBlockQuery
-            hir::db::IncoherentInherentImplCratesQuery
-            hir::db::TraitImplsInCrateQuery
-            hir::db::TraitImplsInBlockQuery
-            hir::db::TraitImplsInDepsQuery
-            hir::db::InternCallableDefQuery
-            hir::db::InternLifetimeParamIdQuery
-            hir::db::InternImplTraitIdQuery
-            hir::db::InternTypeOrConstParamIdQuery
-            hir::db::InternClosureQuery
-            hir::db::InternCoroutineQuery
-            hir::db::AssociatedTyDataQuery
-            hir::db::TraitDatumQuery
             hir::db::AdtDatumQuery
-            hir::db::ImplDatumQuery
+            hir::db::AdtVarianceQuery
+            hir::db::AssociatedTyDataQuery
+            hir::db::AssociatedTyValueQuery
+            hir::db::BorrowckQuery
+            hir::db::CallableItemSignatureQuery
+            hir::db::ConstEvalDiscriminantQuery
+            hir::db::ConstEvalQuery
+            hir::db::ConstEvalStaticQuery
+            hir::db::ConstParamTyQuery
+            hir::db::DynCompatibilityOfTraitQuery
+            hir::db::FieldTypesQuery
             hir::db::FnDefDatumQuery
             hir::db::FnDefVarianceQuery
-            hir::db::AdtVarianceQuery
-            hir::db::AssociatedTyValueQuery
+            hir::db::GenericDefaultsQuery
+            hir::db::GenericPredicatesForParamQuery
+            hir::db::GenericPredicatesQuery
+            hir::db::GenericPredicatesWithoutParentQuery
+            hir::db::ImplDatumQuery
+            hir::db::ImplSelfTyQuery
+            hir::db::ImplTraitQuery
+            hir::db::IncoherentInherentImplCratesQuery
+            hir::db::InferQuery
+            hir::db::InherentImplsInBlockQuery
+            hir::db::InherentImplsInCrateQuery
+            hir::db::InternCallableDefQuery
+            hir::db::InternClosureQuery
+            hir::db::InternCoroutineQuery
+            hir::db::InternImplTraitIdQuery
+            hir::db::InternLifetimeParamIdQuery
+            hir::db::InternTypeOrConstParamIdQuery
+            hir::db::LayoutOfAdtQuery
+            hir::db::LayoutOfTyQuery
+            hir::db::LookupImplMethodQuery
+            hir::db::MirBodyForClosureQuery
+            hir::db::MirBodyQuery
+            hir::db::MonomorphizedMirBodyForClosureQuery
+            hir::db::MonomorphizedMirBodyQuery
             hir::db::ProgramClausesForChalkEnvQuery
+            hir::db::ReturnTypeImplTraitsQuery
+            hir::db::TargetDataLayoutQuery
+            hir::db::TraitDatumQuery
+            hir::db::TraitEnvironmentQuery
+            hir::db::TraitImplsInBlockQuery
+            hir::db::TraitImplsInCrateQuery
+            hir::db::TraitImplsInDepsQuery
+            hir::db::TraitSolveQuery
+            hir::db::TyQuery
+            hir::db::TypeAliasImplTraitsQuery
+            hir::db::ValueTyQuery
 
             // DefDatabase
-            hir::db::FileItemTreeQuery
+            hir::db::AttrsQuery
             hir::db::BlockDefMapQuery
-            hir::db::StructDataWithDiagnosticsQuery
-            hir::db::UnionDataWithDiagnosticsQuery
+            hir::db::BlockItemTreeQuery
+            hir::db::BlockItemTreeWithSourceMapQuery
+            hir::db::BodyQuery
+            hir::db::BodyWithSourceMapQuery
+            hir::db::ConstDataQuery
+            hir::db::ConstVisibilityQuery
+            hir::db::CrateDefMapQuery
+            hir::db::CrateLangItemsQuery
+            hir::db::CrateNotableTraitsQuery
+            hir::db::CrateSupportsNoStdQuery
             hir::db::EnumDataQuery
             hir::db::EnumVariantDataWithDiagnosticsQuery
-            hir::db::ImplDataWithDiagnosticsQuery
-            hir::db::TraitDataWithDiagnosticsQuery
-            hir::db::TraitAliasDataQuery
-            hir::db::TypeAliasDataQuery
-            hir::db::FunctionDataQuery
-            hir::db::ConstDataQuery
-            hir::db::StaticDataQuery
-            hir::db::Macro2DataQuery
-            hir::db::MacroRulesDataQuery
-            hir::db::ProcMacroDataQuery
-            hir::db::BodyWithSourceMapQuery
-            hir::db::BodyQuery
+            hir::db::ExpandProcAttrMacrosQuery
             hir::db::ExprScopesQuery
-            hir::db::GenericParamsQuery
+            hir::db::ExternCrateDeclDataQuery
+            hir::db::FieldVisibilitiesQuery
             hir::db::FieldsAttrsQuery
             hir::db::FieldsAttrsSourceMapQuery
-            hir::db::AttrsQuery
-            hir::db::CrateLangItemsQuery
-            hir::db::LangItemQuery
-            hir::db::ImportMapQuery
-            hir::db::FieldVisibilitiesQuery
+            hir::db::FileItemTreeQuery
+            hir::db::FileItemTreeWithSourceMapQuery
+            hir::db::FunctionDataQuery
             hir::db::FunctionVisibilityQuery
-            hir::db::ConstVisibilityQuery
-            hir::db::CrateSupportsNoStdQuery
-            hir::db::ExternCrateDeclDataQuery
+            hir::db::GenericParamsQuery
+            hir::db::GenericParamsWithSourceMapQuery
+            hir::db::ImplDataWithDiagnosticsQuery
+            hir::db::ImportMapQuery
+            hir::db::IncludeMacroInvocQuery
             hir::db::InternAnonymousConstQuery
+            hir::db::InternBlockQuery
+            hir::db::InternConstQuery
+            hir::db::InternEnumQuery
+            hir::db::InternExternBlockQuery
             hir::db::InternExternCrateQuery
+            hir::db::InternFunctionQuery
+            hir::db::InternImplQuery
             hir::db::InternInTypeConstQuery
+            hir::db::InternMacro2Query
+            hir::db::InternMacroRulesQuery
+            hir::db::InternProcMacroQuery
+            hir::db::InternStaticQuery
+            hir::db::InternStructQuery
+            hir::db::InternTraitAliasQuery
+            hir::db::InternTraitQuery
+            hir::db::InternTypeAliasQuery
+            hir::db::InternUnionQuery
             hir::db::InternUseQuery
+            hir::db::LangItemQuery
+            hir::db::Macro2DataQuery
+            hir::db::MacroDefQuery
+            hir::db::MacroRulesDataQuery
+            hir::db::NotableTraitsInDepsQuery
+            hir::db::ProcMacroDataQuery
+            hir::db::StaticDataQuery
+            hir::db::StructDataWithDiagnosticsQuery
+            hir::db::TraitAliasDataQuery
+            hir::db::TraitDataWithDiagnosticsQuery
+            hir::db::TypeAliasDataQuery
+            hir::db::UnionDataWithDiagnosticsQuery
 
             // InternDatabase
             hir::db::InternFunctionQuery
@@ -192,19 +227,24 @@ impl RootDatabase {
             hir::db::InternMacroCallQuery
             hir::db::InternSyntaxContextQuery
             hir::db::MacroArgQuery
+            hir::db::ParseMacroExpansionErrorQuery
             hir::db::ParseMacroExpansionQuery
-            hir::db::RealSpanMapQuery
+            hir::db::ProcMacroSpanQuery
             hir::db::ProcMacrosQuery
+            hir::db::RealSpanMapQuery
 
             // LineIndexDatabase
             crate::LineIndexQuery
 
             // SourceDatabase
             base_db::ParseQuery
+            base_db::ParseErrorsQuery
             base_db::CrateGraphQuery
+            base_db::CrateWorkspaceDataQuery
 
             // SourceDatabaseExt
             base_db::FileTextQuery
+            base_db::CompressedFileTextQuery
             base_db::FileSourceRootQuery
             base_db::SourceRootQuery
             base_db::SourceRootCratesQuery

@@ -1,22 +1,20 @@
 use rustc_middle::mir;
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
-use rustc_target::spec::abi::Abi;
+use rustc_target::callconv::{Conv, FnAbi};
 
 use super::horizontal_bin_op;
 use crate::*;
-use shims::foreign_items::EmulateForeignItemResult;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
-    crate::MiriInterpCxExt<'mir, 'tcx>
-{
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_sse3_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: Abi,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &MPlaceTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, EmulateForeignItemResult> {
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
+        args: &[OpTy<'tcx>],
+        dest: &MPlaceTy<'tcx>,
+    ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
         this.expect_target_feature_for_intrinsic(link_name, "sse3")?;
         // Prefix should have already been checked.
@@ -27,8 +25,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
             // Horizontally add/subtract adjacent floating point values
             // in `left` and `right`.
             "hadd.ps" | "hadd.pd" | "hsub.ps" | "hsub.pd" => {
-                let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let [left, right] = this.check_shim(abi, Conv::C, link_name, args)?;
 
                 let which = match unprefixed_name {
                     "hadd.ps" | "hadd.pd" => mir::BinOp::Add,
@@ -44,14 +41,14 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
             // the data crosses a cache line, but for Miri this is just a regular
             // unaligned read.
             "ldu.dq" => {
-                let [src_ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let [src_ptr] = this.check_shim(abi, Conv::C, link_name, args)?;
                 let src_ptr = this.read_pointer(src_ptr)?;
                 let dest = dest.force_mplace(this)?;
 
                 this.mem_copy(src_ptr, dest.ptr(), dest.layout.size, /*nonoverlapping*/ true)?;
             }
-            _ => return Ok(EmulateForeignItemResult::NotSupported),
+            _ => return interp_ok(EmulateItemResult::NotSupported),
         }
-        Ok(EmulateForeignItemResult::NeedsJumping)
+        interp_ok(EmulateItemResult::NeedsReturn)
     }
 }

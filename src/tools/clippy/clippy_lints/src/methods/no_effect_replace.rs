@@ -1,6 +1,6 @@
+use clippy_utils::SpanlessEq;
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::ty::is_type_lang_item;
-use clippy_utils::SpanlessEq;
 use rustc_ast::LitKind;
 use rustc_hir::{ExprKind, LangItem};
 use rustc_lint::LateContext;
@@ -25,6 +25,7 @@ pub(super) fn check<'tcx>(
         && param1 == param2.as_str()
     {
         span_lint(cx, NO_EFFECT_REPLACE, expr.span, "replacing text with itself");
+        return;
     }
 
     if SpanlessEq::new(cx).eq_expr(arg1, arg2) {

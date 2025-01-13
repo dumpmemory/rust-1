@@ -2,17 +2,17 @@
 
 use std::cmp::Ordering;
 
-use clippy_utils::consts::{constant, Constant};
+use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::layout::HasTyCtxt;
 use rustc_middle::ty::{Ty, TypeckResults};
-use rustc_span::source_map::Spanned;
 use rustc_span::Span;
+use rustc_span::source_map::Spanned;
 
+use clippy_utils::SpanlessEq;
 use clippy_utils::diagnostics::span_lint_and_note;
 use clippy_utils::source::snippet;
-use clippy_utils::SpanlessEq;
 
 use super::{IMPOSSIBLE_COMPARISONS, REDUNDANT_COMPARISONS};
 
@@ -20,13 +20,14 @@ use super::{IMPOSSIBLE_COMPARISONS, REDUNDANT_COMPARISONS};
 // Flip yoda conditionals, turnings expressions like `42 < x` into `x > 42`
 fn comparison_to_const<'tcx>(
     cx: &LateContext<'tcx>,
-    typeck: &TypeckResults<'tcx>,
+    typeck: &'tcx TypeckResults<'tcx>,
     expr: &'tcx Expr<'tcx>,
 ) -> Option<(CmpOp, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>, Constant<'tcx>, Ty<'tcx>)> {
     if let ExprKind::Binary(operator, left, right) = expr.kind
         && let Ok(cmp_op) = CmpOp::try_from(operator.node)
     {
-        match (constant(cx, typeck, left), constant(cx, typeck, right)) {
+        let ecx = ConstEvalCtxt::with_env(cx.tcx, cx.typing_env(), typeck);
+        match (ecx.eval(left), ecx.eval(right)) {
             (Some(_), Some(_)) => None,
             (_, Some(con)) => Some((cmp_op, left, right, con, typeck.expr_ty(right))),
             (Some(con), _) => Some((cmp_op.reverse(), right, left, con, typeck.expr_ty(left))),
@@ -89,7 +90,7 @@ pub(super) fn check<'tcx>(
                     span,
                     "left-hand side of `&&` operator has no effect",
                     Some(left_cond.span.until(right_cond.span)),
-                    &format!("`if `{rhs_str}` evaluates to true, {lhs_str}` will always evaluate to true as well"),
+                    format!("`if `{rhs_str}` evaluates to true, {lhs_str}` will always evaluate to true as well"),
                 );
             } else {
                 span_lint_and_note(
@@ -98,7 +99,7 @@ pub(super) fn check<'tcx>(
                     span,
                     "right-hand side of `&&` operator has no effect",
                     Some(and_op.span.to(right_cond.span)),
-                    &format!("`if `{lhs_str}` evaluates to true, {rhs_str}` will always evaluate to true as well"),
+                    format!("`if `{lhs_str}` evaluates to true, {rhs_str}` will always evaluate to true as well"),
                 );
             }
             // We could autofix this error but choose not to,
@@ -124,7 +125,7 @@ pub(super) fn check<'tcx>(
                 span,
                 "boolean expression will never evaluate to 'true'",
                 None,
-                &note,
+                note,
             );
         };
     }

@@ -1,6 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::source::{snippet_opt, snippet_with_applicability};
-use clippy_utils::{match_def_path, paths};
+use clippy_utils::source::{SpanRangeExt, snippet_with_applicability};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
@@ -44,17 +43,18 @@ impl<'tcx> LateLintPass<'tcx> for NonOctalUnixPermissions {
         match &expr.kind {
             ExprKind::MethodCall(path, func, [param], _) => {
                 if let Some(adt) = cx.typeck_results().expr_ty(func).peel_refs().ty_adt_def()
-                    && ((path.ident.name == sym!(mode)
+                    && ((path.ident.name.as_str() == "mode"
                         && matches!(
                             cx.tcx.get_diagnostic_name(adt.did()),
                             Some(sym::FsOpenOptions | sym::DirBuilder)
                         ))
-                        || (path.ident.name == sym!(set_mode)
+                        || (path.ident.name.as_str() == "set_mode"
                             && cx.tcx.is_diagnostic_item(sym::FsPermissions, adt.did())))
                     && let ExprKind::Lit(_) = param.kind
                     && param.span.eq_ctxt(expr.span)
-                    && let Some(snip) = snippet_opt(cx, param.span)
-                    && !(snip.starts_with("0o") || snip.starts_with("0b"))
+                    && param
+                        .span
+                        .check_source_text(cx, |src| !matches!(src.as_bytes(), [b'0', b'o' | b'b', ..]))
                 {
                     show_error(cx, param);
                 }
@@ -62,11 +62,12 @@ impl<'tcx> LateLintPass<'tcx> for NonOctalUnixPermissions {
             ExprKind::Call(func, [param]) => {
                 if let ExprKind::Path(ref path) = func.kind
                     && let Some(def_id) = cx.qpath_res(path, func.hir_id).opt_def_id()
-                    && match_def_path(cx, def_id, &paths::PERMISSIONS_FROM_MODE)
+                    && cx.tcx.is_diagnostic_item(sym::permissions_from_mode, def_id)
                     && let ExprKind::Lit(_) = param.kind
                     && param.span.eq_ctxt(expr.span)
-                    && let Some(snip) = snippet_opt(cx, param.span)
-                    && !(snip.starts_with("0o") || snip.starts_with("0b"))
+                    && param
+                        .span
+                        .check_source_text(cx, |src| !matches!(src.as_bytes(), [b'0', b'o' | b'b', ..]))
                 {
                     show_error(cx, param);
                 }

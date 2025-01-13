@@ -1,16 +1,17 @@
 use rustc_hir::LangItem;
-use rustc_middle::mir;
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::{self, Mutability};
-use rustc_span::symbol::Symbol;
+use rustc_middle::ty::{self};
+use rustc_middle::{bug, mir};
+use rustc_span::Symbol;
+use tracing::trace;
 
-use crate::const_eval::{mk_eval_cx_to_read_const_val, CanAccessMutGlobal, CompileTimeEvalContext};
+use crate::const_eval::{CanAccessMutGlobal, CompileTimeInterpCx, mk_eval_cx_to_read_const_val};
 use crate::interpret::*;
 
 /// Allocate a `const core::panic::Location` with the provided filename and line/column numbers.
-fn alloc_caller_location<'mir, 'tcx>(
-    ecx: &mut CompileTimeEvalContext<'mir, 'tcx>,
+fn alloc_caller_location<'tcx>(
+    ecx: &mut CompileTimeInterpCx<'tcx>,
     filename: Symbol,
     line: u32,
     col: u32,
@@ -19,12 +20,9 @@ fn alloc_caller_location<'mir, 'tcx>(
     // This can fail if rustc runs out of memory right here. Trying to emit an error would be
     // pointless, since that would require allocating more memory than these short strings.
     let file = if loc_details.file {
-        ecx.allocate_str(filename.as_str(), MemoryKind::CallerLocation, Mutability::Not).unwrap()
+        ecx.allocate_str_dedup(filename.as_str()).unwrap()
     } else {
-        // FIXME: This creates a new allocation each time. It might be preferable to
-        // perform this allocation only once, and re-use the `MPlaceTy`.
-        // See https://github.com/rust-lang/rust/pull/89920#discussion_r730012398
-        ecx.allocate_str("<redacted>", MemoryKind::CallerLocation, Mutability::Not).unwrap()
+        ecx.allocate_str_dedup("<redacted>").unwrap()
     };
     let file = file.map_provenance(CtfeProvenance::as_immutable);
     let line = if loc_details.line { Scalar::from_u32(line) } else { Scalar::from_u32(0) };
@@ -59,7 +57,7 @@ pub(crate) fn const_caller_location_provider(
     let mut ecx = mk_eval_cx_to_read_const_val(
         tcx.tcx,
         tcx.span,
-        ty::ParamEnv::reveal_all(),
+        ty::TypingEnv::fully_monomorphized(),
         CanAccessMutGlobal::No,
     );
 

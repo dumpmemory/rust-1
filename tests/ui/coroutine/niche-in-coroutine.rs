@@ -2,7 +2,7 @@
 
 //@ run-pass
 
-#![feature(coroutines)]
+#![feature(coroutines, stmt_expr_attributes)]
 
 use std::mem::size_of_val;
 
@@ -10,10 +10,11 @@ fn take<T>(_: T) {}
 
 fn main() {
     let x = false;
-    let gen1 = || {
+    let gen1 = #[coroutine] || {
         yield;
         take(x);
     };
 
-    assert_eq!(size_of_val(&gen1), size_of_val(&Some(gen1)));
+    // FIXME(#63818): niches in coroutines are disabled. Should be `assert_eq`.
+    assert_ne!(size_of_val(&gen1), size_of_val(&Some(gen1)));
 }

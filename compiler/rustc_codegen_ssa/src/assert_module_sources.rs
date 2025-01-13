@@ -23,20 +23,21 @@
 //! allows for doing a more fine-grained check to see if pre- or post-lto data
 //! was re-used.
 
-use crate::errors;
-use rustc_ast as ast;
-use rustc_data_structures::unord::UnordMap;
-use rustc_data_structures::unord::UnordSet;
-use rustc_errors::{DiagArgValue, IntoDiagnosticArg};
+use std::borrow::Cow;
+use std::fmt;
+
+use rustc_data_structures::unord::{UnordMap, UnordSet};
+use rustc_errors::{DiagArgValue, IntoDiagArg};
+use rustc_hir as hir;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::CodegenUnitNameBuilder;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
-use std::borrow::Cow;
-use std::fmt;
+use rustc_span::{Span, Symbol, sym};
 use thin_vec::ThinVec;
+use tracing::debug;
+
+use crate::errors;
 
 #[allow(missing_docs)]
 pub fn assert_module_sources(tcx: TyCtxt<'_>, set_reuse: &dyn Fn(&mut CguReuseTracker)) {
@@ -75,7 +76,7 @@ struct AssertModuleSource<'tcx> {
 }
 
 impl<'tcx> AssertModuleSource<'tcx> {
-    fn check_attr(&mut self, attr: &ast::Attribute) {
+    fn check_attr(&mut self, attr: &hir::Attribute) {
         let (expected_reuse, comp_kind) = if attr.has_name(sym::rustc_partition_reused) {
             (CguReuse::PreLto, ComparisonKind::AtLeast)
         } else if attr.has_name(sym::rustc_partition_codegened) {
@@ -156,7 +157,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
         );
     }
 
-    fn field(&self, attr: &ast::Attribute, name: Symbol) -> Symbol {
+    fn field(&self, attr: &hir::Attribute, name: Symbol) -> Symbol {
         for item in attr.meta_item_list().unwrap_or_else(ThinVec::new) {
             if item.has_name(name) {
                 if let Some(value) = item.value_str() {
@@ -175,7 +176,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
 
     /// Scan for a `cfg="foo"` attribute and check whether we have a
     /// cfg flag called `foo`.
-    fn check_config(&self, attr: &ast::Attribute) -> bool {
+    fn check_config(&self, attr: &hir::Attribute) -> bool {
         let config = &self.tcx.sess.psess.config;
         let value = self.field(attr, sym::cfg);
         debug!("check_config(config={:?}, value={:?})", config, value);
@@ -205,8 +206,8 @@ impl fmt::Display for CguReuse {
     }
 }
 
-impl IntoDiagnosticArg for CguReuse {
-    fn into_diagnostic_arg(self) -> DiagArgValue {
+impl IntoDiagArg for CguReuse {
+    fn into_diag_arg(self) -> DiagArgValue {
         DiagArgValue::Str(Cow::Owned(self.to_string()))
     }
 }

@@ -1,10 +1,10 @@
 //! Definitions of `Wrapping<T>`.
 
 use crate::fmt;
-use crate::ops::{Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign};
-use crate::ops::{BitXor, BitXorAssign, Div, DivAssign};
-use crate::ops::{Mul, MulAssign, Neg, Not, Rem, RemAssign};
-use crate::ops::{Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign};
+use crate::ops::{
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign,
+    Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
+};
 
 /// Provides intentionally-wrapped arithmetic on `T`.
 ///
@@ -1043,7 +1043,7 @@ macro_rules! wrapping_int_impl_unsigned {
             #[must_use = "this returns the result of the operation, \
                           without modifying the original"]
             #[unstable(feature = "wrapping_next_power_of_two", issue = "32463",
-                       reason = "needs decision on wrapping behaviour")]
+                       reason = "needs decision on wrapping behavior")]
             pub fn next_power_of_two(self) -> Self {
                 Wrapping(self.0.wrapping_next_power_of_two())
             }

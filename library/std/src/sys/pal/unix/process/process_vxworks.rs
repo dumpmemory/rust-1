@@ -1,12 +1,12 @@
-use crate::fmt;
-use crate::io::{self, Error, ErrorKind};
+#![forbid(unsafe_op_in_unsafe_fn)]
+use libc::{self, RTP_ID, c_char, c_int};
+
+use crate::io::{self, ErrorKind};
 use crate::num::NonZero;
-use crate::sys;
 use crate::sys::cvt;
+use crate::sys::pal::unix::thread;
 use crate::sys::process::process_common::*;
-use crate::sys_common::thread;
-use libc::RTP_ID;
-use libc::{self, c_char, c_int};
+use crate::{fmt, sys};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Command
@@ -22,7 +22,7 @@ impl Command {
         let envp = self.capture_env();
 
         if self.saw_nul() {
-            return Err(io::const_io_error!(
+            return Err(io::const_error!(
                 ErrorKind::InvalidInput,
                 "nul byte found in provided data",
             ));
@@ -57,7 +57,7 @@ impl Command {
                 t!(cvt_r(|| libc::dup2(fd, libc::STDERR_FILENO)));
             }
 
-            if let Some(ref cwd) = *self.get_cwd() {
+            if let Some(cwd) = self.get_cwd() {
                 t!(cvt(libc::chdir(cwd.as_ptr())));
             }
 
@@ -68,7 +68,12 @@ impl Command {
                 .as_ref()
                 .map(|c| c.as_ptr())
                 .unwrap_or_else(|| *sys::os::environ() as *const _);
-            let stack_size = thread::min_stack();
+            let stack_size = crate::cmp::max(
+                crate::env::var_os("RUST_MIN_STACK")
+                    .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(thread::DEFAULT_MIN_STACK_SIZE),
+                libc::PTHREAD_STACK_MIN,
+            );
 
             // ensure that access to the environment is synchronized
             let _lock = sys::os::env_read_lock();

@@ -5,8 +5,8 @@ use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
+use rustc_span::symbol::{Symbol, sym};
 
 use super::INTO_ITER_ON_REF;
 
@@ -27,7 +27,7 @@ pub(super) fn check(
             cx,
             INTO_ITER_ON_REF,
             method_span,
-            &format!("this `.into_iter()` call is equivalent to `.{method_name}()` and will not consume the `{kind}`",),
+            format!("this `.into_iter()` call is equivalent to `.{method_name}()` and will not consume the `{kind}`",),
             "call directly",
             method_name.to_string(),
             Applicability::MachineApplicable,

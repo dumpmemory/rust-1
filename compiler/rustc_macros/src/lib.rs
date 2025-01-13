@@ -1,16 +1,16 @@
-#![feature(allow_internal_unstable)]
+// tidy-alphabetical-start
+#![allow(rustc::default_hash_types)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(never_type)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_span)]
 #![feature(proc_macro_tracked_env)]
-#![allow(rustc::default_hash_types)]
-#![allow(internal_features)]
-
-use synstructure::decl_derive;
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 use proc_macro::TokenStream;
+use synstructure::decl_derive;
 
 mod current_version;
 mod diagnostics;
@@ -20,6 +20,7 @@ mod lift;
 mod query;
 mod serialize;
 mod symbols;
+mod try_from;
 mod type_foldable;
 mod type_visitable;
 
@@ -108,7 +109,9 @@ decl_derive!(
         // struct attributes
         diag,
         help,
+        help_once,
         note,
+        note_once,
         warning,
         // field attributes
         skip_arg,
@@ -118,14 +121,16 @@ decl_derive!(
         suggestion,
         suggestion_short,
         suggestion_hidden,
-        suggestion_verbose)] => diagnostics::session_diagnostic_derive
+        suggestion_verbose)] => diagnostics::diagnostic_derive
 );
 decl_derive!(
     [LintDiagnostic, attributes(
         // struct attributes
         diag,
         help,
+        help_once,
         note,
+        note_once,
         warning,
         // field attributes
         skip_arg,
@@ -142,8 +147,11 @@ decl_derive!(
         // struct/variant attributes
         label,
         help,
+        help_once,
         note,
+        note_once,
         warning,
+        subdiagnostic,
         suggestion,
         suggestion_short,
         suggestion_hidden,
@@ -156,5 +164,14 @@ decl_derive!(
         skip_arg,
         primary_span,
         suggestion_part,
-        applicability)] => diagnostics::session_subdiagnostic_derive
+        applicability)] => diagnostics::subdiagnostic_derive
 );
+
+decl_derive! {
+    [TryFromU32] =>
+    /// Derives `TryFrom<u32>` for the annotated `enum`, which must have no fields.
+    /// Each variant maps to the value it would produce under an `as u32` cast.
+    ///
+    /// The error type is `u32`.
+    try_from::try_from_u32
+}

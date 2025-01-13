@@ -2,7 +2,7 @@
 
 #![unstable(feature = "thread_local_internals", issue = "none")]
 
-#[cfg(all(test, not(target_os = "emscripten")))]
+#[cfg(all(test, not(any(target_os = "emscripten", target_os = "wasi"))))]
 mod tests;
 
 #[cfg(test)]
@@ -12,7 +12,7 @@ use crate::cell::{Cell, RefCell};
 use crate::error::Error;
 use crate::fmt;
 
-/// A thread local storage key which owns its contents.
+/// A thread local storage (TLS) key which owns its contents.
 ///
 /// This key uses the fastest possible implementation available to it for the
 /// target platform. It is instantiated with the [`thread_local!`] macro and the
@@ -53,25 +53,25 @@ use crate::fmt;
 /// # Examples
 ///
 /// ```
-/// use std::cell::RefCell;
+/// use std::cell::Cell;
 /// use std::thread;
 ///
-/// thread_local!(static FOO: RefCell<u32> = RefCell::new(1));
+/// thread_local!(static FOO: Cell<u32> = Cell::new(1));
 ///
-/// FOO.with_borrow(|v| assert_eq!(*v, 1));
-/// FOO.with_borrow_mut(|v| *v = 2);
+/// assert_eq!(FOO.get(), 1);
+/// FOO.set(2);
 ///
 /// // each thread starts out with the initial value of 1
-/// let t = thread::spawn(move|| {
-///     FOO.with_borrow(|v| assert_eq!(*v, 1));
-///     FOO.with_borrow_mut(|v| *v = 3);
+/// let t = thread::spawn(move || {
+///     assert_eq!(FOO.get(), 1);
+///     FOO.set(3);
 /// });
 ///
 /// // wait for the thread to complete and bail out on panic
 /// t.join().unwrap();
 ///
 /// // we retain our original value of 2 despite the child thread
-/// FOO.with_borrow(|v| assert_eq!(*v, 2));
+/// assert_eq!(FOO.get(), 2);
 /// ```
 ///
 /// # Platform-specific behavior
@@ -123,7 +123,7 @@ pub struct LocalKey<T: 'static> {
     // trivially devirtualizable by LLVM because the value of `inner` never
     // changes and the constant should be readonly within a crate. This mainly
     // only runs into problems when TLS statics are exported across crates.
-    inner: unsafe fn(Option<&mut Option<T>>) -> Option<&'static T>,
+    inner: fn(Option<&mut Option<T>>) -> *const T,
 }
 
 #[stable(feature = "std_debug", since = "1.16.0")]
@@ -141,15 +141,16 @@ impl<T: 'static> fmt::Debug for LocalKey<T> {
 /// Publicity and attributes for each static are allowed. Example:
 ///
 /// ```
-/// use std::cell::RefCell;
-/// thread_local! {
-///     pub static FOO: RefCell<u32> = RefCell::new(1);
+/// use std::cell::{Cell, RefCell};
 ///
-///     static BAR: RefCell<f32> = RefCell::new(1.0);
+/// thread_local! {
+///     pub static FOO: Cell<u32> = Cell::new(1);
+///
+///     static BAR: RefCell<Vec<f32>> = RefCell::new(vec![1.0, 2.0]);
 /// }
 ///
-/// FOO.with_borrow(|v| assert_eq!(*v, 1));
-/// BAR.with_borrow(|v| assert_eq!(*v, 1.0));
+/// assert_eq!(FOO.get(), 1);
+/// BAR.with_borrow(|v| assert_eq!(v[1], 2.0));
 /// ```
 ///
 /// Note that only shared references (`&T`) to the inner data may be obtained, so a
@@ -164,12 +165,13 @@ impl<T: 'static> fmt::Debug for LocalKey<T> {
 /// track any additional state.
 ///
 /// ```
-/// use std::cell::Cell;
+/// use std::cell::RefCell;
+///
 /// thread_local! {
-///     pub static FOO: Cell<u32> = const { Cell::new(1) };
+///     pub static FOO: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 /// }
 ///
-/// assert_eq!(FOO.get(), 1);
+/// FOO.with_borrow(|v| assert_eq!(v.len(), 0));
 /// ```
 ///
 /// See [`LocalKey` documentation][`std::thread::LocalKey`] for more
@@ -235,10 +237,7 @@ impl<T: 'static> LocalKey<T> {
         reason = "recently added to create a key",
         issue = "none"
     )]
-    #[rustc_const_unstable(feature = "thread_local_internals", issue = "none")]
-    pub const unsafe fn new(
-        inner: unsafe fn(Option<&mut Option<T>>) -> Option<&'static T>,
-    ) -> LocalKey<T> {
+    pub const unsafe fn new(inner: fn(Option<&mut Option<T>>) -> *const T) -> LocalKey<T> {
         LocalKey { inner }
     }
 
@@ -252,6 +251,19 @@ impl<T: 'static> LocalKey<T> {
     /// This function will `panic!()` if the key currently has its
     /// destructor running, and it **may** panic if the destructor has
     /// previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// thread_local! {
+    ///     pub static STATIC: String = String::from("I am");
+    /// }
+    ///
+    /// assert_eq!(
+    ///     STATIC.with(|original_value| format!("{original_value} initialized")),
+    ///     "I am initialized",
+    /// );
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with<F, R>(&'static self, f: F) -> R
     where
@@ -273,16 +285,27 @@ impl<T: 'static> LocalKey<T> {
     ///
     /// This function will still `panic!()` if the key is uninitialized and the
     /// key's initializer panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// thread_local! {
+    ///     pub static STATIC: String = String::from("I am");
+    /// }
+    ///
+    /// assert_eq!(
+    ///     STATIC.try_with(|original_value| format!("{original_value} initialized")),
+    ///     Ok(String::from("I am initialized")),
+    /// );
+    /// ```
     #[stable(feature = "thread_local_try_with", since = "1.26.0")]
     #[inline]
     pub fn try_with<F, R>(&'static self, f: F) -> Result<R, AccessError>
     where
         F: FnOnce(&T) -> R,
     {
-        unsafe {
-            let thread_local = (self.inner)(None).ok_or(AccessError)?;
-            Ok(f(thread_local))
-        }
+        let thread_local = unsafe { (self.inner)(None).as_ref().ok_or(AccessError)? };
+        Ok(f(thread_local))
     }
 
     /// Acquires a reference to the value in this TLS key, initializing it with
@@ -301,14 +324,16 @@ impl<T: 'static> LocalKey<T> {
     where
         F: FnOnce(Option<T>, &T) -> R,
     {
-        unsafe {
-            let mut init = Some(init);
-            let reference = (self.inner)(Some(&mut init)).expect(
+        let mut init = Some(init);
+
+        let reference = unsafe {
+            (self.inner)(Some(&mut init)).as_ref().expect(
                 "cannot access a Thread Local Storage value \
                  during or after destruction",
-            );
-            f(init, reference)
-        }
+            )
+        };
+
+        f(init, reference)
     }
 }
 
@@ -377,7 +402,7 @@ impl<T: 'static> LocalKey<Cell<T>> {
     where
         T: Copy,
     {
-        self.with(|cell| cell.get())
+        self.with(Cell::get)
     }
 
     /// Takes the contained value, leaving `Default::default()` in its place.
@@ -407,7 +432,7 @@ impl<T: 'static> LocalKey<Cell<T>> {
     where
         T: Default,
     {
-        self.with(|cell| cell.take())
+        self.with(Cell::take)
     }
 
     /// Replaces the contained value, returning the old value.
@@ -452,7 +477,7 @@ impl<T: 'static> LocalKey<RefCell<T>> {
     /// Panics if the key currently has its destructor running,
     /// and it **may** panic if the destructor has previously been run for this thread.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```
     /// use std::cell::RefCell;
@@ -483,7 +508,7 @@ impl<T: 'static> LocalKey<RefCell<T>> {
     /// Panics if the key currently has its destructor running,
     /// and it **may** panic if the destructor has previously been run for this thread.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```
     /// use std::cell::RefCell;
@@ -578,7 +603,7 @@ impl<T: 'static> LocalKey<RefCell<T>> {
     where
         T: Default,
     {
-        self.with(|cell| cell.take())
+        self.with(RefCell::take)
     }
 
     /// Replaces the contained value, returning the old value.

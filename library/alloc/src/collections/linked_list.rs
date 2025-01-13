@@ -13,12 +13,11 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::cmp::Ordering;
-use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
-use core::mem;
 use core::ptr::NonNull;
+use core::{fmt, mem};
 
 use super::SpecExtend;
 use crate::alloc::{Allocator, Global};
@@ -1083,7 +1082,7 @@ impl<T, A: Allocator> LinkedList<T, A> {
 
     /// Retains only the elements specified by the predicate.
     ///
-    /// In other words, remove all elements `e` for which `f(&e)` returns false.
+    /// In other words, remove all elements `e` for which `f(&mut e)` returns false.
     /// This method operates in place, visiting each element exactly once in the
     /// original order, and preserves the order of the retained elements.
     ///
@@ -1495,6 +1494,14 @@ impl<'a, T, A: Allocator> Cursor<'a, T, A> {
     pub fn back(&self) -> Option<&'a T> {
         self.list.back()
     }
+
+    /// Provides a reference to the cursor's parent list.
+    #[must_use]
+    #[inline(always)]
+    #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    pub fn as_list(&self) -> &'a LinkedList<T, A> {
+        self.list
+    }
 }
 
 impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
@@ -1605,6 +1612,18 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
     pub fn as_cursor(&self) -> Cursor<'_, T, A> {
         Cursor { list: self.list, current: self.current, index: self.index }
     }
+
+    /// Provides a read-only reference to the cursor's parent list.
+    ///
+    /// The lifetime of the returned reference is bound to that of the
+    /// `CursorMut`, which means it cannot outlive the `CursorMut` and that the
+    /// `CursorMut` is frozen for the lifetime of the reference.
+    #[must_use]
+    #[inline(always)]
+    #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    pub fn as_list(&self) -> &LinkedList<T, A> {
+        self.list
+    }
 }
 
 // Now the list editing operations
@@ -1705,7 +1724,7 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
         unsafe {
             self.current = unlinked_node.as_ref().next;
             self.list.unlink_node(unlinked_node);
-            let unlinked_node = Box::from_raw(unlinked_node.as_ptr());
+            let unlinked_node = Box::from_raw_in(unlinked_node.as_ptr(), &self.list.alloc);
             Some(unlinked_node.element)
         }
     }
@@ -1920,9 +1939,7 @@ pub struct ExtractIf<
     T: 'a,
     F: 'a,
     #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
-> where
-    F: FnMut(&mut T) -> bool,
-{
+> {
     list: &'a mut LinkedList<T, A>,
     it: Option<NonNull<Node<T>>>,
     pred: F,
@@ -1946,7 +1963,7 @@ where
                 if (self.pred)(&mut node.as_mut().element) {
                     // `unlink_node` is okay with aliasing `element` references.
                     self.list.unlink_node(node);
-                    return Some(Box::from_raw(node.as_ptr()).element);
+                    return Some(Box::from_raw_in(node.as_ptr(), &self.list.alloc).element);
                 }
             }
         }
@@ -1960,10 +1977,7 @@ where
 }
 
 #[unstable(feature = "extract_if", reason = "recently added", issue = "43244")]
-impl<T: fmt::Debug, F> fmt::Debug for ExtractIf<'_, T, F>
-where
-    F: FnMut(&mut T) -> bool,
-{
+impl<T: fmt::Debug, F> fmt::Debug for ExtractIf<'_, T, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ExtractIf").field(&self.list).finish()
     }
@@ -2126,16 +2140,22 @@ impl<T: Clone, A: Allocator + Clone> Clone for LinkedList<T, A> {
         list
     }
 
-    fn clone_from(&mut self, other: &Self) {
-        let mut iter_other = other.iter();
-        if self.len() > other.len() {
-            self.split_off(other.len());
+    /// Overwrites the contents of `self` with a clone of the contents of `source`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation of the nodes of the linked list. Additionally,
+    /// if the element type `T` overrides `clone_from()`, this will reuse the
+    /// resources of `self`'s elements as well.
+    fn clone_from(&mut self, source: &Self) {
+        let mut source_iter = source.iter();
+        if self.len() > source.len() {
+            self.split_off(source.len());
         }
-        for (elem, elem_other) in self.iter_mut().zip(&mut iter_other) {
-            elem.clone_from(elem_other);
+        for (elem, source_elem) in self.iter_mut().zip(&mut source_iter) {
+            elem.clone_from(source_elem);
         }
-        if !iter_other.is_empty() {
-            self.extend(iter_other.cloned());
+        if !source_iter.is_empty() {
+            self.extend(source_iter.cloned());
         }
     }
 }

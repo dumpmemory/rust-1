@@ -16,7 +16,6 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub mod alloc;
 #[path = "../unsupported/args.rs"]
 pub mod args;
 pub mod env;
@@ -34,10 +33,6 @@ pub mod pipe;
 pub mod process;
 #[path = "../unsupported/stdio.rs"]
 pub mod stdio;
-#[path = "../unsupported/thread_local_dtor.rs"]
-pub mod thread_local_dtor;
-#[path = "../unsupported/thread_local_key.rs"]
-pub mod thread_local_key;
 #[path = "../unsupported/time.rs"]
 pub mod time;
 
@@ -48,12 +43,8 @@ cfg_if::cfg_if! {
         #[path = "atomics/thread.rs"]
         pub mod thread;
     } else {
-        #[path = "../unsupported/once.rs"]
-        pub mod once;
         #[path = "../unsupported/thread.rs"]
         pub mod thread;
-        #[path = "../unsupported/thread_parking.rs"]
-        pub mod thread_parking;
     }
 }
 

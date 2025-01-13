@@ -1,7 +1,11 @@
-use crate::def_id::{DefId, DefIndex, LocalDefId, CRATE_DEF_ID};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
-use rustc_span::{def_id::DefPathHash, HashStableContext};
 use std::fmt::{self, Debug};
+
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_span::HashStableContext;
+use rustc_span::def_id::DefPathHash;
+
+use crate::def_id::{CRATE_DEF_ID, DefId, DefIndex, LocalDefId};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Encodable, Decodable)]
 pub struct OwnerId {
@@ -17,7 +21,7 @@ impl Debug for OwnerId {
 
 impl From<OwnerId> for HirId {
     fn from(owner: OwnerId) -> HirId {
-        HirId { owner, local_id: ItemLocalId::from_u32(0) }
+        HirId { owner, local_id: ItemLocalId::ZERO }
     }
 }
 
@@ -110,7 +114,7 @@ impl HirId {
 
     #[inline]
     pub fn make_owner(owner: LocalDefId) -> Self {
-        Self { owner: OwnerId { def_id: owner }, local_id: ItemLocalId::from_u32(0) }
+        Self { owner: OwnerId { def_id: owner }, local_id: ItemLocalId::ZERO }
     }
 
     pub fn index(self) -> (usize, usize) {
@@ -164,14 +168,16 @@ impl ItemLocalId {
     pub const INVALID: ItemLocalId = ItemLocalId::MAX;
 }
 
-// Safety: Ord is implement as just comparing the ItemLocalId's numerical
-// values and these are not changed by (de-)serialization.
-unsafe impl StableOrd for ItemLocalId {
+impl StableOrd for ItemLocalId {
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `Ord` is implemented as just comparing the ItemLocalId's numerical
+    // values and these are not changed by (de-)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 /// The `HirId` corresponding to `CRATE_NODE_ID` and `CRATE_DEF_ID`.
 pub const CRATE_HIR_ID: HirId =
-    HirId { owner: OwnerId { def_id: CRATE_DEF_ID }, local_id: ItemLocalId::from_u32(0) };
+    HirId { owner: OwnerId { def_id: CRATE_DEF_ID }, local_id: ItemLocalId::ZERO };
 
 pub const CRATE_OWNER_ID: OwnerId = OwnerId { def_id: CRATE_DEF_ID };

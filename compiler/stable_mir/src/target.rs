@@ -1,9 +1,11 @@
 //! Provide information about the machine that this is being compiled into.
 
+use serde::Serialize;
+
 use crate::compiler_interface::with;
 
 /// The properties of the target machine being compiled into.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct MachineInfo {
     pub endian: Endian,
     pub pointer_width: MachineSize,
@@ -14,7 +16,7 @@ impl MachineInfo {
         with(|cx| cx.target_info())
     }
 
-    pub fn target_endianess() -> Endian {
+    pub fn target_endianness() -> Endian {
         with(|cx| cx.target_info().endian)
     }
 
@@ -23,14 +25,14 @@ impl MachineInfo {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize)]
 pub enum Endian {
     Little,
     Big,
 }
 
 /// Represent the size of a component.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 pub struct MachineSize {
     num_bits: usize,
 }

@@ -170,6 +170,7 @@ pub fn test_iter() {
 }
 
 #[test]
+#[allow(for_loops_over_fallibles)]
 pub fn test_iter_mut() {
     let mut ok: Result<isize, &'static str> = Ok(100);
     for loc in ok.iter_mut() {
@@ -195,7 +196,7 @@ pub fn test_unwrap_or_default() {
 }
 
 #[test]
-#[cfg_attr(not(bootstrap), allow(non_local_definitions))]
+#[allow(non_local_definitions)]
 pub fn test_into_ok() {
     fn infallible_op() -> Result<isize, !> {
         Ok(666)
@@ -218,7 +219,7 @@ pub fn test_into_ok() {
 }
 
 #[test]
-#[cfg_attr(not(bootstrap), allow(non_local_definitions))]
+#[allow(non_local_definitions)]
 pub fn test_into_err() {
     fn until_error_op() -> Result<!, isize> {
         Err(666)
@@ -409,7 +410,8 @@ fn result_opt_conversions() {
 #[test]
 fn result_try_trait_v2_branch() {
     use core::num::NonZero;
-    use core::ops::{ControlFlow::*, Try};
+    use core::ops::ControlFlow::*;
+    use core::ops::Try;
 
     assert_eq!(Ok::<i32, i32>(4).branch(), Continue(4));
     assert_eq!(Err::<i32, i32>(4).branch(), Break(Err(4)));

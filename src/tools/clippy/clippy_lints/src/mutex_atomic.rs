@@ -1,7 +1,3 @@
-//! Checks for usage of mutex where an atomic value could be used
-//!
-//! This lint is **allow** by default
-
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::ty::is_type_diagnostic_item;
 use rustc_hir::Expr;
@@ -14,7 +10,7 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for usage of `Mutex<X>` where an atomic will do.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Using a mutex just to make access to a plain bool or
     /// reference sequential is shooting flies with cannons.
     /// `std::sync::atomic::AtomicBool` and `std::sync::atomic::AtomicPtr` are leaner and
@@ -92,9 +88,9 @@ impl<'tcx> LateLintPass<'tcx> for Mutex {
                          behavior and not the internal type, consider using `Mutex<()>`"
                     );
                     match *mutex_param.kind() {
-                        ty::Uint(t) if t != ty::UintTy::Usize => span_lint(cx, MUTEX_INTEGER, expr.span, &msg),
-                        ty::Int(t) if t != ty::IntTy::Isize => span_lint(cx, MUTEX_INTEGER, expr.span, &msg),
-                        _ => span_lint(cx, MUTEX_ATOMIC, expr.span, &msg),
+                        ty::Uint(t) if t != UintTy::Usize => span_lint(cx, MUTEX_INTEGER, expr.span, msg),
+                        ty::Int(t) if t != IntTy::Isize => span_lint(cx, MUTEX_INTEGER, expr.span, msg),
+                        _ => span_lint(cx, MUTEX_ATOMIC, expr.span, msg),
                     };
                 }
             }
@@ -127,7 +123,7 @@ fn get_atomic_name(ty: Ty<'_>) -> Option<&'static str> {
                 IntTy::I128 => None,
             }
         },
-        ty::RawPtr(_) => Some("AtomicPtr"),
+        ty::RawPtr(_, _) => Some("AtomicPtr"),
         _ => None,
     }
 }

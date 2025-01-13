@@ -4,17 +4,19 @@
 //! There are also some rather random cases (like const initializer
 //! expressions) that are mostly just leftovers.
 
-pub use crate::def_id::DefPathHash;
-use crate::def_id::{CrateNum, DefIndex, LocalDefId, StableCrateId, CRATE_DEF_INDEX, LOCAL_CRATE};
-use crate::def_path_hash_map::DefPathHashMap;
+use std::fmt::{self, Write};
+use std::hash::Hash;
 
 use rustc_data_structures::stable_hasher::{Hash64, StableHasher};
 use rustc_data_structures::unord::UnordMap;
 use rustc_index::IndexVec;
-use rustc_span::symbol::{kw, sym, Symbol};
+use rustc_macros::{Decodable, Encodable};
+use rustc_span::{Symbol, kw, sym};
+use tracing::{debug, instrument};
 
-use std::fmt::{self, Write};
-use std::hash::Hash;
+pub use crate::def_id::DefPathHash;
+use crate::def_id::{CRATE_DEF_INDEX, CrateNum, DefIndex, LOCAL_CRATE, LocalDefId, StableCrateId};
+use crate::def_path_hash_map::DefPathHashMap;
 
 /// The `DefPathTable` maps `DefIndex`es to `DefKey`s and vice versa.
 /// Internally the `DefPathTable` holds a tree of `DefKey`s, where each `DefKey`
@@ -287,8 +289,6 @@ pub enum DefPathData {
     /// An existential `impl Trait` type node.
     /// Argument position `impl Trait` have a `TypeNs` with their pretty-printed name.
     OpaqueTy,
-    /// An anonymous struct or union type i.e. `struct { foo: Type }` or `union { bar: Type }`
-    AnonAdt,
 }
 
 impl Definitions {
@@ -377,17 +377,17 @@ impl Definitions {
     }
 
     #[inline(always)]
-    pub fn local_def_path_hash_to_def_id(
-        &self,
-        hash: DefPathHash,
-        err: &mut dyn FnMut() -> !,
-    ) -> LocalDefId {
+    /// Returns `None` if the `DefPathHash` does not correspond to a `LocalDefId`
+    /// in the current compilation session. This can legitimately happen if the
+    /// `DefPathHash` is from a `DefId` in an upstream crate or, during incr. comp.,
+    /// if the `DefPathHash` is from a previous compilation session and
+    /// the def-path does not exist anymore.
+    pub fn local_def_path_hash_to_def_id(&self, hash: DefPathHash) -> Option<LocalDefId> {
         debug_assert!(hash.stable_crate_id() == self.table.stable_crate_id);
         self.table
             .def_path_hash_to_index
             .get(&hash.local_hash())
             .map(|local_def_index| LocalDefId { local_def_index })
-            .unwrap_or_else(|| err())
     }
 
     pub fn def_path_hash_to_def_index_map(&self) -> &DefPathHashMap {
@@ -413,7 +413,7 @@ impl DefPathData {
             TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => Some(name),
 
             Impl | ForeignMod | CrateRoot | Use | GlobalAsm | Closure | Ctor | AnonConst
-            | OpaqueTy | AnonAdt => None,
+            | OpaqueTy => None,
         }
     }
 
@@ -436,7 +436,6 @@ impl DefPathData {
             Ctor => DefPathDataName::Anon { namespace: sym::constructor },
             AnonConst => DefPathDataName::Anon { namespace: sym::constant },
             OpaqueTy => DefPathDataName::Anon { namespace: sym::opaque },
-            AnonAdt => DefPathDataName::Anon { namespace: sym::anon_adt },
         }
     }
 }

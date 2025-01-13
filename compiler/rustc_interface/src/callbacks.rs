@@ -9,19 +9,28 @@
 //! The functions in this file should fall back to the default set in their
 //! origin crate when the `TyCtxt` is not present in TLS.
 
+use std::fmt;
+
 use rustc_errors::{DiagInner, TRACK_DIAGNOSTIC};
 use rustc_middle::dep_graph::{DepNodeExt, TaskDepsRef};
 use rustc_middle::ty::tls;
 use rustc_query_system::dep_graph::dep_node::default_dep_kind_debug;
 use rustc_query_system::dep_graph::{DepContext, DepKind, DepNode};
-use std::fmt;
 
 fn track_span_parent(def_id: rustc_span::def_id::LocalDefId) {
-    tls::with_opt(|tcx| {
-        if let Some(tcx) = tcx {
-            let _span = tcx.source_span(def_id);
-            // Sanity check: relative span's parent must be an absolute span.
-            debug_assert_eq!(_span.data_untracked().parent, None);
+    tls::with_context_opt(|icx| {
+        if let Some(icx) = icx {
+            // `track_span_parent` gets called a lot from HIR lowering code.
+            // Skip doing anything if we aren't tracking dependencies.
+            let tracks_deps = match icx.task_deps {
+                TaskDepsRef::Allow(..) => true,
+                TaskDepsRef::EvalAlways | TaskDepsRef::Ignore | TaskDepsRef::Forbid => false,
+            };
+            if tracks_deps {
+                let _span = icx.tcx.source_span(def_id);
+                // Sanity check: relative span's parent must be an absolute span.
+                debug_assert_eq!(_span.data_untracked().parent, None);
+            }
         }
     })
 }
@@ -29,7 +38,7 @@ fn track_span_parent(def_id: rustc_span::def_id::LocalDefId) {
 /// This is a callback from `rustc_errors` as it cannot access the implicit state
 /// in `rustc_middle` otherwise. It is used when diagnostic messages are
 /// emitted and stores them in the current query, if there is one.
-fn track_diagnostic(diagnostic: DiagInner, f: &mut dyn FnMut(DiagInner)) {
+fn track_diagnostic<R>(diagnostic: DiagInner, f: &mut dyn FnMut(DiagInner) -> R) -> R {
     tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
             if let Some(diagnostics) = icx.diagnostics {
@@ -38,11 +47,11 @@ fn track_diagnostic(diagnostic: DiagInner, f: &mut dyn FnMut(DiagInner)) {
 
             // Diagnostics are tracked, we can ignore the dependency.
             let icx = tls::ImplicitCtxt { task_deps: TaskDepsRef::Ignore, ..icx.clone() };
-            return tls::enter_context(&icx, move || (*f)(diagnostic));
+            tls::enter_context(&icx, move || (*f)(diagnostic))
+        } else {
+            // In any other case, invoke diagnostics anyway.
+            (*f)(diagnostic)
         }
-
-        // In any other case, invoke diagnostics anyway.
-        (*f)(diagnostic);
     })
 }
 

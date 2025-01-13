@@ -2,6 +2,7 @@
 // This is ignored for the fallback mode on MSVC due to problems with PDB.
 
 //@ ignore-msvc
+//@ ignore-wasi wasi codegens the main symbol differently
 
 //@ compile-flags: -g -C no-prepopulate-passes
 
@@ -20,7 +21,10 @@
 #![allow(unused_variables)]
 #![allow(unused_assignments)]
 
-enum E { A(u32), B(u32) }
+enum E {
+    A(u32),
+    B(u32),
+}
 
 pub fn main() {
     let e = E::A(23);

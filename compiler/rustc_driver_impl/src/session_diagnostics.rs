@@ -1,3 +1,5 @@
+use std::error::Error;
+
 use rustc_macros::{Diagnostic, Subdiagnostic};
 
 #[derive(Diagnostic)]
@@ -33,6 +35,12 @@ pub(crate) struct RLinkRustcVersionMismatch<'a> {
 pub(crate) struct RlinkNotAFile;
 
 #[derive(Diagnostic)]
+#[diag(driver_impl_rlink_corrupt_file)]
+pub(crate) struct RlinkCorruptFile<'a> {
+    pub file: &'a std::path::Path,
+}
+
+#[derive(Diagnostic)]
 #[diag(driver_impl_ice)]
 pub(crate) struct Ice;
 
@@ -43,19 +51,12 @@ pub(crate) struct IceBugReport<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(driver_impl_ice_bug_report_internal_feature)]
-pub(crate) struct IceBugReportInternalFeature;
+#[diag(driver_impl_ice_bug_report_update_note)]
+pub(crate) struct UpdateNightlyNote;
 
 #[derive(Diagnostic)]
-#[diag(driver_impl_ice_bug_report_outdated)]
-pub(crate) struct IceBugReportOutdated<'a> {
-    pub version: &'a str,
-    pub bug_report_url: &'a str,
-    #[note(driver_impl_update)]
-    pub note_update: (),
-    #[note(driver_impl_url)]
-    pub note_url: (),
-}
+#[diag(driver_impl_ice_bug_report_internal_feature)]
+pub(crate) struct IceBugReportInternalFeature;
 
 #[derive(Diagnostic)]
 #[diag(driver_impl_ice_version)]
@@ -94,3 +95,9 @@ pub(crate) struct IceFlags {
 #[derive(Diagnostic)]
 #[diag(driver_impl_ice_exclude_cargo_defaults)]
 pub(crate) struct IceExcludeCargoDefaults;
+
+#[derive(Diagnostic)]
+#[diag(driver_impl_unstable_feature_usage)]
+pub(crate) struct UnstableFeatureUsage {
+    pub error: Box<dyn Error>,
+}

@@ -2,14 +2,22 @@
 // Tests that we don't ICE when we have a trait impl on a TAIT.
 
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 //@ check-pass
 #![feature(type_alias_impl_trait)]
 
+mod g {
+    pub trait Dummy {}
+    impl Dummy for () {}
+    pub type F = impl Dummy;
+    pub fn f() -> F {}
+}
+use g::*;
+
 trait Test {
     fn test(self);
 }
-
 
 impl Test for define::F {
     fn test(self) {}

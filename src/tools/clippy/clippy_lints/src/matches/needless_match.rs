@@ -3,12 +3,12 @@ use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::ty::{is_type_diagnostic_item, same_type_and_consts};
 use clippy_utils::{
-    eq_expr_value, get_parent_expr_for_hir, higher, is_else_clause, is_res_lang_ctor, over, path_res,
+    SpanlessEq, eq_expr_value, get_parent_expr_for_hir, higher, is_else_clause, is_res_lang_ctor, over, path_res,
     peel_blocks_with_stmt,
 };
 use rustc_errors::Applicability;
 use rustc_hir::LangItem::OptionNone;
-use rustc_hir::{Arm, BindingAnnotation, ByRef, Expr, ExprKind, ItemKind, Node, Pat, PatKind, Path, QPath};
+use rustc_hir::{Arm, BindingMode, ByRef, Expr, ExprKind, ItemKind, Node, Pat, PatExprKind, PatKind, Path, QPath};
 use rustc_lint::LateContext;
 use rustc_span::sym;
 
@@ -90,7 +90,9 @@ fn check_if_let_inner(cx: &LateContext<'_>, if_let: &higher::IfLet<'_>) -> bool 
         }
 
         // Recursively check for each `else if let` phrase,
-        if let Some(ref nested_if_let) = higher::IfLet::hir(cx, if_else) {
+        if let Some(ref nested_if_let) = higher::IfLet::hir(cx, if_else)
+            && SpanlessEq::new(cx).eq_expr(nested_if_let.let_expr, if_let.let_expr)
+        {
             return check_if_let_inner(cx, nested_if_let);
         }
 
@@ -125,13 +127,13 @@ fn strip_return<'hir>(expr: &'hir Expr<'hir>) -> &'hir Expr<'hir> {
 fn expr_ty_matches_p_ty(cx: &LateContext<'_>, expr: &Expr<'_>, p_expr: &Expr<'_>) -> bool {
     match cx.tcx.parent_hir_node(p_expr.hir_id) {
         // Compare match_expr ty with local in `let local = match match_expr {..}`
-        Node::Local(local) => {
+        Node::LetStmt(local) => {
             let results = cx.typeck_results();
             return same_type_and_consts(results.node_type(local.hir_id), results.expr_ty(expr));
         },
         // compare match_expr ty with RetTy in `fn foo() -> RetTy`
         Node::Item(item) => {
-            if let ItemKind::Fn(..) = item.kind {
+            if let ItemKind::Fn { .. } = item.kind {
                 let output = cx
                     .tcx
                     .fn_sig(item.owner_id)
@@ -178,7 +180,7 @@ fn pat_same_as_expr(pat: &Pat<'_>, expr: &Expr<'_>) -> bool {
                 },
             )),
         ) => {
-            return !matches!(annot, BindingAnnotation(ByRef::Yes, _)) && pat_ident.name == first_seg.ident.name;
+            return !matches!(annot, BindingMode(ByRef::Yes(_), _)) && pat_ident.name == first_seg.ident.name;
         },
         // Example: `Custom::TypeA => Custom::TypeB`, or `None => None`
         (PatKind::Path(QPath::Resolved(_, p_path)), ExprKind::Path(QPath::Resolved(_, e_path))) => {
@@ -187,8 +189,12 @@ fn pat_same_as_expr(pat: &Pat<'_>, expr: &Expr<'_>) -> bool {
             });
         },
         // Example: `5 => 5`
-        (PatKind::Lit(pat_lit_expr), ExprKind::Lit(expr_spanned)) => {
-            if let ExprKind::Lit(pat_spanned) = &pat_lit_expr.kind {
+        (PatKind::Expr(pat_expr_expr), ExprKind::Lit(expr_spanned)) => {
+            if let PatExprKind::Lit {
+                lit: pat_spanned,
+                negated: false,
+            } = &pat_expr_expr.kind
+            {
                 return pat_spanned.node == expr_spanned.node;
             }
         },

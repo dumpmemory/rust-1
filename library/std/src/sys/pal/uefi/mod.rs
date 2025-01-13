@@ -11,32 +11,23 @@
 //!
 //! [`OsStr`]: crate::ffi::OsStr
 //! [`OsString`]: crate::ffi::OsString
+#![forbid(unsafe_op_in_unsafe_fn)]
 
-pub mod alloc;
 pub mod args;
 pub mod env;
-#[path = "../unsupported/fs.rs"]
 pub mod fs;
+pub mod helpers;
 #[path = "../unsupported/io.rs"]
 pub mod io;
 #[path = "../unsupported/net.rs"]
 pub mod net;
-#[path = "../unsupported/once.rs"]
-pub mod once;
 pub mod os;
 #[path = "../unsupported/pipe.rs"]
 pub mod pipe;
-#[path = "../unsupported/process.rs"]
 pub mod process;
 pub mod stdio;
 pub mod thread;
-#[path = "../unsupported/thread_local_key.rs"]
-pub mod thread_local_key;
-#[path = "../unsupported/thread_parking.rs"]
-pub mod thread_parking;
 pub mod time;
-
-mod helpers;
 
 #[cfg(test)]
 mod tests;
@@ -103,12 +94,13 @@ pub const fn unsupported<T>() -> std_io::Result<T> {
 
 #[inline]
 pub const fn unsupported_err() -> std_io::Error {
-    std_io::const_io_error!(std_io::ErrorKind::Unsupported, "operation not supported on UEFI",)
+    std_io::const_error!(std_io::ErrorKind::Unsupported, "operation not supported on UEFI",)
 }
 
 pub fn decode_error_kind(code: RawOsError) -> crate::io::ErrorKind {
-    use crate::io::ErrorKind;
     use r_efi::efi::Status;
+
+    use crate::io::ErrorKind;
 
     match r_efi::efi::Status::from_usize(code) {
         Status::ALREADY_STARTED
@@ -184,39 +176,6 @@ pub fn abort_internal() -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_abort() {
     abort_internal();
-}
-
-#[inline]
-pub fn hashmap_random_keys() -> (u64, u64) {
-    get_random().unwrap()
-}
-
-fn get_random() -> Option<(u64, u64)> {
-    use r_efi::protocols::rng;
-
-    let mut buf = [0u8; 16];
-    let handles = helpers::locate_handles(rng::PROTOCOL_GUID).ok()?;
-    for handle in handles {
-        if let Ok(protocol) = helpers::open_protocol::<rng::Protocol>(handle, rng::PROTOCOL_GUID) {
-            let r = unsafe {
-                ((*protocol.as_ptr()).get_rng)(
-                    protocol.as_ptr(),
-                    crate::ptr::null_mut(),
-                    buf.len(),
-                    buf.as_mut_ptr(),
-                )
-            };
-            if r.is_error() {
-                continue;
-            } else {
-                return Some((
-                    u64::from_le_bytes(buf[..8].try_into().ok()?),
-                    u64::from_le_bytes(buf[8..].try_into().ok()?),
-                ));
-            }
-        }
-    }
-    None
 }
 
 /// Disable access to BootServices if `EVT_SIGNAL_EXIT_BOOT_SERVICES` is signaled

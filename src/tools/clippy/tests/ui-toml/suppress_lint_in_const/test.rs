@@ -1,4 +1,3 @@
-#![feature(inline_const)]
 #![warn(clippy::indexing_slicing)]
 // We also check the out_of_bounds_indexing lint here, because it lints similar things and
 // we want to avoid false positives.
@@ -8,7 +7,8 @@
     clippy::no_effect,
     clippy::unnecessary_operation,
     clippy::useless_vec,
-    clippy::out_of_bounds_indexing
+    clippy::out_of_bounds_indexing,
+    clippy::needless_lifetimes
 )]
 
 const ARR: [i32; 2] = [1, 2];

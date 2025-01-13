@@ -2,10 +2,10 @@ use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::{last_path_segment, std_or_core};
 use rustc_errors::Applicability;
-use rustc_hir::{def, Expr, ExprKind, GenericArg, QPath, TyKind};
+use rustc_hir::{Expr, ExprKind, GenericArg, QPath, TyKind, def};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::{sym, SyntaxContext};
+use rustc_span::{SyntaxContext, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -49,7 +49,7 @@ impl<'tcx> LateLintPass<'tcx> for DefaultIterEmpty {
                 cx,
                 DEFAULT_INSTEAD_OF_ITER_EMPTY,
                 expr.span,
-                &format!("`{path}()` is the more idiomatic way"),
+                format!("`{path}()` is the more idiomatic way"),
                 "try",
                 sugg,
                 applicability,
@@ -60,7 +60,7 @@ impl<'tcx> LateLintPass<'tcx> for DefaultIterEmpty {
 
 fn make_sugg(
     cx: &LateContext<'_>,
-    ty_path: &rustc_hir::QPath<'_>,
+    ty_path: &QPath<'_>,
     ctxt: SyntaxContext,
     applicability: &mut Applicability,
     path: &str,

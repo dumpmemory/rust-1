@@ -1,5 +1,4 @@
 //@ run-pass
-//@ ignore-wasm32-bare no libc to test ffi with
 #![feature(c_variadic)]
 
 use std::ffi::VaList;
@@ -12,6 +11,10 @@ extern "C" {
 }
 
 pub unsafe extern "C" fn test_valist_forward(n: u64, mut ap: ...) -> f64 {
+    rust_valist_interesting_average(n, ap.as_va_list())
+}
+
+pub unsafe extern "C-unwind" fn c_unwind_can_forward(n: u64, mut ap: ...) -> f64 {
     rust_valist_interesting_average(n, ap.as_va_list())
 }
 
@@ -71,6 +74,10 @@ pub fn main() {
 
     unsafe {
         assert_eq!(test_valist_forward(2, 10i64, 10f64, 20i64, 20f64) as i64, 30);
+    }
+
+    unsafe {
+        assert_eq!(c_unwind_can_forward(2, 10i64, 10f64, 20i64, 20f64) as i64, 30);
     }
 
     unsafe {

@@ -1,16 +1,15 @@
+use rustc_ast::{self as ast, MetaItem};
+use rustc_data_structures::fx::FxHashSet;
+use rustc_expand::base::{Annotatable, ExtCtxt};
+use rustc_span::{Span, sym};
+use thin_vec::{ThinVec, thin_vec};
+
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
 
-use rustc_ast::{self as ast, MetaItem};
-use rustc_data_structures::fx::FxHashSet;
-use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::sym;
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
-
-pub fn expand_deriving_eq(
-    cx: &mut ExtCtxt<'_>,
+pub(crate) fn expand_deriving_eq(
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -49,7 +48,7 @@ pub fn expand_deriving_eq(
 }
 
 fn cs_total_eq_assert(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
 ) -> BlockOrExpr {
@@ -66,13 +65,10 @@ fn cs_total_eq_assert(
                 // Already produced an assertion for this type.
             } else {
                 // let _: AssertParamIsEq<FieldTy>;
-                super::assert_ty_bounds(
-                    cx,
-                    &mut stmts,
-                    field.ty.clone(),
-                    field.span,
-                    &[sym::cmp, sym::AssertParamIsEq],
-                );
+                super::assert_ty_bounds(cx, &mut stmts, field.ty.clone(), field.span, &[
+                    sym::cmp,
+                    sym::AssertParamIsEq,
+                ]);
             }
         }
     };

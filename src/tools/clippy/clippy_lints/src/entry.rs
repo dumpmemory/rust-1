@@ -1,17 +1,17 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::{reindent_multiline, snippet_indent, snippet_with_applicability, snippet_with_context};
 use clippy_utils::{
-    can_move_expr_to_closure_no_visit, higher, is_expr_final_block_expr, is_expr_used_or_unified, match_def_path,
-    paths, peel_hir_expr_while, SpanlessEq,
+    SpanlessEq, can_move_expr_to_closure_no_visit, higher, is_expr_final_block_expr, is_expr_used_or_unified,
+    peel_hir_expr_while,
 };
 use core::fmt::{self, Write};
 use rustc_errors::Applicability;
 use rustc_hir::hir_id::HirIdSet;
-use rustc_hir::intravisit::{walk_expr, Visitor};
+use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{Block, Expr, ExprKind, HirId, Pat, Stmt, StmtKind, UnOp};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::{Span, SyntaxContext, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Span, SyntaxContext, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -186,7 +186,7 @@ impl<'tcx> LateLintPass<'tcx> for HashMapPass {
             cx,
             MAP_ENTRY,
             expr.span,
-            &format!("usage of `contains_key` followed by `insert` on a `{}`", map_ty.name()),
+            format!("usage of `contains_key` followed by `insert` on a `{}`", map_ty.name()),
             "try",
             sugg,
             app,
@@ -269,9 +269,9 @@ fn try_parse_contains<'tcx>(cx: &LateContext<'_>, expr: &'tcx Expr<'_>) -> Optio
                 key,
                 call_ctxt: expr.span.ctxt(),
             };
-            if match_def_path(cx, id, &paths::BTREEMAP_CONTAINS_KEY) {
+            if cx.tcx.is_diagnostic_item(sym::btreemap_contains_key, id) {
                 Some((MapType::BTree, expr))
-            } else if match_def_path(cx, id, &paths::HASHMAP_CONTAINS_KEY) {
+            } else if cx.tcx.is_diagnostic_item(sym::hashmap_contains_key, id) {
                 Some((MapType::Hash, expr))
             } else {
                 None
@@ -306,7 +306,7 @@ struct InsertExpr<'tcx> {
 fn try_parse_insert<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) -> Option<InsertExpr<'tcx>> {
     if let ExprKind::MethodCall(_, map, [key, value], _) = expr.kind {
         let id = cx.typeck_results().type_dependent_def_id(expr.hir_id)?;
-        if match_def_path(cx, id, &paths::BTREEMAP_INSERT) || match_def_path(cx, id, &paths::HASHMAP_INSERT) {
+        if cx.tcx.is_diagnostic_item(sym::btreemap_insert, id) || cx.tcx.is_diagnostic_item(sym::hashmap_insert, id) {
             Some(InsertExpr { map, key, value })
         } else {
             None
@@ -358,7 +358,7 @@ struct InsertSearcher<'cx, 'tcx> {
     can_use_entry: bool,
     /// Whether this expression is the final expression in this code path. This may be a statement.
     in_tail_pos: bool,
-    // Is this expression a single insert. A slightly better suggestion can be made in this case.
+    /// Is this expression a single insert. A slightly better suggestion can be made in this case.
     is_single_insert: bool,
     /// If the visitor has seen the map being used.
     is_map_used: bool,
@@ -423,13 +423,16 @@ impl<'tcx> Visitor<'tcx> for InsertSearcher<'_, 'tcx> {
                 }
             },
             StmtKind::Expr(e) => self.visit_expr(e),
-            StmtKind::Local(l) => {
+            StmtKind::Let(l) => {
                 self.visit_pat(l.pat);
                 if let Some(e) = l.init {
                     self.allow_insert_closure &= !self.in_tail_pos;
                     self.in_tail_pos = false;
                     self.is_single_insert = false;
                     self.visit_expr(e);
+                }
+                if let Some(els) = &l.els {
+                    self.visit_block(els);
                 }
             },
             StmtKind::Item(_) => {
@@ -675,12 +678,12 @@ fn find_insert_calls<'tcx>(
         map: contains_expr.map,
         key: contains_expr.key,
         ctxt: expr.span.ctxt(),
-        edits: Vec::new(),
-        is_map_used: false,
         allow_insert_closure: true,
         can_use_entry: true,
         in_tail_pos: true,
         is_single_insert: true,
+        is_map_used: false,
+        edits: Vec::new(),
         loops: Vec::new(),
         locals: HirIdSet::default(),
     };

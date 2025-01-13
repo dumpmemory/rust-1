@@ -1,13 +1,13 @@
-use super::utils::make_iterator_snippet;
 use super::NEVER_LOOP;
+use super::utils::make_iterator_snippet;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::ForLoop;
 use clippy_utils::macros::root_macro_call_first_node;
 use clippy_utils::source::snippet;
 use rustc_errors::Applicability;
-use rustc_hir::{Block, Destination, Expr, ExprKind, HirId, InlineAsmOperand, Pat, Stmt, StmtKind};
+use rustc_hir::{Block, Destination, Expr, ExprKind, HirId, InlineAsmOperand, Pat, Stmt, StmtKind, StructTailExpr};
 use rustc_lint::LateContext;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 use std::iter::once;
 
 pub(super) fn check<'tcx>(
@@ -137,7 +137,7 @@ fn stmt_to_expr<'tcx>(stmt: &Stmt<'tcx>) -> Option<(&'tcx Expr<'tcx>, Option<&'t
     match stmt.kind {
         StmtKind::Semi(e) | StmtKind::Expr(e) => Some((e, None)),
         // add the let...else expression (if present)
-        StmtKind::Local(local) => local.init.map(|init| (init, local.els)),
+        StmtKind::Let(local) => local.init.map(|init| (init, local.els)),
         StmtKind::Item(..) => None,
     }
 }
@@ -156,18 +156,16 @@ fn never_loop_expr<'tcx>(
         | ExprKind::Field(e, _)
         | ExprKind::AddrOf(_, _, e)
         | ExprKind::Repeat(e, _)
-        | ExprKind::DropTemps(e) => never_loop_expr(cx, e, local_labels, main_loop_id),
+        | ExprKind::DropTemps(e)
+        | ExprKind::UnsafeBinderCast(_, e, _) => never_loop_expr(cx, e, local_labels, main_loop_id),
         ExprKind::Let(let_expr) => never_loop_expr(cx, let_expr.init, local_labels, main_loop_id),
         ExprKind::Array(es) | ExprKind::Tup(es) => never_loop_expr_all(cx, es.iter(), local_labels, main_loop_id),
-        ExprKind::MethodCall(_, receiver, es, _) => never_loop_expr_all(
-            cx,
-            std::iter::once(receiver).chain(es.iter()),
-            local_labels,
-            main_loop_id,
-        ),
+        ExprKind::MethodCall(_, receiver, es, _) => {
+            never_loop_expr_all(cx, once(receiver).chain(es.iter()), local_labels, main_loop_id)
+        },
         ExprKind::Struct(_, fields, base) => {
             let fields = never_loop_expr_all(cx, fields.iter().map(|f| f.expr), local_labels, main_loop_id);
-            if let Some(base) = base {
+            if let StructTailExpr::Base(base) = base {
                 combine_seq(fields, || never_loop_expr(cx, base, local_labels, main_loop_id))
             } else {
                 fields
@@ -255,9 +253,7 @@ fn never_loop_expr<'tcx>(
             InlineAsmOperand::Const { .. } | InlineAsmOperand::SymFn { .. } | InlineAsmOperand::SymStatic { .. } => {
                 NeverLoopResult::Normal
             },
-            InlineAsmOperand::Label { block } => {
-                never_loop_block(cx, block, local_labels, main_loop_id)
-            }
+            InlineAsmOperand::Label { block } => never_loop_block(cx, block, local_labels, main_loop_id),
         })),
         ExprKind::OffsetOf(_, _)
         | ExprKind::Yield(_, _)

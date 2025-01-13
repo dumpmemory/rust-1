@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::visitors::for_each_expr;
-use clippy_utils::{binop_traits, trait_ref_of_method, BINOP_TRAITS, OP_ASSIGN_TRAITS};
+use clippy_utils::visitors::for_each_expr_without_closures;
+use clippy_utils::{BINOP_TRAITS, OP_ASSIGN_TRAITS, binop_traits, trait_ref_of_method};
 use core::ops::ControlFlow;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
@@ -83,7 +83,7 @@ impl<'tcx> LateLintPass<'tcx> for SuspiciousImpl {
                 cx,
                 lint,
                 binop.span,
-                &format!(
+                format!(
                     "suspicious use of `{}` in `{}` impl",
                     binop.node.as_str(),
                     cx.tcx.item_name(trait_id)
@@ -95,7 +95,7 @@ impl<'tcx> LateLintPass<'tcx> for SuspiciousImpl {
 
 fn count_binops(expr: &hir::Expr<'_>) -> u32 {
     let mut count = 0u32;
-    let _: Option<!> = for_each_expr(expr, |e| {
+    let _: Option<!> = for_each_expr_without_closures(expr, |e| {
         if matches!(
             e.kind,
             hir::ExprKind::Binary(..)

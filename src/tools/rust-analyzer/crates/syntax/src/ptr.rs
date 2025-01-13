@@ -27,7 +27,7 @@ pub struct AstPtr<N: AstNode> {
     _ty: PhantomData<fn() -> N>,
 }
 
-impl<N: AstNode + std::fmt::Debug> std::fmt::Debug for AstPtr<N> {
+impl<N: AstNode> std::fmt::Debug for AstPtr<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("AstPtr").field(&self.raw).finish()
     }
@@ -120,7 +120,7 @@ impl<N: AstNode> From<AstPtr<N>> for SyntaxNodePtr {
 fn test_local_syntax_ptr() {
     use crate::{ast, AstNode, SourceFile};
 
-    let file = SourceFile::parse("struct Foo { f: u32, }").ok().unwrap();
+    let file = SourceFile::parse("struct Foo { f: u32, }", parser::Edition::CURRENT).ok().unwrap();
     let field = file.syntax().descendants().find_map(ast::RecordField::cast).unwrap();
     let ptr = SyntaxNodePtr::new(field.syntax());
     let field_syntax = ptr.to_node(file.syntax());

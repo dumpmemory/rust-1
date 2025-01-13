@@ -48,7 +48,7 @@ If building LLVM from source, you'll need additional tools:
   [LLVM's documentation](https://llvm.org/docs/GettingStarted.html#host-c-toolchain-both-compiler-and-standard-library)
 * `ninja`, or GNU `make` 3.81 or later (Ninja is recommended, especially on
   Windows)
-* `cmake` 3.13.4 or later
+* `cmake` version listed on [LLVM's documentation](https://llvm.org/docs/GettingStarted.html#software)
 * `libstdc++-static` may be required on some Linux distributions such as Fedora
   and Ubuntu
 
@@ -79,9 +79,23 @@ See [the rustc-dev-guide for more info][sysllvm].
    ./configure
    ```
 
-   If you plan to use `x.py install` to create an installation, it is
-   recommended that you set the `prefix` value in the `[install]` section to a
-   directory: `./configure --set install.prefix=<path>`
+   If you plan to use `x.py install` to create an installation, you can either
+   set `DESTDIR` environment variable to your custom directory path:
+
+   ```bash
+   export DESTDIR=<path>
+   ```
+
+   or set `prefix` and `sysconfdir` in the `[install]` section to your custom
+   directory path:
+
+   ```sh
+   ./configure --set install.prefix=<path> --set install.sysconfdir=<path>
+   ```
+
+   When the `DESTDIR` environment variable is present, the `prefix` and
+   `sysconfdir` values are combined with the path from the `DESTDIR`
+   environment variable.
 
 3. Build and install:
 
@@ -151,14 +165,14 @@ toolchain.
    directory and uncomment the line `MSYS2_PATH_TYPE=inherit`.
 
    You could install and use MSYS2's version of git instead with `pacman`,
-   however this is not recommended as it's excrutiatingly slow, and not frequently
-   tested for compatability.
+   however this is not recommended as it's excruciatingly slow, and not frequently
+   tested for compatibility.
 
-2. Start a MINGW64 or MINGW32 shell (depending on whether you want 32-bit
+3. Start a MINGW64 or MINGW32 shell (depending on whether you want 32-bit
    or 64-bit Rust) either from your start menu, or by running `mingw64.exe`
    or `mingw32.exe` from your MSYS2 installation directory (e.g. `C:\msys64`).
 
-3. From this terminal, install the required tools:
+4. From this terminal, install the required tools:
 
    ```sh
    # Update package mirrors (may be needed if you have a fresh install of MSYS2)
@@ -178,7 +192,7 @@ toolchain.
                mingw-w64-x86_64-ninja
    ```
 
-4. Navigate to Rust's source code (or clone it), then build it:
+5. Navigate to Rust's source code (or clone it), then build it:
 
    ```sh
    python x.py setup dist && python x.py build && python x.py install
@@ -215,7 +229,7 @@ python x.py build
 
 Right now, building Rust only works with some known versions of Visual Studio.
 If you have a more recent version installed and the build system doesn't
-understand, you may need to force rustbuild to use an older version.
+understand, you may need to force bootstrap to use an older version.
 This can be done by manually calling the appropriate vcvars file before running
 the bootstrap.
 

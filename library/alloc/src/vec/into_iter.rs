@@ -1,11 +1,3 @@
-#[cfg(not(no_global_oom_handling))]
-use super::AsVecIntoIter;
-use crate::alloc::{Allocator, Global};
-#[cfg(not(no_global_oom_handling))]
-use crate::collections::VecDeque;
-use crate::raw_vec::RawVec;
-use core::array;
-use core::fmt;
 use core::iter::{
     FusedIterator, InPlaceIterable, SourceIter, TrustedFused, TrustedLen,
     TrustedRandomAccessNoCoerce,
@@ -17,15 +9,23 @@ use core::num::NonZero;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use core::slice::{self};
+use core::{array, fmt};
+
+#[cfg(not(no_global_oom_handling))]
+use super::AsVecIntoIter;
+use crate::alloc::{Allocator, Global};
+#[cfg(not(no_global_oom_handling))]
+use crate::collections::VecDeque;
+use crate::raw_vec::RawVec;
 
 macro non_null {
     (mut $place:expr, $t:ident) => {{
         #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
-        unsafe { &mut *(ptr::addr_of_mut!($place) as *mut NonNull<$t>) }
+        unsafe { &mut *((&raw mut $place) as *mut NonNull<$t>) }
     }},
     ($place:expr, $t:ident) => {{
         #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
-        unsafe { *(ptr::addr_of!($place) as *const NonNull<$t>) }
+        unsafe { *((&raw const $place) as *const NonNull<$t>) }
     }},
 }
 
@@ -114,16 +114,22 @@ impl<T, A: Allocator> IntoIter<T, A> {
     }
 
     /// Drops remaining elements and relinquishes the backing allocation.
-    /// This method guarantees it won't panic before relinquishing
-    /// the backing allocation.
+    ///
+    /// This method guarantees it won't panic before relinquishing the backing
+    /// allocation.
     ///
     /// This is roughly equivalent to the following, but more efficient
     ///
     /// ```
-    /// # let mut into_iter = Vec::<u8>::with_capacity(10).into_iter();
+    /// # let mut vec = Vec::<u8>::with_capacity(10);
+    /// # let ptr = vec.as_mut_ptr();
+    /// # let mut into_iter = vec.into_iter();
     /// let mut into_iter = std::mem::replace(&mut into_iter, Vec::new().into_iter());
     /// (&mut into_iter).for_each(drop);
     /// std::mem::forget(into_iter);
+    /// # // FIXME(https://github.com/rust-lang/miri/issues/3670):
+    /// # // use -Zmiri-disable-leak-check instead of unleaking in tests meant to leak.
+    /// # drop(unsafe { Vec::<u8>::from_raw_parts(ptr, 0, 10) });
     /// ```
     ///
     /// This method is used by in-place iteration, refer to the vec::in_place_collect
@@ -136,7 +142,7 @@ impl<T, A: Allocator> IntoIter<T, A> {
         // struct and then overwriting &mut self.
         // this creates less assembly
         self.cap = 0;
-        self.buf = RawVec::NEW.non_null();
+        self.buf = RawVec::new().non_null();
         self.ptr = self.buf;
         self.end = self.buf.as_ptr();
 
@@ -254,7 +260,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 
     #[inline]
     fn next_chunk<const N: usize>(&mut self) -> Result<[T; N], core::array::IntoIter<T, N>> {
-        let mut raw_ary = MaybeUninit::uninit_array();
+        let mut raw_ary = [const { MaybeUninit::uninit() }; N];
 
         let len = self.len();
 
@@ -282,11 +288,65 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 
         // Safety: `len` is larger than the array size. Copy a fixed amount here to fully initialize
         // the array.
-        return unsafe {
+        unsafe {
             ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw_ary.as_mut_ptr() as *mut T, N);
             self.ptr = self.ptr.add(N);
             Ok(raw_ary.transpose().assume_init())
-        };
+        }
+    }
+
+    fn fold<B, F>(mut self, mut accum: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        if T::IS_ZST {
+            while self.ptr.as_ptr() != self.end.cast_mut() {
+                // SAFETY: we just checked that `self.ptr` is in bounds.
+                let tmp = unsafe { self.ptr.read() };
+                // See `next` for why we subtract from `end` here.
+                self.end = self.end.wrapping_byte_sub(1);
+                accum = f(accum, tmp);
+            }
+        } else {
+            // SAFETY: `self.end` can only be null if `T` is a ZST.
+            while self.ptr != non_null!(self.end, T) {
+                // SAFETY: we just checked that `self.ptr` is in bounds.
+                let tmp = unsafe { self.ptr.read() };
+                // SAFETY: the maximum this can be is `self.end`.
+                // Increment `self.ptr` first to avoid double dropping in the event of a panic.
+                self.ptr = unsafe { self.ptr.add(1) };
+                accum = f(accum, tmp);
+            }
+        }
+        accum
+    }
+
+    fn try_fold<B, F, R>(&mut self, mut accum: B, mut f: F) -> R
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> R,
+        R: core::ops::Try<Output = B>,
+    {
+        if T::IS_ZST {
+            while self.ptr.as_ptr() != self.end.cast_mut() {
+                // SAFETY: we just checked that `self.ptr` is in bounds.
+                let tmp = unsafe { self.ptr.read() };
+                // See `next` for why we subtract from `end` here.
+                self.end = self.end.wrapping_byte_sub(1);
+                accum = f(accum, tmp)?;
+            }
+        } else {
+            // SAFETY: `self.end` can only be null if `T` is a ZST.
+            while self.ptr != non_null!(self.end, T) {
+                // SAFETY: we just checked that `self.ptr` is in bounds.
+                let tmp = unsafe { self.ptr.read() };
+                // SAFETY: the maximum this can be is `self.end`.
+                // Increment `self.ptr` first to avoid double dropping in the event of a panic.
+                self.ptr = unsafe { self.ptr.add(1) };
+                accum = f(accum, tmp)?;
+            }
+        }
+        R::from_output(accum)
     }
 
     unsafe fn __iterator_get_unchecked(&mut self, i: usize) -> Self::Item
@@ -433,7 +493,7 @@ unsafe impl<#[may_dangle] T, A: Allocator> Drop for IntoIter<T, A> {
                     // `IntoIter::alloc` is not used anymore after this and will be dropped by RawVec
                     let alloc = ManuallyDrop::take(&mut self.0.alloc);
                     // RawVec handles deallocation
-                    let _ = RawVec::from_raw_parts_in(self.0.buf.as_ptr(), self.0.cap, alloc);
+                    let _ = RawVec::from_nonnull_in(self.0.buf, self.0.cap, alloc);
                 }
             }
         }

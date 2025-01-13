@@ -7,11 +7,9 @@ edition = "2021"
 proc-macro = true
 
 [dependencies]
-synstructure = "0.13.0"
-syn = { version = "2.0.9", features = ["full"] }
+syn = { version = "2.0.9", features = ["full", "extra-traits"] }
 proc-macro2 = "1"
 quote = "1"
 
 [features]
-default = ["nightly"]
 nightly = []

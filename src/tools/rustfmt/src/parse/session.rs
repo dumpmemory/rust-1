@@ -2,13 +2,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
-use rustc_errors::emitter::{stderr_destination, DynEmitter, Emitter, HumanEmitter, SilentEmitter};
+use rustc_errors::emitter::{DynEmitter, Emitter, HumanEmitter, SilentEmitter, stderr_destination};
+use rustc_errors::registry::Registry;
 use rustc_errors::translation::Translate;
 use rustc_errors::{ColorConfig, Diag, DiagCtxt, DiagInner, Level as DiagnosticLevel};
 use rustc_session::parse::ParseSess as RawParseSess;
 use rustc_span::{
+    BytePos, Span,
     source_map::{FilePathMapping, SourceMap},
-    symbol, BytePos, Span,
+    symbol,
 };
 
 use crate::config::file_lines::LineRange;
@@ -37,15 +39,15 @@ struct SilentOnIgnoredFilesEmitter {
 }
 
 impl SilentOnIgnoredFilesEmitter {
-    fn handle_non_ignoreable_error(&mut self, diag: DiagInner) {
+    fn handle_non_ignoreable_error(&mut self, diag: DiagInner, registry: &Registry) {
         self.has_non_ignorable_parser_errors = true;
         self.can_reset.store(false, Ordering::Release);
-        self.emitter.emit_diagnostic(diag);
+        self.emitter.emit_diagnostic(diag, registry);
     }
 }
 
 impl Translate for SilentOnIgnoredFilesEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<rustc_errors::FluentBundle>> {
+    fn fluent_bundle(&self) -> Option<&rustc_errors::FluentBundle> {
         self.emitter.fluent_bundle()
     }
 
@@ -55,13 +57,13 @@ impl Translate for SilentOnIgnoredFilesEmitter {
 }
 
 impl Emitter for SilentOnIgnoredFilesEmitter {
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+    fn source_map(&self) -> Option<&SourceMap> {
         None
     }
 
-    fn emit_diagnostic(&mut self, diag: DiagInner) {
+    fn emit_diagnostic(&mut self, diag: DiagInner, registry: &Registry) {
         if diag.level() == DiagnosticLevel::Fatal {
-            return self.handle_non_ignoreable_error(diag);
+            return self.handle_non_ignoreable_error(diag, registry);
         }
         if let Some(primary_span) = &diag.span.primary_span() {
             let file_name = self.source_map.span_to_filename(*primary_span);
@@ -79,7 +81,7 @@ impl Emitter for SilentOnIgnoredFilesEmitter {
                 }
             };
         }
-        self.handle_non_ignoreable_error(diag);
+        self.handle_non_ignoreable_error(diag, registry);
     }
 }
 
@@ -97,7 +99,7 @@ fn default_dcx(
     source_map: Lrc<SourceMap>,
     ignore_path_set: Lrc<IgnorePathSet>,
     can_reset: Lrc<AtomicBool>,
-    hide_parse_errors: bool,
+    show_parse_errors: bool,
     color: Color,
 ) -> DiagCtxt {
     let supports_color = term::stderr().map_or(false, |term| term.supports_color());
@@ -116,11 +118,12 @@ fn default_dcx(
             .sm(Some(source_map.clone())),
     );
 
-    let emitter: Box<DynEmitter> = if hide_parse_errors {
+    let emitter: Box<DynEmitter> = if !show_parse_errors {
         Box::new(SilentEmitter {
             fallback_bundle,
             fatal_dcx: DiagCtxt::new(emitter),
             fatal_note: None,
+            emit_fatal_diagnostic: false,
         })
     } else {
         emitter
@@ -147,7 +150,7 @@ impl ParseSess {
             Lrc::clone(&source_map),
             Lrc::clone(&ignore_path_set),
             Lrc::clone(&can_reset_errors),
-            config.hide_parse_errors(),
+            config.show_parse_errors(),
             config.color(),
         );
         let raw_psess = RawParseSess::with_dcx(dcx, source_map);
@@ -163,7 +166,7 @@ impl ParseSess {
     ///
     /// * `id` - The name of the module
     /// * `relative` - If Some(symbol), the symbol name is a directory relative to the dir_path.
-    ///   If relative is Some, resolve the submodle at {dir_path}/{symbol}/{id}.rs
+    ///   If relative is Some, resolve the submodule at {dir_path}/{symbol}/{id}.rs
     ///   or {dir_path}/{symbol}/{id}/mod.rs. if None, resolve the module at {dir_path}/{id}.rs.
     /// *  `dir_path` - Module resolution will occur relative to this directory.
     pub(crate) fn default_submod_path(
@@ -174,7 +177,7 @@ impl ParseSess {
     ) -> Result<ModulePathSuccess, ModError<'_>> {
         rustc_expand::module::default_submod_path(&self.raw_psess, id, relative, dir_path).or_else(
             |e| {
-                // If resloving a module relative to {dir_path}/{symbol} fails because a file
+                // If resolving a module relative to {dir_path}/{symbol} fails because a file
                 // could not be found, then try to resolve the module relative to {dir_path}.
                 // If we still can't find the module after searching for it in {dir_path},
                 // surface the original error.
@@ -209,7 +212,9 @@ impl ParseSess {
             rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
             false,
         );
-        self.raw_psess.dcx.make_silent(fallback_bundle, None);
+        self.raw_psess
+            .dcx()
+            .make_silent(fallback_bundle, None, false);
     }
 
     pub(crate) fn span_to_filename(&self, span: Span) -> FileName {
@@ -285,11 +290,11 @@ impl ParseSess {
     }
 
     pub(super) fn has_errors(&self) -> bool {
-        self.raw_psess.dcx.has_errors().is_some()
+        self.raw_psess.dcx().has_errors().is_some()
     }
 
     pub(super) fn reset_errors(&self) {
-        self.raw_psess.dcx.reset_err_count();
+        self.raw_psess.dcx().reset_err_count();
     }
 }
 
@@ -340,7 +345,7 @@ mod tests {
         }
 
         impl Translate for TestEmitter {
-            fn fluent_bundle(&self) -> Option<&Lrc<rustc_errors::FluentBundle>> {
+            fn fluent_bundle(&self) -> Option<&rustc_errors::FluentBundle> {
                 None
             }
 
@@ -350,11 +355,11 @@ mod tests {
         }
 
         impl Emitter for TestEmitter {
-            fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+            fn source_map(&self) -> Option<&SourceMap> {
                 None
             }
 
-            fn emit_diagnostic(&mut self, _diag: DiagInner) {
+            fn emit_diagnostic(&mut self, _diag: DiagInner, _registry: &Registry) {
                 self.num_emitted_errors.fetch_add(1, Ordering::Release);
             }
         }
@@ -391,7 +396,9 @@ mod tests {
         }
 
         fn get_ignore_list(config: &str) -> IgnoreList {
-            Config::from_toml(config, Path::new("")).unwrap().ignore()
+            Config::from_toml(config, Path::new("./rustfmt.toml"))
+                .unwrap()
+                .ignore()
         }
 
         #[test]
@@ -406,6 +413,7 @@ mod tests {
                 SourceMapFileName::Real(RealFileName::LocalPath(PathBuf::from("foo.rs"))),
                 source,
             );
+            let registry = Registry::new(&[]);
             let mut emitter = build_emitter(
                 Lrc::clone(&num_emitted_errors),
                 Lrc::clone(&can_reset_errors),
@@ -414,7 +422,7 @@ mod tests {
             );
             let span = MultiSpan::from_span(mk_sp(BytePos(0), BytePos(1)));
             let fatal_diagnostic = build_diagnostic(DiagnosticLevel::Fatal, Some(span));
-            emitter.emit_diagnostic(fatal_diagnostic);
+            emitter.emit_diagnostic(fatal_diagnostic, &registry);
             assert_eq!(num_emitted_errors.load(Ordering::Acquire), 1);
             assert_eq!(can_reset_errors.load(Ordering::Acquire), false);
         }
@@ -431,6 +439,7 @@ mod tests {
                 SourceMapFileName::Real(RealFileName::LocalPath(PathBuf::from("foo.rs"))),
                 source,
             );
+            let registry = Registry::new(&[]);
             let mut emitter = build_emitter(
                 Lrc::clone(&num_emitted_errors),
                 Lrc::clone(&can_reset_errors),
@@ -439,7 +448,7 @@ mod tests {
             );
             let span = MultiSpan::from_span(mk_sp(BytePos(0), BytePos(1)));
             let non_fatal_diagnostic = build_diagnostic(DiagnosticLevel::Warning, Some(span));
-            emitter.emit_diagnostic(non_fatal_diagnostic);
+            emitter.emit_diagnostic(non_fatal_diagnostic, &registry);
             assert_eq!(num_emitted_errors.load(Ordering::Acquire), 0);
             assert_eq!(can_reset_errors.load(Ordering::Acquire), true);
         }
@@ -455,6 +464,7 @@ mod tests {
                 SourceMapFileName::Real(RealFileName::LocalPath(PathBuf::from("foo.rs"))),
                 source,
             );
+            let registry = Registry::new(&[]);
             let mut emitter = build_emitter(
                 Lrc::clone(&num_emitted_errors),
                 Lrc::clone(&can_reset_errors),
@@ -463,7 +473,7 @@ mod tests {
             );
             let span = MultiSpan::from_span(mk_sp(BytePos(0), BytePos(1)));
             let non_fatal_diagnostic = build_diagnostic(DiagnosticLevel::Warning, Some(span));
-            emitter.emit_diagnostic(non_fatal_diagnostic);
+            emitter.emit_diagnostic(non_fatal_diagnostic, &registry);
             assert_eq!(num_emitted_errors.load(Ordering::Acquire), 1);
             assert_eq!(can_reset_errors.load(Ordering::Acquire), false);
         }
@@ -491,6 +501,7 @@ mod tests {
                 SourceMapFileName::Real(RealFileName::LocalPath(PathBuf::from("fatal.rs"))),
                 fatal_source,
             );
+            let registry = Registry::new(&[]);
             let mut emitter = build_emitter(
                 Lrc::clone(&num_emitted_errors),
                 Lrc::clone(&can_reset_errors),
@@ -502,9 +513,9 @@ mod tests {
             let bar_diagnostic = build_diagnostic(DiagnosticLevel::Warning, Some(bar_span));
             let foo_diagnostic = build_diagnostic(DiagnosticLevel::Warning, Some(foo_span));
             let fatal_diagnostic = build_diagnostic(DiagnosticLevel::Fatal, None);
-            emitter.emit_diagnostic(bar_diagnostic);
-            emitter.emit_diagnostic(foo_diagnostic);
-            emitter.emit_diagnostic(fatal_diagnostic);
+            emitter.emit_diagnostic(bar_diagnostic, &registry);
+            emitter.emit_diagnostic(foo_diagnostic, &registry);
+            emitter.emit_diagnostic(fatal_diagnostic, &registry);
             assert_eq!(num_emitted_errors.load(Ordering::Acquire), 2);
             assert_eq!(can_reset_errors.load(Ordering::Acquire), false);
         }

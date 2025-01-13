@@ -2,10 +2,17 @@ codegen_ssa_L4Bender_exporting_symbols_unimplemented = exporting symbols not imp
 
 codegen_ssa_add_native_library = failed to add native library {$library_path}: {$error}
 
+codegen_ssa_aix_strip_not_used = using host's `strip` binary to cross-compile to AIX which is not guaranteed to work
+
+codegen_ssa_apple_deployment_target_invalid =
+    failed to parse deployment target specified in {$env_var}: {$error}
+
+codegen_ssa_apple_deployment_target_too_low =
+    deployment target in {$env_var} was set to {$version}, but the minimum supported by `rustc` is {$os_min}
+
 codegen_ssa_apple_sdk_error_sdk_path = failed to get {$sdk_name} SDK path: {$error}
 
-codegen_ssa_archive_build_failure =
-    failed to build archive: {$error}
+codegen_ssa_archive_build_failure = failed to build archive at `{$path}`: {$error}
 
 codegen_ssa_atomic_compare_exchange = Atomic compare-exchange intrinsic missing failure memory ordering
 
@@ -16,15 +23,30 @@ codegen_ssa_cgu_not_recorded =
 
 codegen_ssa_check_installed_visual_studio = please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.
 
+codegen_ssa_compiler_builtins_cannot_call =
+    `compiler_builtins` cannot call functions through upstream monomorphizations; encountered invalid call from `{$caller}` to `{$callee}`
+
 codegen_ssa_copy_path = could not copy {$from} to {$to}: {$error}
 
 codegen_ssa_copy_path_buf = unable to copy {$source_file} to {$output_path}: {$error}
 
 codegen_ssa_create_temp_dir = couldn't create a temp dir: {$error}
 
+codegen_ssa_dlltool_fail_import_library =
+    Dlltool could not create import library with {$dlltool_path} {$dlltool_args}:
+    {$stdout}
+    {$stderr}
+
+codegen_ssa_error_calling_dlltool =
+    Error calling dlltool '{$dlltool_path}': {$error}
+
+codegen_ssa_error_creating_import_library =
+    Error creating import library for {$lib_name}: {$error}
+
 codegen_ssa_error_creating_remark_dir = failed to create remark directory: {$error}
 
-codegen_ssa_expected_coverage_symbol = expected `coverage(off)` or `coverage(on)`
+codegen_ssa_error_writing_def_file =
+    Error writing .DEF file: {$error}
 
 codegen_ssa_expected_used_symbol = expected `used`, `used(compiler)` or `used(linker)`
 
@@ -43,6 +65,9 @@ codegen_ssa_failed_to_get_layout = failed to get layout for {$ty}: {$err}
 codegen_ssa_failed_to_write = failed to write {$path}: {$error}
 
 codegen_ssa_field_associated_value_expected = associated value expected for `{$name}`
+
+codegen_ssa_forbidden_target_feature_attr =
+    target feature `{$feature}` cannot be enabled with `#[target_feature]`: {$reason}
 
 codegen_ssa_ignoring_emit_path = ignoring emit path because multiple .{$extension} files were produced
 
@@ -68,7 +93,7 @@ codegen_ssa_invalid_monomorphization_basic_integer_type = invalid monomorphizati
 
 codegen_ssa_invalid_monomorphization_cannot_return = invalid monomorphization of `{$name}` intrinsic: cannot return `{$ret_ty}`, expected `u{$expected_int_bits}` or `[u8; {$expected_bytes}]`
 
-codegen_ssa_invalid_monomorphization_cast_fat_pointer = invalid monomorphization of `{$name}` intrinsic: cannot cast fat pointer `{$ty}`
+codegen_ssa_invalid_monomorphization_cast_wide_pointer = invalid monomorphization of `{$name}` intrinsic: cannot cast wide pointer `{$ty}`
 
 codegen_ssa_invalid_monomorphization_expected_element_type = invalid monomorphization of `{$name}` intrinsic: expected element type `{$expected_element}` of second argument `{$second_arg}` to be a pointer to the element type `{$in_elem}` of the first argument `{$in_ty}`, found `{$expected_element}` != `{$mutability} {$in_elem}`
 
@@ -118,7 +143,7 @@ codegen_ssa_invalid_monomorphization_simd_return = invalid monomorphization of `
 
 codegen_ssa_invalid_monomorphization_simd_second = invalid monomorphization of `{$name}` intrinsic: expected SIMD second type, found non-SIMD `{$ty}`
 
-codegen_ssa_invalid_monomorphization_simd_shuffle = invalid monomorphization of `{$name}` intrinsic: simd_shuffle index must be an array of `u32`, got `{$ty}`
+codegen_ssa_invalid_monomorphization_simd_shuffle = invalid monomorphization of `{$name}` intrinsic: simd_shuffle index must be a SIMD vector of `u32`, got `{$ty}`
 
 codegen_ssa_invalid_monomorphization_simd_third = invalid monomorphization of `{$name}` intrinsic: expected SIMD third type, found non-SIMD `{$ty}`
 
@@ -169,10 +194,17 @@ codegen_ssa_metadata_object_file_write = error writing metadata object file: {$e
 
 codegen_ssa_missing_cpp_build_tool_component = or a necessary component may be missing from the "C++ build tools" workload
 
+codegen_ssa_missing_features = add the missing features in a `target_feature` attribute
+
 codegen_ssa_missing_memory_ordering = Atomic intrinsic missing memory ordering
 
 codegen_ssa_missing_query_depgraph =
     found CGU-reuse attribute but `-Zquery-dep-graph` was not specified
+
+codegen_ssa_mixed_export_name_and_no_mangle = `{$no_mangle_attr}` attribute may not be used in combination with `#[export_name]`
+    .label = `{$no_mangle_attr}` is ignored
+    .note = `#[export_name]` takes precedence
+    .suggestion = remove the `{$no_mangle_attr}` attribute
 
 codegen_ssa_msvc_missing_linker = the msvc targets depend on the msvc linker but `link.exe` was not found
 
@@ -197,7 +229,7 @@ codegen_ssa_read_file = failed to read file: {$message}
 
 codegen_ssa_repair_vs_build_tools = the Visual Studio build tools may need to be repaired using the Visual Studio installer
 
-codegen_ssa_rlib_archive_build_failure = failed to build archive from rlib: {$error}
+codegen_ssa_rlib_archive_build_failure = failed to build archive from rlib at `{$path}`: {$error}
 
 codegen_ssa_rlib_incompatible_dependency_formats = `{$ty1}` and `{$ty2}` do not have equivalent dependency formats (`{$list1}` vs `{$list2}`)
 
@@ -208,6 +240,8 @@ codegen_ssa_rlib_not_found = could not find rlib for: `{$crate_name}`
 codegen_ssa_rlib_only_rmeta_found = could not find rlib for: `{$crate_name}`, found rmeta (metadata) file
 
 codegen_ssa_select_cpp_build_tool_workload = in the Visual Studio installer, ensure the "C++ build tools" workload is selected
+
+codegen_ssa_self_contained_linker_missing = the self-contained linker was requested, but it wasn't found in the target's sysroot, or in rustc's sysroot
 
 codegen_ssa_shuffle_indices_evaluation = could not evaluate shuffle_indices at compile time
 
@@ -221,6 +255,9 @@ codegen_ssa_stripping_debug_info_failed = stripping debug info with `{$util}` fa
     .note = {$output}
 
 codegen_ssa_symbol_file_write_failure = failed to write symbols file: {$error}
+
+codegen_ssa_target_feature_disable_or_enable =
+    the target features {$features} must all be either enabled or disabled together
 
 codegen_ssa_target_feature_safe_trait = `#[target_feature(..)]` cannot be applied to safe trait method
     .label = cannot be applied to safe trait method

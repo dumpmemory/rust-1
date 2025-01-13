@@ -4,6 +4,20 @@ on:
   - push
   - pull_request
 
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+env:
+  # Disabling incr comp reduces cache size and incr comp doesn't save as much
+  # on CI anyway.
+  CARGO_BUILD_INCREMENTAL: false
+  # Rust's CI denies warnings. Deny them here too to ensure subtree syncs don't
+  # fail because of warnings.
+  RUSTFLAGS: "-Dwarnings"
+
 jobs:
   rustfmt:
     runs-on: ubuntu-latest
@@ -15,7 +29,6 @@ jobs:
     - name: Avoid installing rustc-dev
       run: |
         sed -i 's/components.*/components = ["rustfmt"]/' rust-toolchain
-        echo 'profile = "minimal"' >> rust-toolchain
         rustfmt -v
 
     - name: Rustfmt
@@ -23,15 +36,15 @@ jobs:
         cargo fmt --check
         rustfmt --check build_system/main.rs
         rustfmt --check example/*
+        rustfmt --check scripts/*.rs
 
 
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
 
-    defaults:
-      run:
-        shell: bash
+    env:
+      CG_CLIF_EXPENSIVE_CHECKS: 1
 
     strategy:
       fail-fast: false
@@ -43,20 +56,21 @@ jobs:
           - os: macos-latest
             env:
               TARGET_TRIPLE: x86_64-apple-darwin
-          # cross-compile from Linux to Windows using mingw
-          # FIXME The wine version in Ubuntu 22.04 is missing ProcessPrng
-          #- os: ubuntu-latest
-          #  env:
-          #    TARGET_TRIPLE: x86_64-pc-windows-gnu
           - os: ubuntu-latest
             env:
               TARGET_TRIPLE: aarch64-unknown-linux-gnu
+            apt_deps: gcc-aarch64-linux-gnu qemu-user
+          - os: macos-latest
+            env:
+              TARGET_TRIPLE: aarch64-apple-darwin
           - os: ubuntu-latest
             env:
               TARGET_TRIPLE: s390x-unknown-linux-gnu
+            apt_deps: gcc-s390x-linux-gnu qemu-user
           - os: ubuntu-latest
             env:
               TARGET_TRIPLE: riscv64gc-unknown-linux-gnu
+            apt_deps: gcc-riscv64-linux-gnu qemu-user
           - os: windows-latest
             env:
               TARGET_TRIPLE: x86_64-pc-windows-msvc
@@ -81,29 +95,15 @@ jobs:
       if: matrix.os == 'windows-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
       run: rustup set default-host x86_64-pc-windows-gnu
 
-    #- name: Install MinGW toolchain and wine
-    #  if: matrix.os == 'ubuntu-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
-    #  run: |
-    #    sudo apt-get update
-    #    sudo apt-get install -y gcc-mingw-w64-x86-64 wine-stable
+    - name: Use x86_64 compiler on macOS
+      if: matrix.os == 'macos-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-apple-darwin'
+      run: rustup set default-host x86_64-apple-darwin
 
-    - name: Install AArch64 toolchain and qemu
-      if: matrix.os == 'ubuntu-latest' && matrix.env.TARGET_TRIPLE == 'aarch64-unknown-linux-gnu'
+    - name: Install toolchain and emulator
+      if: matrix.apt_deps != null
       run: |
         sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
-
-    - name: Install s390x toolchain and qemu
-      if: matrix.env.TARGET_TRIPLE == 's390x-unknown-linux-gnu'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-s390x-linux-gnu qemu-user
-
-    - name: Install riscv64gc toolchain and qemu
-      if: matrix.env.TARGET_TRIPLE == 'riscv64gc-unknown-linux-gnu'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-riscv64-linux-gnu qemu-user
+        sudo apt-get install -y ${{ matrix.apt_deps }}
 
     - name: Prepare dependencies
       run: ./y.sh prepare
@@ -121,9 +121,6 @@ jobs:
 
     # This is roughly config rust-lang/rust uses for testing
     - name: Test with LLVM sysroot
-      # Skip native x86_64-pc-windows-gnu. It is way too slow and cross-compiled
-      # x86_64-pc-windows-gnu covers at least part of the tests.
-      if: matrix.os != 'windows-latest' || matrix.env.TARGET_TRIPLE != 'x86_64-pc-windows-gnu'
       env:
         TARGET_TRIPLE: ${{ matrix.env.TARGET_TRIPLE }}
       run: ./y.sh test --sysroot llvm --no-unstable-features
@@ -133,10 +130,6 @@ jobs:
   test_llvm:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
-    defaults:
-      run:
-        shell: bash
 
     steps:
     - uses: actions/checkout@v4
@@ -160,10 +153,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    defaults:
-      run:
-        shell: bash
-
     steps:
     - uses: actions/checkout@v4
 
@@ -185,19 +174,15 @@ jobs:
       run: ./y.sh prepare
 
     - name: Build
-      run: CI_OPT=1 ./y.sh build --sysroot none
+      run: ./y.sh build --sysroot none
 
     - name: Benchmark
-      run: CI_OPT=1 ./y.sh bench
+      run: ./y.sh bench
 
 
   dist:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-
-    defaults:
-      run:
-        shell: bash
 
     strategy:
       fail-fast: false
@@ -210,10 +195,9 @@ jobs:
           - os: macos-latest
             env:
               TARGET_TRIPLE: x86_64-apple-darwin
-          # cross-compile from Linux to Windows using mingw
-          - os: ubuntu-latest
+          - os: macos-latest
             env:
-              TARGET_TRIPLE: x86_64-pc-windows-gnu
+              TARGET_TRIPLE: aarch64-apple-darwin
           - os: windows-latest
             env:
               TARGET_TRIPLE: x86_64-pc-windows-msvc
@@ -234,36 +218,26 @@ jobs:
       if: matrix.os == 'windows-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
       run: rustup set default-host x86_64-pc-windows-gnu
 
-    - name: Install MinGW toolchain and wine
-      if: matrix.os == 'ubuntu-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-mingw-w64-x86-64 wine-stable
+    - name: Use x86_64 compiler on macOS
+      if: matrix.os == 'macos-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-apple-darwin'
+      run: rustup set default-host x86_64-apple-darwin
 
     - name: Prepare dependencies
       run: ./y.sh prepare
 
     - name: Build backend
-      run: CI_OPT=1 ./y.sh build --sysroot none
+      run: ./y.sh build --sysroot none
 
     - name: Build sysroot
-      run: CI_OPT=1 ./y.sh build
+      run: ./y.sh build
 
     - name: Package prebuilt cg_clif
       run: tar cvfJ cg_clif.tar.xz dist
 
     - name: Upload prebuilt cg_clif
-      if: matrix.os == 'windows-latest' || matrix.env.TARGET_TRIPLE != 'x86_64-pc-windows-gnu'
       uses: actions/upload-artifact@v4
       with:
         name: cg_clif-${{ matrix.env.TARGET_TRIPLE }}
-        path: cg_clif.tar.xz
-
-    - name: Upload prebuilt cg_clif (cross compile)
-      if: matrix.os != 'windows-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
-      uses: actions/upload-artifact@v4
-      with:
-        name: cg_clif-${{ runner.os }}-cross-x86_64-mingw
         path: cg_clif.tar.xz
 
   release:
@@ -271,6 +245,9 @@ jobs:
     timeout-minutes: 10
     if: ${{ github.ref == 'refs/heads/master' }}
     needs: [rustfmt, test, bench, dist]
+
+    permissions:
+      contents: write # for creating the dev tag and release
 
     concurrency:
       group: release-dev

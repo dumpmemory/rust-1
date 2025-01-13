@@ -1,5 +1,3 @@
-//@ min-lldb-version: 310
-
 // == Test [gdb|lldb]-[command|check] are parsed correctly ===
 //@ should-fail
 //@ needs-run-enabled
@@ -16,8 +14,8 @@
 
 // lldb-command:run
 
-// lldb-command:print x
-// lldb-check:[...]$0 = 5
+// lldb-command:v x
+// lldb-check:[...] 5
 
 // === CDB TESTS ==================================================================================
 

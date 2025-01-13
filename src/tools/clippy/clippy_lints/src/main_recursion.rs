@@ -42,7 +42,7 @@ impl LateLintPass<'_> for MainRecursion {
             return;
         }
 
-        if let ExprKind::Call(func, _) = &expr.kind
+        if let ExprKind::Call(func, []) = &expr.kind
             && let ExprKind::Path(QPath::Resolved(_, path)) = &func.kind
             && let Some(def_id) = path.res.opt_def_id()
             && is_entrypoint_fn(cx, def_id)
@@ -51,7 +51,7 @@ impl LateLintPass<'_> for MainRecursion {
                 cx,
                 MAIN_RECURSION,
                 func.span,
-                &format!("recursing into entrypoint `{}`", snippet(cx, func.span, "main")),
+                format!("recursing into entrypoint `{}`", snippet(cx, func.span, "main")),
                 None,
                 "consider using another function for this recursion",
             );

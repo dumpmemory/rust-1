@@ -1,4 +1,4 @@
-//! Command-line interface of the rustbuild build system.
+//! Command-line interface of the bootstrap build system.
 //!
 //! This module implements the command-line parsing of the build system which
 //! has various flags to configure how it's run.
@@ -9,7 +9,7 @@ use clap::{CommandFactory, Parser, ValueEnum};
 
 use crate::core::build_steps::setup::Profile;
 use crate::core::builder::{Builder, Kind};
-use crate::core::config::{target_selection_list, Config, TargetSelectionList};
+use crate::core::config::{Config, TargetSelectionList, target_selection_list};
 use crate::{Build, DocTests};
 
 #[derive(Copy, Clone, Default, Debug, ValueEnum)]
@@ -41,167 +41,163 @@ pub struct Flags {
     #[command(subcommand)]
     pub cmd: Subcommand,
 
-    #[arg(global(true), short, long, action = clap::ArgAction::Count)]
+    #[arg(global = true, short, long, action = clap::ArgAction::Count)]
     /// use verbose output (-vv for very verbose)
     pub verbose: u8, // each extra -v after the first is passed to Cargo
-    #[arg(global(true), short, long)]
+    #[arg(global = true, short, long)]
     /// use incremental compilation
     pub incremental: bool,
-    #[arg(global(true), long, value_hint = clap::ValueHint::FilePath, value_name = "FILE")]
+    #[arg(global = true, long, value_hint = clap::ValueHint::FilePath, value_name = "FILE")]
     /// TOML configuration file for build
     pub config: Option<PathBuf>,
-    #[arg(global(true), long, value_hint = clap::ValueHint::DirPath, value_name = "DIR")]
+    #[arg(global = true, long, value_hint = clap::ValueHint::DirPath, value_name = "DIR")]
     /// Build directory, overrides `build.build-dir` in `config.toml`
     pub build_dir: Option<PathBuf>,
 
-    #[arg(global(true), long, value_hint = clap::ValueHint::Other, value_name = "BUILD")]
+    #[arg(global = true, long, value_hint = clap::ValueHint::Other, value_name = "BUILD")]
     /// build target of the stage0 compiler
     pub build: Option<String>,
 
-    #[arg(global(true), long, value_hint = clap::ValueHint::Other, value_name = "HOST", value_parser = target_selection_list)]
+    #[arg(global = true, long, value_hint = clap::ValueHint::Other, value_name = "HOST", value_parser = target_selection_list)]
     /// host targets to build
     pub host: Option<TargetSelectionList>,
 
-    #[arg(global(true), long, value_hint = clap::ValueHint::Other, value_name = "TARGET", value_parser = target_selection_list)]
+    #[arg(global = true, long, value_hint = clap::ValueHint::Other, value_name = "TARGET", value_parser = target_selection_list)]
     /// target targets to build
     pub target: Option<TargetSelectionList>,
 
-    #[arg(global(true), long, value_name = "PATH")]
+    #[arg(global = true, long, value_name = "PATH")]
     /// build paths to exclude
     pub exclude: Vec<PathBuf>, // keeping for client backward compatibility
-    #[arg(global(true), long, value_name = "PATH")]
+    #[arg(global = true, long, value_name = "PATH")]
     /// build paths to skip
     pub skip: Vec<PathBuf>,
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     /// include default paths in addition to the provided ones
     pub include_default_paths: bool,
 
-    #[arg(global(true), value_hint = clap::ValueHint::Other, long)]
+    #[arg(global = true, value_hint = clap::ValueHint::Other, long)]
     pub rustc_error_format: Option<String>,
 
-    #[arg(global(true), long, value_hint = clap::ValueHint::CommandString, value_name = "CMD")]
+    #[arg(global = true, long, value_hint = clap::ValueHint::CommandString, value_name = "CMD")]
     /// command to run on failure
     pub on_fail: Option<String>,
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     /// dry run; don't build anything
     pub dry_run: bool,
     /// Indicates whether to dump the work done from bootstrap shims
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     pub dump_bootstrap_shims: bool,
-    #[arg(global(true), value_hint = clap::ValueHint::Other, long, value_name = "N")]
+    #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "N")]
     /// stage to build (indicates compiler to use/test, e.g., stage 0 uses the
     /// bootstrap compiler, stage 1 the stage 0 rustc artifacts, etc.)
     pub stage: Option<u32>,
 
-    #[arg(global(true), value_hint = clap::ValueHint::Other, long, value_name = "N")]
+    #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "N")]
     /// stage(s) to keep without recompiling
     /// (pass multiple times to keep e.g., both stages 0 and 1)
     pub keep_stage: Vec<u32>,
-    #[arg(global(true), value_hint = clap::ValueHint::Other, long, value_name = "N")]
+    #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "N")]
     /// stage(s) of the standard library to keep without recompiling
     /// (pass multiple times to keep e.g., both stages 0 and 1)
     pub keep_stage_std: Vec<u32>,
-    #[arg(global(true), long, value_hint = clap::ValueHint::DirPath, value_name = "DIR")]
+    #[arg(global = true, long, value_hint = clap::ValueHint::DirPath, value_name = "DIR")]
     /// path to the root of the rust checkout
     pub src: Option<PathBuf>,
 
     #[arg(
-        global(true),
+        global = true,
         short,
         long,
         value_hint = clap::ValueHint::Other,
-        default_value_t = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         value_name = "JOBS"
     )]
     /// number of jobs to run in parallel
-    pub jobs: usize,
+    pub jobs: Option<u32>,
     // This overrides the deny-warnings configuration option,
     // which passes -Dwarnings to the compiler invocations.
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     #[arg(value_enum, default_value_t=Warnings::Default, value_name = "deny|warn")]
     /// if value is deny, will deny warnings
     /// if value is warn, will emit warnings
     /// otherwise, use the default configured behaviour
     pub warnings: Warnings,
 
-    #[arg(global(true), value_hint = clap::ValueHint::Other, long, value_name = "FORMAT")]
+    #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "FORMAT")]
     /// rustc error format
     pub error_format: Option<String>,
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     /// use message-format=json
     pub json_output: bool,
 
-    #[arg(global(true), long, value_name = "STYLE")]
+    #[arg(global = true, long, value_name = "STYLE")]
     #[arg(value_enum, default_value_t = Color::Auto)]
     /// whether to use color in cargo and rustc output
     pub color: Color,
 
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     /// Bootstrap uses this value to decide whether it should bypass locking the build process.
     /// This is rarely needed (e.g., compiling the std library for different targets in parallel).
     ///
     /// Unless you know exactly what you are doing, you probably don't need this.
     pub bypass_bootstrap_lock: bool,
 
-    /// whether rebuilding llvm should be skipped, overriding `skip-rebuld` in config.toml
-    #[arg(global(true), long, value_name = "VALUE")]
-    pub llvm_skip_rebuild: Option<bool>,
     /// generate PGO profile with rustc build
-    #[arg(global(true), value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
+    #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
     pub rust_profile_generate: Option<String>,
     /// use PGO profile for rustc build
-    #[arg(global(true), value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
+    #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
     pub rust_profile_use: Option<String>,
     /// use PGO profile for LLVM build
-    #[arg(global(true), value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
+    #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
     pub llvm_profile_use: Option<String>,
     // LLVM doesn't support a custom location for generating profile
     // information.
     //
     // llvm_out/build/profiles/ is the location this writes to.
     /// generate PGO profile with llvm built for rustc
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     pub llvm_profile_generate: bool,
     /// Enable BOLT link flags
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     pub enable_bolt_settings: bool,
     /// Skip stage0 compiler validation
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     pub skip_stage0_validation: bool,
     /// Additional reproducible artifacts that should be added to the reproducible artifacts archive.
-    #[arg(global(true), long)]
+    #[arg(global = true, long)]
     pub reproducible_artifact: Vec<String>,
-    #[arg(global(true))]
+    #[arg(global = true)]
     /// paths for the subcommand
     pub paths: Vec<PathBuf>,
     /// override options in config.toml
-    #[arg(global(true), value_hint = clap::ValueHint::Other, long, value_name = "section.option=value")]
+    #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "section.option=value")]
     pub set: Vec<String>,
     /// arguments passed to subcommands
-    #[arg(global(true), last(true), value_name = "ARGS")]
+    #[arg(global = true, last(true), value_name = "ARGS")]
     pub free_args: Vec<String>,
 }
 
 impl Flags {
-    pub fn parse(args: &[String]) -> Self {
-        let first = String::from("x.py");
-        let it = std::iter::once(&first).chain(args.iter());
+    /// Check if `<cmd> -h -v` was passed.
+    /// If yes, print the available paths and return `true`.
+    pub fn try_parse_verbose_help(args: &[String]) -> bool {
         // We need to check for `<cmd> -h -v`, in which case we list the paths
         #[derive(Parser)]
         #[command(disable_help_flag(true))]
         struct HelpVerboseOnly {
             #[arg(short, long)]
             help: bool,
-            #[arg(global(true), short, long, action = clap::ArgAction::Count)]
+            #[arg(global = true, short, long, action = clap::ArgAction::Count)]
             pub verbose: u8,
             #[arg(value_enum)]
             cmd: Kind,
         }
         if let Ok(HelpVerboseOnly { help: true, verbose: 1.., cmd: subcommand }) =
-            HelpVerboseOnly::try_parse_from(it.clone())
+            HelpVerboseOnly::try_parse_from(normalize_args(args))
         {
             println!("NOTE: updating submodules before printing available paths");
-            let config = Config::parse(&[String::from("build")]);
+            let config = Config::parse(Self::parse(&[String::from("build")]));
             let build = Build::new(config);
             let paths = Builder::get_help(&build, subcommand);
             if let Some(s) = paths {
@@ -209,11 +205,21 @@ impl Flags {
             } else {
                 panic!("No paths available for subcommand `{}`", subcommand.as_str());
             }
-            crate::exit!(0);
+            true
+        } else {
+            false
         }
-
-        Flags::parse_from(it)
     }
+
+    pub fn parse(args: &[String]) -> Self {
+        Flags::parse_from(normalize_args(args))
+    }
+}
+
+fn normalize_args(args: &[String]) -> Vec<String> {
+    let first = String::from("x.py");
+    let it = std::iter::once(first).chain(args.iter().cloned());
+    it.collect()
 }
 
 #[derive(Debug, Clone, Default, clap::Subcommand)]
@@ -260,16 +266,16 @@ pub enum Subcommand {
         #[arg(long, requires = "fix")]
         allow_staged: bool,
         /// clippy lints to allow
-        #[arg(global(true), short = 'A', action = clap::ArgAction::Append, value_name = "LINT")]
+        #[arg(global = true, short = 'A', action = clap::ArgAction::Append, value_name = "LINT")]
         allow: Vec<String>,
         /// clippy lints to deny
-        #[arg(global(true), short = 'D', action = clap::ArgAction::Append, value_name = "LINT")]
+        #[arg(global = true, short = 'D', action = clap::ArgAction::Append, value_name = "LINT")]
         deny: Vec<String>,
         /// clippy lints to warn on
-        #[arg(global(true), short = 'W', action = clap::ArgAction::Append, value_name = "LINT")]
+        #[arg(global = true, short = 'W', action = clap::ArgAction::Append, value_name = "LINT")]
         warn: Vec<String>,
         /// clippy lints to forbid
-        #[arg(global(true), short = 'F', action = clap::ArgAction::Append, value_name = "LINT")]
+        #[arg(global = true, short = 'F', action = clap::ArgAction::Append, value_name = "LINT")]
         forbid: Vec<String>,
     },
     /// Run cargo fix
@@ -284,8 +290,8 @@ pub enum Subcommand {
         name = "fmt",
         long_about = "\n
     Arguments:
-        This subcommand optionally accepts a `--check` flag which succeeds if formatting is correct and
-        fails if it is not. For example:
+        This subcommand optionally accepts a `--check` flag which succeeds if
+        formatting is correct and fails if it is not. For example:
             ./x.py fmt
             ./x.py fmt --check"
     )]
@@ -294,6 +300,10 @@ pub enum Subcommand {
         /// check formatting instead of applying
         #[arg(long)]
         check: bool,
+
+        /// apply to all appropriate files, not just those that have been modified
+        #[arg(long)]
+        all: bool,
     },
     #[command(aliases = ["d"], long_about = "\n
     Arguments:
@@ -339,16 +349,13 @@ pub enum Subcommand {
         #[arg(long)]
         /// run all tests regardless of failure
         no_fail_fast: bool,
-        #[arg(long, value_name = "SUBSTRING")]
-        /// skips tests matching SUBSTRING, if supported by test tool. May be passed multiple times
-        skip: Vec<PathBuf>,
         #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
         /// extra arguments to be passed for the test tool being used
         /// (e.g. libtest, compiletest or rustdoc)
         test_args: Vec<String>,
-        /// extra options to pass the compiler when running tests
+        /// extra options to pass the compiler when running compiletest tests
         #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
-        rustc_args: Vec<String>,
+        compiletest_rustc_args: Vec<String>,
         #[arg(long)]
         /// do not run doc tests
         no_doc: bool,
@@ -381,6 +388,25 @@ pub enum Subcommand {
         /// enable this to generate a Rustfix coverage file, which is saved in
         /// `/<build_base>/rustfix_missing_coverage.txt`
         rustfix_coverage: bool,
+        #[arg(long)]
+        /// don't capture stdout/stderr of tests
+        no_capture: bool,
+    },
+    /// Build and run some test suites *in Miri*
+    Miri {
+        #[arg(long)]
+        /// run all tests regardless of failure
+        no_fail_fast: bool,
+        #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
+        /// extra arguments to be passed for the test tool being used
+        /// (e.g. libtest, compiletest or rustdoc)
+        test_args: Vec<String>,
+        #[arg(long)]
+        /// do not run doc tests
+        no_doc: bool,
+        #[arg(long)]
+        /// only run doc tests
+        doc: bool,
     },
     /// Build and run some benchmarks
     Bench {
@@ -404,7 +430,7 @@ pub enum Subcommand {
     Arguments:
         This subcommand accepts a number of paths to tools to build and run. For
         example:
-            ./x.py run src/tools/expand-yaml-anchors
+            ./x.py run src/tools/bump-stage0
         At least a tool needs to be called.")]
     /// Run tools contained in this repository
     Run {
@@ -423,14 +449,14 @@ Arguments:
     The profile is optional and you will be prompted interactively if it is not given.
     The following profiles are available:
 {}
-    To only set up the git hook, VS Code config or toolchain link, you may use
+    To only set up the git hook, editor config or toolchain link, you may use
         ./x.py setup hook
-        ./x.py setup vscode
+        ./x.py setup editor
         ./x.py setup link", Profile::all_for_help("        ").trim_end()))]
     Setup {
         /// Either the profile for `config.toml` or another setup action.
         /// May be omitted to set up interactively
-        #[arg(value_name = "<PROFILE>|hook|vscode|link")]
+        #[arg(value_name = "<PROFILE>|hook|editor|link")]
         profile: Option<PathBuf>,
     },
     /// Suggest a subset of tests to run, based on modified files
@@ -440,6 +466,20 @@ Arguments:
         #[arg(long)]
         run: bool,
     },
+    /// Vendor dependencies
+    Vendor {
+        /// Additional `Cargo.toml` to sync and vendor
+        #[arg(long)]
+        sync: Vec<PathBuf>,
+        /// Always include version in subdir name
+        #[arg(long)]
+        versioned_dirs: bool,
+    },
+    /// Perform profiling and benchmarking of the compiler using the
+    /// `rustc-perf-wrapper` tool.
+    ///
+    /// You need to pass arguments after `--`, e.g.`x perf -- cachegrind`.
+    Perf {},
 }
 
 impl Subcommand {
@@ -453,19 +493,22 @@ impl Subcommand {
             Subcommand::Fix { .. } => Kind::Fix,
             Subcommand::Format { .. } => Kind::Format,
             Subcommand::Test { .. } => Kind::Test,
+            Subcommand::Miri { .. } => Kind::Miri,
             Subcommand::Clean { .. } => Kind::Clean,
             Subcommand::Dist { .. } => Kind::Dist,
             Subcommand::Install { .. } => Kind::Install,
             Subcommand::Run { .. } => Kind::Run,
             Subcommand::Setup { .. } => Kind::Setup,
             Subcommand::Suggest { .. } => Kind::Suggest,
+            Subcommand::Vendor { .. } => Kind::Vendor,
+            Subcommand::Perf { .. } => Kind::Perf,
         }
     }
 
-    pub fn rustc_args(&self) -> Vec<&str> {
+    pub fn compiletest_rustc_args(&self) -> Vec<&str> {
         match *self {
-            Subcommand::Test { ref rustc_args, .. } => {
-                rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
+            Subcommand::Test { ref compiletest_rustc_args, .. } => {
+                compiletest_rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
             }
             _ => vec![],
         }
@@ -473,14 +516,16 @@ impl Subcommand {
 
     pub fn fail_fast(&self) -> bool {
         match *self {
-            Subcommand::Test { no_fail_fast, .. } => !no_fail_fast,
+            Subcommand::Test { no_fail_fast, .. } | Subcommand::Miri { no_fail_fast, .. } => {
+                !no_fail_fast
+            }
             _ => false,
         }
     }
 
     pub fn doc_tests(&self) -> DocTests {
         match *self {
-            Subcommand::Test { doc, no_doc, .. } => {
+            Subcommand::Test { doc, no_doc, .. } | Subcommand::Miri { no_doc, doc, .. } => {
                 if doc {
                     DocTests::Only
                 } else if no_doc {
@@ -517,6 +562,13 @@ impl Subcommand {
     pub fn force_rerun(&self) -> bool {
         match *self {
             Subcommand::Test { force_rerun, .. } => force_rerun,
+            _ => false,
+        }
+    }
+
+    pub fn no_capture(&self) -> bool {
+        match *self {
+            Subcommand::Test { no_capture, .. } => no_capture,
             _ => false,
         }
     }
@@ -562,6 +614,20 @@ impl Subcommand {
             _ => false,
         }
     }
+
+    pub fn vendor_versioned_dirs(&self) -> bool {
+        match *self {
+            Subcommand::Vendor { versioned_dirs, .. } => versioned_dirs,
+            _ => false,
+        }
+    }
+
+    pub fn vendor_sync_args(&self) -> Vec<PathBuf> {
+        match self {
+            Subcommand::Vendor { sync, .. } => sync.clone(),
+            _ => vec![],
+        }
+    }
 }
 
 /// Returns the shell completion for a given shell, if the result differs from the current
@@ -577,7 +643,14 @@ pub fn get_completion<G: clap_complete::Generator>(shell: G, path: &Path) -> Opt
         })
     };
     let mut buf = Vec::new();
-    clap_complete::generate(shell, &mut cmd, "x.py", &mut buf);
+    let (bin_name, _) = path
+        .file_name()
+        .expect("path should be a regular file")
+        .to_str()
+        .expect("file name should be UTF-8")
+        .rsplit_once('.')
+        .expect("file name should have an extension");
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut buf);
     if buf == current.as_bytes() {
         return None;
     }

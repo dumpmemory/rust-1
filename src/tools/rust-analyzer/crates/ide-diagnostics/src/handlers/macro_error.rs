@@ -3,18 +3,25 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
 // Diagnostic: macro-error
 //
 // This diagnostic is shown for macro expansion errors.
+
+// Diagnostic: proc-macros-disabled
+//
+// This diagnostic is shown for proc macros where proc macros have been disabled.
+
+// Diagnostic: proc-macro-disabled
+//
+// This diagnostic is shown for proc macros that has been specifically disabled via `rust-analyzer.procMacro.ignored`.
 pub(crate) fn macro_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroError) -> Diagnostic {
     // Use more accurate position if available.
     let display_range = ctx.resolve_precise_location(&d.node, d.precise_location);
     Diagnostic::new(
-        DiagnosticCode::Ra("macro-error", Severity::Error),
+        DiagnosticCode::Ra(d.kind, if d.error { Severity::Error } else { Severity::WeakWarning }),
         d.message.clone(),
         display_range,
     )
-    .experimental()
 }
 
-// Diagnostic: macro-error
+// Diagnostic: macro-def-error
 //
 // This diagnostic is shown for macro expansion errors.
 pub(crate) fn macro_def_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroDefError) -> Diagnostic {
@@ -26,7 +33,6 @@ pub(crate) fn macro_def_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroDefErr
         d.message.clone(),
         display_range,
     )
-    .experimental()
 }
 
 #[cfg(test)]
@@ -47,7 +53,7 @@ macro_rules! include { () => {} }
 macro_rules! compile_error { () => {} }
 
   include!("doesntexist");
-//^^^^^^^ error: failed to load file `doesntexist`
+         //^^^^^^^^^^^^^ error: failed to load file `doesntexist`
 
   compile_error!("compile_error macro works");
 //^^^^^^^^^^^^^ error: compile_error macro works
@@ -127,7 +133,7 @@ macro_rules! env { () => {} }
 macro_rules! concat { () => {} }
 
   include!(concat!(env!("OUT_DIR"), "/out.rs"));
-//^^^^^^^ error: `OUT_DIR` not set, enable "build scripts" to fix
+                      //^^^^^^^^^ error: `OUT_DIR` not set, enable "build scripts" to fix
 "#,
         );
     }
@@ -162,20 +168,25 @@ macro_rules! include {}
 
 #[rustc_builtin_macro]
 macro_rules! compile_error {}
+#[rustc_builtin_macro]
+macro_rules! concat {}
 
 fn main() {
     // Test a handful of built-in (eager) macros:
 
     include!(invalid);
-  //^^^^^^^ error: could not convert tokens
+           //^^^^^^^ error: expected string literal
     include!("does not exist");
-  //^^^^^^^ error: failed to load file `does not exist`
+           //^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
+
+    include!(concat!("does ", "not ", "exist"));
+                  //^^^^^^^^^^^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
 
     env!(invalid);
-  //^^^ error: could not convert tokens
+       //^^^^^^^ error: expected string literal
 
     env!("OUT_DIR");
-  //^^^ error: `OUT_DIR` not set, enable "build scripts" to fix
+       //^^^^^^^^^ error: `OUT_DIR` not set, enable "build scripts" to fix
 
     compile_error!("compile_error works");
   //^^^^^^^^^^^^^ error: compile_error works
@@ -200,7 +211,7 @@ fn f() {
     m!();
 
     m!(hi);
-  //^ error: leftover tokens
+    //^ error: leftover tokens
 }
       "#,
         );
@@ -267,11 +278,7 @@ fn f() {
 
     #[test]
     fn include_does_not_break_diagnostics() {
-        let mut config = DiagnosticsConfig::test_sample();
-        config.disabled.insert("inactive-code".to_owned());
-        config.disabled.insert("unlinked-file".to_owned());
-        check_diagnostics_with_config(
-            config,
+        check_diagnostics(
             r#"
 //- minicore: include
 //- /lib.rs crate:lib

@@ -1,3 +1,11 @@
+use std::assert_matches::assert_matches;
+use std::collections::hash_map::Entry;
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::profiling::{QueryInvocationId, SelfProfilerRef};
@@ -6,13 +14,11 @@ use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::sync::{AtomicU32, AtomicU64, Lock, Lrc};
 use rustc_data_structures::unord::UnordMap;
 use rustc_index::IndexVec;
+use rustc_macros::{Decodable, Encodable};
 use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
-use std::assert_matches::assert_matches;
-use std::collections::hash_map::Entry;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::marker::PhantomData;
-use std::sync::atomic::Ordering;
+use tracing::{debug, instrument};
+#[cfg(debug_assertions)]
+use {super::debug::EdgeFilter, std::env};
 
 use super::query::DepGraphQuery;
 use super::serialized::{GraphEncoder, SerializedDepGraph, SerializedDepNodeIndex};
@@ -20,9 +26,6 @@ use super::{DepContext, DepKind, DepNode, Deps, HasDepContext, WorkProductId};
 use crate::dep_graph::edges::EdgesVec;
 use crate::ich::StableHashingContext;
 use crate::query::{QueryContext, QuerySideEffects};
-
-#[cfg(debug_assertions)]
-use {super::debug::EdgeFilter, std::env};
 
 #[derive(Clone)]
 pub struct DepGraph<D: Deps> {
@@ -39,8 +42,13 @@ rustc_index::newtype_index! {
     pub struct DepNodeIndex {}
 }
 
+// We store a large collection of these in `prev_index_to_index` during
+// non-full incremental builds, and want to ensure that the element size
+// doesn't inadvertently increase.
+rustc_data_structures::static_assert_size!(Option<DepNodeIndex>, 4);
+
 impl DepNodeIndex {
-    const SINGLETON_DEPENDENCYLESS_ANON_NODE: DepNodeIndex = DepNodeIndex::from_u32(0);
+    const SINGLETON_DEPENDENCYLESS_ANON_NODE: DepNodeIndex = DepNodeIndex::ZERO;
     pub const FOREVER_RED_NODE: DepNodeIndex = DepNodeIndex::from_u32(1);
 }
 
@@ -56,7 +64,6 @@ pub struct MarkFrame<'a> {
     parent: Option<&'a MarkFrame<'a>>,
 }
 
-#[derive(PartialEq)]
 enum DepNodeColor {
     Red,
     Green(DepNodeIndex),
@@ -81,7 +88,7 @@ pub(crate) struct DepGraphData<D: Deps> {
 
     /// The dep-graph from the previous compilation session. It contains all
     /// nodes and edges as well as all fingerprints of nodes that have them.
-    previous: SerializedDepGraph,
+    previous: Arc<SerializedDepGraph>,
 
     colors: DepNodeColorMap,
 
@@ -113,7 +120,7 @@ where
 impl<D: Deps> DepGraph<D> {
     pub fn new(
         profiler: &SelfProfilerRef,
-        prev_graph: SerializedDepGraph,
+        prev_graph: Arc<SerializedDepGraph>,
         prev_work_products: WorkProductMap,
         encoder: FileEncoder,
         record_graph: bool,
@@ -127,6 +134,7 @@ impl<D: Deps> DepGraph<D> {
             encoder,
             record_graph,
             record_stats,
+            Arc::clone(&prev_graph),
         );
 
         let colors = DepNodeColorMap::new(prev_graph_node_count);
@@ -294,7 +302,11 @@ impl<D: Deps> DepGraph<D> {
         OP: FnOnce() -> R,
     {
         match self.data() {
-            Some(data) => data.with_anon_task(cx, dep_kind, op),
+            Some(data) => {
+                let (result, index) = data.with_anon_task_inner(cx, dep_kind, op);
+                self.read_index(index);
+                (result, index)
+            }
             None => (op(), self.next_virtual_depnode_index()),
         }
     }
@@ -389,7 +401,16 @@ impl<D: Deps> DepGraphData<D> {
 
     /// Executes something within an "anonymous" task, that is, a task the
     /// `DepNode` of which is determined by the list of inputs it read from.
-    pub(crate) fn with_anon_task<Tcx: DepContext<Deps = D>, OP, R>(
+    ///
+    /// NOTE: this does not actually count as a read of the DepNode here.
+    /// Using the result of this task without reading the DepNode will result
+    /// in untracked dependencies which may lead to ICEs as nodes are
+    /// incorrectly marked green.
+    ///
+    /// FIXME: This could perhaps return a `WithDepNode` to ensure that the
+    /// user of this function actually performs the read; we'll have to see
+    /// how to make that work with `anon` in `execute_job_incr`, though.
+    pub(crate) fn with_anon_task_inner<Tcx: DepContext<Deps = D>, OP, R>(
         &self,
         cx: Tcx,
         dep_kind: DepKind,
@@ -457,7 +478,8 @@ impl<D: Deps> DepGraph<D> {
                     }
                     TaskDepsRef::Ignore => return,
                     TaskDepsRef::Forbid => {
-                        panic!("Illegal read of: {dep_node_index:?}")
+                        // Reading is forbidden in this context. ICE with a useful error message.
+                        panic_on_forbidden_read(data, dep_node_index)
                     }
                 };
                 let task_deps = &mut *task_deps;
@@ -828,12 +850,6 @@ impl<D: Deps> DepGraphData<D> {
     ) -> Option<DepNodeIndex> {
         let frame = MarkFrame { index: prev_dep_node_index, parent: frame };
 
-        #[cfg(not(parallel_compiler))]
-        {
-            debug_assert!(!self.dep_node_exists(dep_node));
-            debug_assert!(self.colors.get(prev_dep_node_index).is_none());
-        }
-
         // We never try to mark eval_always nodes as green
         debug_assert!(!qcx.dep_context().is_eval_always(dep_node.kind));
 
@@ -861,13 +877,6 @@ impl<D: Deps> DepGraphData<D> {
         // FIXME: Store the fact that a node has diagnostics in a bit in the dep graph somewhere
         // Maybe store a list on disk and encode this fact in the DepNodeState
         let side_effects = qcx.load_side_effects(prev_dep_node_index);
-
-        #[cfg(not(parallel_compiler))]
-        debug_assert!(
-            self.colors.get(prev_dep_node_index).is_none(),
-            "DepGraph::try_mark_previous_green() - Duplicate DepNodeColor \
-                      insertion for {dep_node:?}"
-        );
 
         if side_effects.maybe_any() {
             qcx.dep_context().dep_graph().with_query_deserialization(|| {
@@ -915,7 +924,7 @@ impl<D: Deps> DepGraph<D> {
     /// Returns true if the given node has been marked as red during the
     /// current compilation session. Used in various assertions
     pub fn is_red(&self, dep_node: &DepNode) -> bool {
-        self.node_color(dep_node) == Some(DepNodeColor::Red)
+        matches!(self.node_color(dep_node), Some(DepNodeColor::Red))
     }
 
     /// Returns true if the given node has been marked as green during the
@@ -1084,11 +1093,12 @@ impl<D: Deps> CurrentDepGraph<D> {
         encoder: FileEncoder,
         record_graph: bool,
         record_stats: bool,
+        previous: Arc<SerializedDepGraph>,
     ) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let nanos = duration.as_secs() * 1_000_000_000 + duration.subsec_nanos() as u64;
+        let nanos = duration.as_nanos();
         let mut stable_hasher = StableHasher::new();
         nanos.hash(&mut stable_hasher);
         let anon_id_seed = stable_hasher.finish();
@@ -1102,11 +1112,6 @@ impl<D: Deps> CurrentDepGraph<D> {
             Err(_) => None,
         };
 
-        // We store a large collection of these in `prev_index_to_index` during
-        // non-full incremental builds, and want to ensure that the element size
-        // doesn't inadvertently increase.
-        static_assert_size!(Option<DepNodeIndex>, 4);
-
         let new_node_count_estimate = 102 * prev_graph_node_count / 100 + 200;
 
         CurrentDepGraph {
@@ -1116,6 +1121,7 @@ impl<D: Deps> CurrentDepGraph<D> {
                 record_graph,
                 record_stats,
                 profiler,
+                previous,
             ),
             new_node_to_index: Sharded::new(|| {
                 FxHashMap::with_capacity_and_hasher(
@@ -1236,16 +1242,14 @@ impl<D: Deps> CurrentDepGraph<D> {
         match prev_index_to_index[prev_index] {
             Some(dep_node_index) => dep_node_index,
             None => {
-                let key = prev_graph.index_to_node(prev_index);
-                let edges = prev_graph
-                    .edge_targets_from(prev_index)
-                    .map(|i| prev_index_to_index[i].unwrap())
-                    .collect();
-                let fingerprint = prev_graph.fingerprint_by_index(prev_index);
-                let dep_node_index = self.encoder.send(key, fingerprint, edges);
+                let dep_node_index = self.encoder.send_promoted(prev_index, &*prev_index_to_index);
                 prev_index_to_index[prev_index] = Some(dep_node_index);
                 #[cfg(debug_assertions)]
-                self.record_edge(dep_node_index, key, fingerprint);
+                self.record_edge(
+                    dep_node_index,
+                    prev_graph.index_to_node(prev_index),
+                    prev_graph.fingerprint_by_index(prev_index),
+                );
                 dep_node_index
             }
         }
@@ -1363,4 +1367,46 @@ pub(crate) fn print_markframe_trace<D: Deps>(graph: &DepGraph<D>, frame: Option<
     }
 
     eprintln!("end of try_mark_green dep node stack");
+}
+
+#[cold]
+#[inline(never)]
+fn panic_on_forbidden_read<D: Deps>(data: &DepGraphData<D>, dep_node_index: DepNodeIndex) -> ! {
+    // We have to do an expensive reverse-lookup of the DepNode that
+    // corresponds to `dep_node_index`, but that's OK since we are about
+    // to ICE anyway.
+    let mut dep_node = None;
+
+    // First try to find the dep node among those that already existed in the
+    // previous session
+    for (prev_index, index) in data.current.prev_index_to_index.lock().iter_enumerated() {
+        if index == &Some(dep_node_index) {
+            dep_node = Some(data.previous.index_to_node(prev_index));
+            break;
+        }
+    }
+
+    if dep_node.is_none() {
+        // Try to find it among the new nodes
+        for shard in data.current.new_node_to_index.lock_shards() {
+            if let Some((node, _)) = shard.iter().find(|(_, index)| **index == dep_node_index) {
+                dep_node = Some(*node);
+                break;
+            }
+        }
+    }
+
+    let dep_node = dep_node.map_or_else(
+        || format!("with index {:?}", dep_node_index),
+        |dep_node| format!("`{:?}`", dep_node),
+    );
+
+    panic!(
+        "Error: trying to record dependency on DepNode {dep_node} in a \
+         context that does not allow it (e.g. during query deserialization). \
+         The most common case of recording a dependency on a DepNode `foo` is \
+         when the corresponding query `foo` is invoked. Invoking queries is not \
+         allowed as part of loading something from the incremental on-disk cache. \
+         See <https://github.com/rust-lang/rust/pull/91919>."
+    )
 }

@@ -24,10 +24,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   xz-utils \
   nodejs \
   mingw-w64 \
-  libgccjit-13-dev \
+  # libgccjit dependencies
+  flex \
+  libmpfr-dev \
+  libgmp-dev \
+  libmpc3 \
+  libmpc-dev \
   && rm -rf /var/lib/apt/lists/*
-
-# Note: libgccjit needs to match the default gcc version for the linker to find it.
 
 # Install powershell (universal package) so we can test x.ps1 on Linux
 # FIXME: need a "universal" version that supports libicu74, but for now it still works to ignore that dep.
@@ -48,8 +51,21 @@ ENV RUST_CONFIGURE_ARGS \
       --build=x86_64-unknown-linux-gnu \
       --llvm-root=/usr/lib/llvm-18 \
       --enable-llvm-link-shared \
+      --set rust.randomize-layout=true \
       --set rust.thin-lto-import-instr-limit=10
 
-COPY host-x86_64/x86_64-gnu-llvm-16/script.sh /tmp/
+COPY scripts/shared.sh /scripts/
+COPY scripts/build-gccjit.sh /scripts/
 
-ENV SCRIPT /tmp/script.sh
+RUN /scripts/build-gccjit.sh /scripts
+
+ARG SCRIPT_ARG
+
+COPY scripts/add_dummy_commit.sh /tmp/
+COPY scripts/x86_64-gnu-llvm.sh /tmp/
+COPY scripts/x86_64-gnu-llvm2.sh /tmp/
+COPY scripts/x86_64-gnu-llvm3.sh /tmp/
+COPY scripts/stage_2_test_set1.sh /tmp/
+COPY scripts/stage_2_test_set2.sh /tmp/
+
+ENV SCRIPT "/tmp/add_dummy_commit.sh && /tmp/${SCRIPT_ARG}"

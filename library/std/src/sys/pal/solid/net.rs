@@ -1,19 +1,15 @@
-use super::abi;
-use crate::{
-    cmp,
-    ffi::CStr,
-    io::{self, BorrowedBuf, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut},
-    mem,
-    net::{Shutdown, SocketAddr},
-    os::solid::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
-    ptr, str,
-    sys_common::net::{getsockopt, setsockopt, sockaddr_to_addr},
-    sys_common::{FromInner, IntoInner},
-    time::Duration,
-};
-
-use self::netc::{sockaddr, socklen_t, MSG_PEEK};
 use libc::{c_int, c_void, size_t};
+
+use self::netc::{MSG_PEEK, sockaddr, socklen_t};
+use super::abi;
+use crate::ffi::CStr;
+use crate::io::{self, BorrowedBuf, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut};
+use crate::net::{Shutdown, SocketAddr};
+use crate::os::solid::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use crate::sys_common::net::{getsockopt, setsockopt, sockaddr_to_addr};
+use crate::sys_common::{FromInner, IntoInner};
+use crate::time::Duration;
+use crate::{cmp, mem, ptr, str};
 
 pub mod netc {
     pub use super::super::abi::sockets::*;
@@ -154,10 +150,7 @@ impl Socket {
         }
 
         if timeout.as_secs() == 0 && timeout.subsec_nanos() == 0 {
-            return Err(io::const_io_error!(
-                io::ErrorKind::InvalidInput,
-                "cannot set a 0 duration timeout",
-            ));
+            return Err(io::Error::ZERO_TIMEOUT);
         }
 
         let mut timeout =
@@ -182,7 +175,7 @@ impl Socket {
         };
 
         match n {
-            0 => Err(io::const_io_error!(io::ErrorKind::TimedOut, "connection timed out")),
+            0 => Err(io::const_error!(io::ErrorKind::TimedOut, "connection timed out")),
             _ => {
                 let can_write = writefds.num_fds != 0;
                 if !can_write {
@@ -306,10 +299,7 @@ impl Socket {
         let timeout = match dur {
             Some(dur) => {
                 if dur.as_secs() == 0 && dur.subsec_nanos() == 0 {
-                    return Err(io::const_io_error!(
-                        io::ErrorKind::InvalidInput,
-                        "cannot set a 0 duration timeout",
-                    ));
+                    return Err(io::Error::ZERO_TIMEOUT);
                 }
 
                 let secs = if dur.as_secs() > netc::c_long::MAX as u64 {

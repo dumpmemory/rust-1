@@ -1,5 +1,5 @@
-use super::utils::make_iterator_snippet;
 use super::MANUAL_FIND;
+use super::utils::make_iterator_snippet;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::ty::implements_trait;
@@ -7,7 +7,7 @@ use clippy_utils::{higher, is_res_lang_ctor, path_res, peel_blocks_with_stmt};
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
 use rustc_hir::lang_items::LangItem;
-use rustc_hir::{BindingAnnotation, Block, Expr, ExprKind, HirId, Node, Pat, PatKind, Stmt, StmtKind};
+use rustc_hir::{BindingMode, Block, Expr, ExprKind, HirId, Node, Pat, PatKind, Stmt, StmtKind};
 use rustc_lint::LateContext;
 use rustc_span::Span;
 
@@ -58,7 +58,7 @@ pub(super) fn check<'tcx>(
             .tcx
             .lang_items()
             .copy_trait()
-            .map_or(false, |id| implements_trait(cx, ty, id, &[]))
+            .is_some_and(|id| implements_trait(cx, ty, id, &[]))
         {
             snippet.push_str(
                 &format!(
@@ -107,7 +107,7 @@ fn get_binding(pat: &Pat<'_>) -> Option<HirId> {
             hir_id = None;
             return;
         }
-        if let BindingAnnotation::NONE = annotation {
+        if let BindingMode::NONE = annotation {
             hir_id = Some(id);
         }
     });

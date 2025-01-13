@@ -156,10 +156,10 @@ macro_rules! make_mir_visitor {
 
             fn visit_coverage(
                 &mut self,
-                coverage: & $($mutability)? Coverage,
+                kind: & $($mutability)? coverage::CoverageKind,
                 location: Location,
             ) {
-                self.super_coverage(coverage, location);
+                self.super_coverage(kind, location);
             }
 
             fn visit_retag(
@@ -184,12 +184,12 @@ macro_rules! make_mir_visitor {
 
             /// This is called for every constant in the MIR body and every `required_consts`
             /// (i.e., including consts that have been dead-code-eliminated).
-            fn visit_constant(
+            fn visit_const_operand(
                 &mut self,
                 constant: & $($mutability)? ConstOperand<'tcx>,
                 location: Location,
             ) {
-                self.super_constant(constant, location);
+                self.super_const_operand(constant, location);
             }
 
             fn visit_ty_const(
@@ -337,22 +337,26 @@ macro_rules! make_mir_visitor {
 
                     let ty::Instance { def: callee_def, args: callee_args } = callee;
                     match callee_def {
-                        ty::InstanceDef::Item(_def_id) => {}
+                        ty::InstanceKind::Item(_def_id) => {}
 
-                        ty::InstanceDef::Intrinsic(_def_id) |
-                        ty::InstanceDef::VTableShim(_def_id) |
-                        ty::InstanceDef::ReifyShim(_def_id) |
-                        ty::InstanceDef::Virtual(_def_id, _) |
-                        ty::InstanceDef::ThreadLocalShim(_def_id) |
-                        ty::InstanceDef::ClosureOnceShim { call_once: _def_id, track_caller: _ } |
-                        ty::InstanceDef::ConstructCoroutineInClosureShim { coroutine_closure_def_id: _def_id, target_kind: _ } |
-                        ty::InstanceDef::CoroutineKindShim { coroutine_def_id: _def_id, target_kind: _ } |
-                        ty::InstanceDef::DropGlue(_def_id, None) => {}
+                        ty::InstanceKind::Intrinsic(_def_id) |
+                        ty::InstanceKind::VTableShim(_def_id) |
+                        ty::InstanceKind::ReifyShim(_def_id, _) |
+                        ty::InstanceKind::Virtual(_def_id, _) |
+                        ty::InstanceKind::ThreadLocalShim(_def_id) |
+                        ty::InstanceKind::ClosureOnceShim { call_once: _def_id, track_caller: _ } |
+                        ty::InstanceKind::ConstructCoroutineInClosureShim {
+                            coroutine_closure_def_id: _def_id,
+                            receiver_by_ref: _,
+                        } |
+                        ty::InstanceKind::AsyncDropGlueCtorShim(_def_id, None) |
+                        ty::InstanceKind::DropGlue(_def_id, None) => {}
 
-                        ty::InstanceDef::FnPtrShim(_def_id, ty) |
-                        ty::InstanceDef::DropGlue(_def_id, Some(ty)) |
-                        ty::InstanceDef::CloneShim(_def_id, ty) |
-                        ty::InstanceDef::FnPtrAddrShim(_def_id, ty) => {
+                        ty::InstanceKind::FnPtrShim(_def_id, ty) |
+                        ty::InstanceKind::DropGlue(_def_id, Some(ty)) |
+                        ty::InstanceKind::CloneShim(_def_id, ty) |
+                        ty::InstanceKind::FnPtrAddrShim(_def_id, ty) |
+                        ty::InstanceKind::AsyncDropGlueCtorShim(_def_id, Some(ty)) => {
                             // FIXME(eddyb) use a better `TyContext` here.
                             self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
                         }
@@ -448,6 +452,7 @@ macro_rules! make_mir_visitor {
                     }
                     StatementKind::ConstEvalCounter => {}
                     StatementKind::Nop => {}
+                    StatementKind::BackwardIncompatibleDropHint { .. } => {}
                 }
             }
 
@@ -535,6 +540,17 @@ macro_rules! make_mir_visitor {
                         );
                     }
 
+                    TerminatorKind::TailCall {
+                        func,
+                        args,
+                        fn_span: _,
+                    } => {
+                        self.visit_operand(func, location);
+                        for arg in args {
+                            self.visit_operand(&$($mutability)? arg.node, location);
+                        }
+                    },
+
                     TerminatorKind::Assert {
                         cond,
                         expected: _,
@@ -561,6 +577,7 @@ macro_rules! make_mir_visitor {
                     }
 
                     TerminatorKind::InlineAsm {
+                        asm_macro: _,
                         template: _,
                         operands,
                         options: _,
@@ -592,7 +609,7 @@ macro_rules! make_mir_visitor {
                                 }
                                 InlineAsmOperand::Const { value }
                                 | InlineAsmOperand::SymFn { value } => {
-                                    self.visit_constant(value, location);
+                                    self.visit_const_operand(value, location);
                                 }
                                 InlineAsmOperand::Out { place: None, .. }
                                 | InlineAsmOperand::SymStatic { def_id: _ }
@@ -650,7 +667,7 @@ macro_rules! make_mir_visitor {
                             BorrowKind::Shared => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::SharedBorrow
                             ),
-                            BorrowKind::Fake => PlaceContext::NonMutatingUse(
+                            BorrowKind::Fake(_) => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::FakeBorrow
                             ),
                             BorrowKind::Mut { .. } =>
@@ -666,24 +683,16 @@ macro_rules! make_mir_visitor {
                         );
                     }
 
-                    Rvalue::AddressOf(m, path) => {
+                    Rvalue::RawPtr(m, path) => {
                         let ctx = match m {
                             Mutability::Mut => PlaceContext::MutatingUse(
-                                MutatingUseContext::AddressOf
+                                MutatingUseContext::RawBorrow
                             ),
                             Mutability::Not => PlaceContext::NonMutatingUse(
-                                NonMutatingUseContext::AddressOf
+                                NonMutatingUseContext::RawBorrow
                             ),
                         };
                         self.visit_place(path, ctx, location);
-                    }
-
-                    Rvalue::Len(path) => {
-                        self.visit_place(
-                            path,
-                            PlaceContext::NonMutatingUse(NonMutatingUseContext::Inspect),
-                            location
-                        );
                     }
 
                     Rvalue::Cast(_cast_kind, operand, ty) => {
@@ -691,8 +700,7 @@ macro_rules! make_mir_visitor {
                         self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
                     }
 
-                    Rvalue::BinaryOp(_bin_op, box(lhs, rhs))
-                    | Rvalue::CheckedBinaryOp(_bin_op, box(lhs, rhs)) => {
+                    Rvalue::BinaryOp(_bin_op, box(lhs, rhs)) => {
                         self.visit_operand(lhs, location);
                         self.visit_operand(rhs, location);
                     }
@@ -748,6 +756,9 @@ macro_rules! make_mir_visitor {
                             ) => {
                                 self.visit_args(coroutine_closure_args, location);
                             }
+                            AggregateKind::RawPtr(ty, _) => {
+                                self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
+                            }
                         }
 
                         for operand in operands {
@@ -781,7 +792,7 @@ macro_rules! make_mir_visitor {
                         );
                     }
                     Operand::Constant(constant) => {
-                        self.visit_constant(constant, location);
+                        self.visit_const_operand(constant, location);
                     }
                 }
             }
@@ -800,7 +811,7 @@ macro_rules! make_mir_visitor {
             }
 
             fn super_coverage(&mut self,
-                              _coverage: & $($mutability)? Coverage,
+                              _kind: & $($mutability)? coverage::CoverageKind,
                               _location: Location) {
             }
 
@@ -860,7 +871,7 @@ macro_rules! make_mir_visitor {
                     }
                 }
                 match value {
-                    VarDebugInfoContents::Const(c) => self.visit_constant(c, location),
+                    VarDebugInfoContents::Const(c) => self.visit_const_operand(c, location),
                     VarDebugInfoContents::Place(place) =>
                         self.visit_place(
                             place,
@@ -875,7 +886,7 @@ macro_rules! make_mir_visitor {
                 _scope: $(& $mutability)? SourceScope
             ) {}
 
-            fn super_constant(
+            fn super_const_operand(
                 &mut self,
                 constant: & $($mutability)? ConstOperand<'tcx>,
                 location: Location
@@ -888,7 +899,7 @@ macro_rules! make_mir_visitor {
 
                 self.visit_span($(& $mutability)? *span);
                 match const_ {
-                    Const::Ty(ct) => self.visit_ty_const($(&$mutability)? *ct, location),
+                    Const::Ty(_, ct) => self.visit_ty_const($(&$mutability)? *ct, location),
                     Const::Val(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                     Const::Unevaluated(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                 }
@@ -998,14 +1009,14 @@ macro_rules! extra_body_methods {
 macro_rules! super_body {
     ($self:ident, $body:ident, $($mutability:ident, $invalidate:tt)?) => {
         let span = $body.span;
-        if let Some(gen) = &$($mutability)? $body.coroutine {
-            if let Some(yield_ty) = $(& $mutability)? gen.yield_ty {
+        if let Some(coroutine) = &$($mutability)? $body.coroutine {
+            if let Some(yield_ty) = $(& $mutability)? coroutine.yield_ty {
                 $self.visit_ty(
                     yield_ty,
                     TyContext::YieldTy(SourceInfo::outermost(span))
                 );
             }
-            if let Some(resume_ty) = $(& $mutability)? gen.resume_ty {
+            if let Some(resume_ty) = $(& $mutability)? coroutine.resume_ty {
                 $self.visit_ty(
                     resume_ty,
                     TyContext::ResumeTy(SourceInfo::outermost(span))
@@ -1048,9 +1059,11 @@ macro_rules! super_body {
 
         $self.visit_span($(& $mutability)? $body.span);
 
-        for const_ in &$($mutability)? $body.required_consts {
-            let location = Location::START;
-            $self.visit_constant(const_, location);
+        if let Some(required_consts) = &$($mutability)? $body.required_consts {
+            for const_ in required_consts {
+                let location = Location::START;
+                $self.visit_const_operand(const_, location);
+            }
         }
     }
 }
@@ -1276,9 +1289,11 @@ pub enum NonMutatingUseContext {
     /// Shared borrow.
     SharedBorrow,
     /// A fake borrow.
+    /// FIXME: do we need to distinguish shallow and deep fake borrows? In fact, do we need to
+    /// distinguish fake and normal deep borrows?
     FakeBorrow,
-    /// AddressOf for *const pointer.
-    AddressOf,
+    /// `&raw const`.
+    RawBorrow,
     /// PlaceMention statement.
     ///
     /// This statement is executed as a check that the `Place` is live without reading from it,
@@ -1311,8 +1326,8 @@ pub enum MutatingUseContext {
     Drop,
     /// Mutable borrow.
     Borrow,
-    /// AddressOf for *mut pointer.
-    AddressOf,
+    /// `&raw mut`.
+    RawBorrow,
     /// Used as base for another place, e.g., `x` in `x.y`. Could potentially mutate the place.
     /// For example, the projection `x.y` is marked as a mutation in these cases:
     /// ```ignore (illustrative)
@@ -1346,12 +1361,12 @@ pub enum PlaceContext {
 impl PlaceContext {
     /// Returns `true` if this place context represents a drop.
     #[inline]
-    pub fn is_drop(&self) -> bool {
+    pub fn is_drop(self) -> bool {
         matches!(self, PlaceContext::MutatingUse(MutatingUseContext::Drop))
     }
 
     /// Returns `true` if this place context represents a borrow.
-    pub fn is_borrow(&self) -> bool {
+    pub fn is_borrow(self) -> bool {
         matches!(
             self,
             PlaceContext::NonMutatingUse(
@@ -1361,17 +1376,17 @@ impl PlaceContext {
     }
 
     /// Returns `true` if this place context represents an address-of.
-    pub fn is_address_of(&self) -> bool {
+    pub fn is_address_of(self) -> bool {
         matches!(
             self,
-            PlaceContext::NonMutatingUse(NonMutatingUseContext::AddressOf)
-                | PlaceContext::MutatingUse(MutatingUseContext::AddressOf)
+            PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow)
+                | PlaceContext::MutatingUse(MutatingUseContext::RawBorrow)
         )
     }
 
     /// Returns `true` if this place context represents a storage live or storage dead marker.
     #[inline]
-    pub fn is_storage_marker(&self) -> bool {
+    pub fn is_storage_marker(self) -> bool {
         matches!(
             self,
             PlaceContext::NonUse(NonUseContext::StorageLive | NonUseContext::StorageDead)
@@ -1380,18 +1395,18 @@ impl PlaceContext {
 
     /// Returns `true` if this place context represents a use that potentially changes the value.
     #[inline]
-    pub fn is_mutating_use(&self) -> bool {
+    pub fn is_mutating_use(self) -> bool {
         matches!(self, PlaceContext::MutatingUse(..))
     }
 
     /// Returns `true` if this place context represents a use.
     #[inline]
-    pub fn is_use(&self) -> bool {
+    pub fn is_use(self) -> bool {
         !matches!(self, PlaceContext::NonUse(..))
     }
 
     /// Returns `true` if this place context represents an assignment statement.
-    pub fn is_place_assignment(&self) -> bool {
+    pub fn is_place_assignment(self) -> bool {
         matches!(
             self,
             PlaceContext::MutatingUse(
@@ -1400,5 +1415,20 @@ impl PlaceContext {
                     | MutatingUseContext::AsmOutput,
             )
         )
+    }
+
+    /// The variance of a place in the given context.
+    pub fn ambient_variance(self) -> ty::Variance {
+        use NonMutatingUseContext::*;
+        use NonUseContext::*;
+        match self {
+            PlaceContext::MutatingUse(_) => ty::Invariant,
+            PlaceContext::NonUse(StorageDead | StorageLive | VarDebugInfo) => ty::Invariant,
+            PlaceContext::NonMutatingUse(
+                Inspect | Copy | Move | PlaceMention | SharedBorrow | FakeBorrow | RawBorrow
+                | Projection,
+            ) => ty::Covariant,
+            PlaceContext::NonUse(AscribeUserTy(variance)) => variance,
+        }
     }
 }

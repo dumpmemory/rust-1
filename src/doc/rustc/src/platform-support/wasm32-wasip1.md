@@ -49,7 +49,7 @@ this target are:
 
 This target is cross-compiled. The target includes support for `std` itself,
 but not all of the standard library works. For example spawning a thread will
-always return an error (see the `wasm32-wasi-preview1-threads` target for
+always return an error (see the `wasm32-wasip1-threads` target for
 example). Another example is that spawning a process will always return an
 error. Operations such as opening a file, however, will be implemented by
 calling WASI-defined APIs.
@@ -59,7 +59,7 @@ languages compiled to WebAssembly, for example C/C++. Any ABI differences or
 mismatches are considered bugs that need to be fixed.
 
 By default the WASI targets in Rust ship in rustup with a precompiled copy of
-[`wasi-libc`] meaning that a WebAssembly-targetting-Clang is not required to
+[`wasi-libc`] meaning that a WebAssembly-targeting-Clang is not required to
 use the WASI targets from Rust.  If there is no actual interoperation with C
 then `rustup target add wasm32-wasip1` is all that's needed to get
 started with WASI.
@@ -73,19 +73,21 @@ be used instead.
 
 ## Building the target
 
-To build this target a compiled version of [`wasi-libc`] is required to be
-present at build time. This can be installed through
-[`wasi-sdk`](https://github.com/WebAssembly/wasi-sdk) as well. This is the
-configured with:
+To build this target first acquire a copy of
+[`wasi-sdk`](https://github.com/WebAssembly/wasi-sdk/). At this time version 22
+is the minimum needed.
 
-```toml
-[target.wasm32-wasip1]
-wasi-root = ".../wasi-libc/sysroot"
+Next configure the `WASI_SDK_PATH` environment variable to point to where this
+is installed. For example:
+
+```text
+export WASI_SDK_PATH=/path/to/wasi-sdk-22.0
 ```
 
-Additionally users will need to enable LLD when building Rust from source as
-LLVM's `wasm-ld` driver for LLD is required when linking WebAssembly code
-together.
+Next be sure to enable LLD when building Rust from source as LLVM's `wasm-ld`
+driver for LLD is required when linking WebAssembly code together. Rust's build
+system will automatically pick up any necessary binaries and programs from
+`WASI_SDK_PATH`.
 
 ## Building Rust programs
 
@@ -95,10 +97,6 @@ the target with:
 ```text
 rustup target add wasm32-wasip1
 ```
-
-> **Note**: the `wasm32-wasip1` target is new and may only be available
-> on nightly by the time you're reading this. If `wasm32-wasip1` isn't
-> available on stable Rust then `wasm32-wasi` should be available instead.
 
 Rust programs can be built for that target:
 
@@ -112,8 +110,27 @@ This target can be cross-compiled from any hosts.
 
 ## Testing
 
-Currently the WASI target is not tested in rust-lang/rust CI. This means that
-tests in the repository are not guaranteed to pass. This is theoretically
-possibly by installing a standalone WebAssembly runtime and using it as a
-"runner" for all tests, but there are various failures that will need to be
-waded through to adjust tests to work on the WASI target.
+This target is tested in rust-lang/rust CI on all merges. A subset of tests are
+run in the `test-various` builder such as the UI tests and libcore tests. This
+can be tested locally, for example, with:
+
+```text
+./x.py test --target wasm32-wasip1 tests/ui
+```
+
+## Conditionally compiling code
+
+It's recommended to conditionally compile code for this target with:
+
+```text
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+```
+
+Note that the `target_env = "p1"` condition first appeared in Rust 1.80. Prior
+to Rust 1.80 the `target_env` condition was not set.
+
+## Enabled WebAssembly features
+
+The default set of WebAssembly features enabled for compilation is currently the
+same as [`wasm32-unknown-unknown`](./wasm32-unknown-unknown.md). See the
+documentation there for more information.

@@ -1,21 +1,22 @@
-use crate::assert_dep_graph::assert_dep_graph;
-use crate::errors;
+use std::fs;
+use std::sync::Arc;
+
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::join;
 use rustc_middle::dep_graph::{
     DepGraph, SerializedDepGraph, WorkProduct, WorkProductId, WorkProductMap,
 };
 use rustc_middle::ty::TyCtxt;
-use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_serialize::Encodable as RustcEncodable;
+use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_session::Session;
-use std::fs;
+use tracing::debug;
 
 use super::data::*;
-use super::dirty_clean;
-use super::file_format;
 use super::fs::*;
-use super::work_product;
+use super::{dirty_clean, file_format, work_product};
+use crate::assert_dep_graph::assert_dep_graph;
+use crate::errors;
 
 /// Saves and writes the [`DepGraph`] to the file system.
 ///
@@ -24,7 +25,7 @@ use super::work_product;
 ///
 /// This function should only run after all queries have completed.
 /// Trying to execute a query afterwards would attempt to read the result cache we just dropped.
-pub fn save_dep_graph(tcx: TyCtxt<'_>) {
+pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
     debug!("save_dep_graph()");
     tcx.dep_graph.with_ignore(|| {
         let sess = tcx.sess;
@@ -147,7 +148,7 @@ fn encode_query_cache(tcx: TyCtxt<'_>, encoder: FileEncoder) -> FileEncodeResult
 /// and moves it to the permanent dep-graph path
 pub(crate) fn build_dep_graph(
     sess: &Session,
-    prev_graph: SerializedDepGraph,
+    prev_graph: Arc<SerializedDepGraph>,
     prev_work_products: WorkProductMap,
 ) -> Option<DepGraph> {
     if sess.opts.incremental.is_none() {

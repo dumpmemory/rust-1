@@ -1,22 +1,23 @@
 //! Code to load the dep-graph from files.
 
-use crate::errors;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::unord::UnordMap;
 use rustc_middle::dep_graph::{DepGraph, DepsType, SerializedDepGraph, WorkProductMap};
 use rustc_middle::query::on_disk_cache::OnDiskCache;
-use rustc_serialize::opaque::MemDecoder;
 use rustc_serialize::Decodable;
+use rustc_serialize::opaque::MemDecoder;
+use rustc_session::Session;
 use rustc_session::config::IncrementalStateAssertion;
-use rustc_session::{Session, StableCrateId};
-use rustc_span::{ErrorGuaranteed, Symbol};
-use std::path::{Path, PathBuf};
+use tracing::{debug, warn};
 
 use super::data::*;
-use super::file_format;
 use super::fs::*;
 use super::save::build_dep_graph;
-use super::work_product;
+use super::{file_format, work_product};
+use crate::errors;
 
 #[derive(Debug)]
 /// Represents the result of an attempt to load incremental compilation data.
@@ -88,7 +89,7 @@ fn delete_dirty_work_product(sess: &Session, swp: SerializedWorkProduct) {
     work_product::delete_workproduct_files(sess, &swp.work_product);
 }
 
-fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProductMap)> {
+fn load_dep_graph(sess: &Session) -> LoadResult<(Arc<SerializedDepGraph>, WorkProductMap)> {
     let prof = sess.prof.clone();
 
     if sess.opts.incremental.is_none() {
@@ -114,7 +115,11 @@ fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProduct
 
         if let LoadResult::Ok { data: (work_products_data, start_pos) } = load_result {
             // Decode the list of work_products
-            let mut work_product_decoder = MemDecoder::new(&work_products_data[..], start_pos);
+            let Ok(mut work_product_decoder) = MemDecoder::new(&work_products_data[..], start_pos)
+            else {
+                sess.dcx().emit_warn(errors::CorruptFile { path: &work_products_path });
+                return LoadResult::DataOutOfDate;
+            };
             let work_products: Vec<SerializedWorkProduct> =
                 Decodable::decode(&mut work_product_decoder);
 
@@ -144,7 +149,10 @@ fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProduct
         LoadResult::DataOutOfDate => LoadResult::DataOutOfDate,
         LoadResult::LoadDepGraph(path, err) => LoadResult::LoadDepGraph(path, err),
         LoadResult::Ok { data: (bytes, start_pos) } => {
-            let mut decoder = MemDecoder::new(&bytes, start_pos);
+            let Ok(mut decoder) = MemDecoder::new(&bytes, start_pos) else {
+                sess.dcx().emit_warn(errors::CorruptFile { path: &path });
+                return LoadResult::DataOutOfDate;
+            };
             let prev_commandline_args_hash = u64::decode(&mut decoder);
 
             if prev_commandline_args_hash != expected_hash {
@@ -173,30 +181,31 @@ fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProduct
 /// If we are not in incremental compilation mode, returns `None`.
 /// Otherwise, tries to load the query result cache from disk,
 /// creating an empty cache if it could not be loaded.
-pub fn load_query_result_cache(sess: &Session) -> Option<OnDiskCache<'_>> {
+pub fn load_query_result_cache(sess: &Session) -> Option<OnDiskCache> {
     if sess.opts.incremental.is_none() {
         return None;
     }
 
     let _prof_timer = sess.prof.generic_activity("incr_comp_load_query_result_cache");
 
-    match load_data(&query_cache_path(sess), sess) {
+    let path = query_cache_path(sess);
+    match load_data(&path, sess) {
         LoadResult::Ok { data: (bytes, start_pos) } => {
-            Some(OnDiskCache::new(sess, bytes, start_pos))
+            let cache = OnDiskCache::new(sess, bytes, start_pos).unwrap_or_else(|()| {
+                sess.dcx().emit_warn(errors::CorruptFile { path: &path });
+                OnDiskCache::new_empty()
+            });
+            Some(cache)
         }
-        _ => Some(OnDiskCache::new_empty(sess.source_map())),
+        _ => Some(OnDiskCache::new_empty()),
     }
 }
 
 /// Setups the dependency graph by loading an existing graph from disk and set up streaming of a
 /// new graph to an incremental session directory.
-pub fn setup_dep_graph(
-    sess: &Session,
-    crate_name: Symbol,
-    stable_crate_id: StableCrateId,
-) -> Result<DepGraph, ErrorGuaranteed> {
+pub fn setup_dep_graph(sess: &Session) -> DepGraph {
     // `load_dep_graph` can only be called after `prepare_session_directory`.
-    prepare_session_directory(sess, crate_name, stable_crate_id)?;
+    prepare_session_directory(sess);
 
     let res = sess.opts.build_dep_graph().then(|| load_dep_graph(sess));
 
@@ -212,10 +221,9 @@ pub fn setup_dep_graph(
         });
     }
 
-    Ok(res
-        .and_then(|result| {
-            let (prev_graph, prev_work_products) = result.open(sess);
-            build_dep_graph(sess, prev_graph, prev_work_products)
-        })
-        .unwrap_or_else(DepGraph::new_disabled))
+    res.and_then(|result| {
+        let (prev_graph, prev_work_products) = result.open(sess);
+        build_dep_graph(sess, prev_graph, prev_work_products)
+    })
+    .unwrap_or_else(DepGraph::new_disabled)
 }

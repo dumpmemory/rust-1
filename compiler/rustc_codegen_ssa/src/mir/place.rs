@@ -1,36 +1,96 @@
+use rustc_abi::Primitive::{Int, Pointer};
+use rustc_abi::{Align, BackendRepr, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
+use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::tcx::PlaceTy;
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
+use rustc_middle::ty::{self, Ty};
+use rustc_middle::{bug, mir};
+use tracing::{debug, instrument};
+
 use super::operand::OperandValue;
 use super::{FunctionCx, LocalRef};
-
 use crate::common::IntPredicate;
 use crate::size_of_val;
 use crate::traits::*;
 
-use rustc_middle::mir;
-use rustc_middle::mir::tcx::PlaceTy;
-use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
-use rustc_middle::ty::{self, Ty};
-use rustc_target::abi::{Align, FieldsShape, Int, Pointer, TagEncoding};
-use rustc_target::abi::{VariantIdx, Variants};
-
+/// The location and extra runtime properties of the place.
+///
+/// Typically found in a [`PlaceRef`] or an [`OperandValue::Ref`].
+///
+/// As a location in memory, this has no specific type. If you want to
+/// load or store it using a typed operation, use [`Self::with_type`].
 #[derive(Copy, Clone, Debug)]
-pub struct PlaceRef<'tcx, V> {
+pub struct PlaceValue<V> {
     /// A pointer to the contents of the place.
     pub llval: V,
 
     /// This place's extra data if it is unsized, or `None` if null.
     pub llextra: Option<V>,
 
-    /// The monomorphized type of this place, including variant information.
-    pub layout: TyAndLayout<'tcx>,
-
     /// The alignment we know for this place.
     pub align: Align,
 }
 
+impl<V: CodegenObject> PlaceValue<V> {
+    /// Constructor for the ordinary case of `Sized` types.
+    ///
+    /// Sets `llextra` to `None`.
+    pub fn new_sized(llval: V, align: Align) -> PlaceValue<V> {
+        PlaceValue { llval, llextra: None, align }
+    }
+
+    /// Allocates a stack slot in the function for a value
+    /// of the specified size and alignment.
+    ///
+    /// The allocation itself is untyped.
+    pub fn alloca<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+        bx: &mut Bx,
+        size: Size,
+        align: Align,
+    ) -> PlaceValue<V> {
+        let llval = bx.alloca(size, align);
+        PlaceValue::new_sized(llval, align)
+    }
+
+    /// Creates a `PlaceRef` to this location with the given type.
+    pub fn with_type<'tcx>(self, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
+        assert!(
+            layout.is_unsized() || layout.is_uninhabited() || self.llextra.is_none(),
+            "Had pointer metadata {:?} for sized type {layout:?}",
+            self.llextra,
+        );
+        PlaceRef { val: self, layout }
+    }
+
+    /// Gets the pointer to this place as an [`OperandValue::Immediate`]
+    /// or, for those needing metadata, an [`OperandValue::Pair`].
+    ///
+    /// This is the inverse of [`OperandValue::deref`].
+    pub fn address(self) -> OperandValue<V> {
+        if let Some(llextra) = self.llextra {
+            OperandValue::Pair(self.llval, llextra)
+        } else {
+            OperandValue::Immediate(self.llval)
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct PlaceRef<'tcx, V> {
+    /// The location and extra runtime properties of the place.
+    pub val: PlaceValue<V>,
+
+    /// The monomorphized type of this place, including variant information.
+    ///
+    /// You probably shouldn't use the alignment from this layout;
+    /// rather you should use the `.val.align` of the actual place,
+    /// which might be different from the type's normal alignment.
+    pub layout: TyAndLayout<'tcx>,
+}
+
 impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     pub fn new_sized(llval: V, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
-        assert!(layout.is_sized());
-        PlaceRef { llval, llextra: None, layout, align: layout.align.abi }
+        PlaceRef::new_sized_aligned(llval, layout, layout.align.abi)
     }
 
     pub fn new_sized_aligned(
@@ -39,7 +99,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         align: Align,
     ) -> PlaceRef<'tcx, V> {
         assert!(layout.is_sized());
-        PlaceRef { llval, llextra: None, layout, align }
+        PlaceValue::new_sized(llval, align).with_type(layout)
     }
 
     // FIXME(eddyb) pass something else for the name so no work is done
@@ -48,17 +108,16 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
-        Self::alloca_aligned(bx, layout, layout.align.abi)
+        Self::alloca_size(bx, layout.size, layout)
     }
 
-    pub fn alloca_aligned<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+    pub fn alloca_size<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
         bx: &mut Bx,
+        size: Size,
         layout: TyAndLayout<'tcx>,
-        align: Align,
     ) -> Self {
         assert!(layout.is_sized(), "tried to statically allocate unsized place");
-        let tmp = bx.alloca(bx.cx().backend_type(layout), align);
-        Self::new_sized_aligned(tmp, layout, align)
+        PlaceValue::alloca(bx, size, layout.align.abi).with_type(layout)
     }
 
     /// Returns a place for an indirect reference to an unsized place.
@@ -74,11 +133,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         Self::alloca(bx, ptr_layout)
     }
 
-    pub fn len<Cx: ConstMethods<'tcx, Value = V>>(&self, cx: &Cx) -> V {
+    pub fn len<Cx: ConstCodegenMethods<'tcx, Value = V>>(&self, cx: &Cx) -> V {
         if let FieldsShape::Array { count, .. } = self.layout.fields {
             if self.layout.is_unsized() {
                 assert_eq!(count, 0);
-                self.llextra.unwrap()
+                self.val.llextra.unwrap()
             } else {
                 cx.const_usize(count)
             }
@@ -97,22 +156,22 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     ) -> Self {
         let field = self.layout.field(bx.cx(), ix);
         let offset = self.layout.fields.offset(ix);
-        let effective_field_align = self.align.restrict_for_offset(offset);
+        let effective_field_align = self.val.align.restrict_for_offset(offset);
 
         // `simple` is called when we don't need to adjust the offset to
         // the dynamic alignment of the field.
         let mut simple = || {
             let llval = if offset.bytes() == 0 {
-                self.llval
+                self.val.llval
             } else {
-                bx.inbounds_ptradd(self.llval, bx.const_usize(offset.bytes()))
+                bx.inbounds_ptradd(self.val.llval, bx.const_usize(offset.bytes()))
             };
-            PlaceRef {
+            let val = PlaceValue {
                 llval,
-                llextra: if bx.cx().type_has_metadata(field.ty) { self.llextra } else { None },
-                layout: field,
+                llextra: if bx.cx().type_has_metadata(field.ty) { self.val.llextra } else { None },
                 align: effective_field_align,
-            }
+            };
+            val.with_type(field)
         };
 
         // Simple cases, which don't need DST adjustment:
@@ -142,7 +201,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         // The type `Foo<Foo<Trait>>` is represented in LLVM as `{ u16, { u16, u8 }}`, meaning that
         // the `y` field has 16-bit alignment.
 
-        let meta = self.llextra;
+        let meta = self.val.llextra;
 
         let unaligned_offset = bx.cx().const_usize(offset.bytes());
 
@@ -164,9 +223,10 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         debug!("struct_field_ptr: DST field offset: {:?}", offset);
 
         // Adjust pointer.
-        let ptr = bx.inbounds_ptradd(self.llval, offset);
-
-        PlaceRef { llval: ptr, llextra: self.llextra, layout: field, align: effective_field_align }
+        let ptr = bx.inbounds_ptradd(self.val.llval, offset);
+        let val =
+            PlaceValue { llval: ptr, llextra: self.val.llextra, align: effective_field_align };
+        val.with_type(field)
     }
 
     /// Obtain the actual discriminant of a value.
@@ -179,10 +239,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         let dl = &bx.tcx().data_layout;
         let cast_to_layout = bx.cx().layout_of(cast_to);
         let cast_to = bx.cx().immediate_backend_type(cast_to_layout);
-        if self.layout.abi.is_uninhabited() {
+        if self.layout.is_uninhabited() {
             return bx.cx().const_poison(cast_to);
         }
         let (tag_scalar, tag_encoding, tag_field) = match self.layout.variants {
+            Variants::Empty => unreachable!("we already handled uninhabited types"),
             Variants::Single { index } => {
                 let discr_val = self
                     .layout
@@ -298,24 +359,23 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         variant_index: VariantIdx,
     ) {
-        if self.layout.for_variant(bx.cx(), variant_index).abi.is_uninhabited() {
+        if self.layout.for_variant(bx.cx(), variant_index).is_uninhabited() {
             // We play it safe by using a well-defined `abort`, but we could go for immediate UB
             // if that turns out to be helpful.
             bx.abort();
             return;
         }
         match self.layout.variants {
-            Variants::Single { index } => {
-                assert_eq!(index, variant_index);
-            }
+            Variants::Empty => unreachable!("we already handled uninhabited types"),
+            Variants::Single { index } => assert_eq!(index, variant_index),
+
             Variants::Multiple { tag_encoding: TagEncoding::Direct, tag_field, .. } => {
                 let ptr = self.project_field(bx, tag_field);
                 let to =
                     self.layout.ty.discriminant_for_variant(bx.tcx(), variant_index).unwrap().val;
-                bx.store(
+                bx.store_to_place(
                     bx.cx().const_uint_big(bx.cx().backend_type(ptr.layout), to),
-                    ptr.llval,
-                    ptr.align,
+                    ptr.val,
                 );
             }
             Variants::Multiple {
@@ -327,15 +387,22 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
                 if variant_index != untagged_variant {
                     let niche = self.project_field(bx, tag_field);
                     let niche_llty = bx.cx().immediate_backend_type(niche.layout);
+                    let BackendRepr::Scalar(scalar) = niche.layout.backend_repr else {
+                        bug!("expected a scalar placeref for the niche");
+                    };
+                    // We are supposed to compute `niche_value.wrapping_add(niche_start)` wrapping
+                    // around the `niche`'s type.
+                    // The easiest way to do that is to do wrapping arithmetic on `u128` and then
+                    // masking off any extra bits that occur because we did the arithmetic with too many bits.
                     let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
                     let niche_value = (niche_value as u128).wrapping_add(niche_start);
-                    // FIXME(eddyb): check the actual primitive type here.
-                    let niche_llval = if niche_value == 0 {
-                        // HACK(eddyb): using `c_null` as it works on all types.
-                        bx.cx().const_null(niche_llty)
-                    } else {
-                        bx.cx().const_uint_big(niche_llty, niche_value)
-                    };
+                    let niche_value = niche_value & niche.layout.size.unsigned_int_max();
+
+                    let niche_llval = bx.cx().scalar_to_backend(
+                        Scalar::from_uint(niche_value, niche.layout.size),
+                        scalar,
+                        niche_llty,
+                    );
                     OperandValue::Immediate(niche_llval).store(bx, niche);
                 }
             }
@@ -356,16 +423,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             layout.size
         };
 
-        PlaceRef {
-            llval: bx.inbounds_gep(
-                bx.cx().backend_type(self.layout),
-                self.llval,
-                &[bx.cx().const_usize(0), llindex],
-            ),
-            llextra: None,
-            layout,
-            align: self.align.restrict_for_offset(offset),
-        }
+        let llval = bx.inbounds_gep(bx.cx().backend_type(layout), self.val.llval, &[llindex]);
+        let align = self.val.align.restrict_for_offset(offset);
+        PlaceValue::new_sized(llval, align).with_type(layout)
     }
 
     pub fn project_downcast<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
@@ -389,11 +449,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     }
 
     pub fn storage_live<Bx: BuilderMethods<'a, 'tcx, Value = V>>(&self, bx: &mut Bx) {
-        bx.lifetime_start(self.llval, self.layout.size);
+        bx.lifetime_start(self.val.llval, self.layout.size);
     }
 
     pub fn storage_dead<Bx: BuilderMethods<'a, 'tcx, Value = V>>(&self, bx: &mut Bx) {
-        bx.lifetime_end(self.llval, self.layout.size);
+        bx.lifetime_end(self.val.llval, self.layout.size);
     }
 }
 
@@ -414,10 +474,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             LocalRef::Operand(..) => {
                 if place_ref.is_indirect_first_projection() {
                     base = 1;
-                    let cg_base = self.codegen_consume(
-                        bx,
-                        mir::PlaceRef { projection: &place_ref.projection[..0], ..place_ref },
-                    );
+                    let cg_base = self.codegen_consume(bx, mir::PlaceRef {
+                        projection: &place_ref.projection[..0],
+                        ..place_ref
+                    });
                     cg_base.deref(bx.cx())
                 } else {
                     bug!("using operand local {:?} as place", place_ref);
@@ -431,6 +491,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             cg_base = match *elem {
                 mir::ProjectionElem::Deref => bx.load_operand(cg_base).deref(bx.cx()),
                 mir::ProjectionElem::Field(ref field, _) => {
+                    assert!(
+                        !cg_base.layout.ty.is_any_ptr(),
+                        "Bad PlaceRef: destructing pointers should use cast/PtrMetadata, \
+                         but tried to access field {field:?} of pointer {cg_base:?}",
+                    );
                     cg_base.project_field(bx, field.index())
                 }
                 mir::ProjectionElem::OpaqueCast(ty) => {
@@ -461,8 +526,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                     if subslice.layout.is_unsized() {
                         assert!(from_end, "slice subslices should be `from_end`");
-                        subslice.llextra =
-                            Some(bx.sub(cg_base.llextra.unwrap(), bx.cx().const_usize(from + to)));
+                        subslice.val.llextra = Some(
+                            bx.sub(cg_base.val.llextra.unwrap(), bx.cx().const_usize(from + to)),
+                        );
                     }
 
                     subslice

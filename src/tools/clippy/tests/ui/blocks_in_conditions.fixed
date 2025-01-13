@@ -1,7 +1,12 @@
 //@aux-build:proc_macro_attr.rs
 
 #![warn(clippy::blocks_in_conditions)]
-#![allow(unused, clippy::let_and_return, clippy::needless_if)]
+#![allow(
+    unused,
+    clippy::let_and_return,
+    clippy::needless_if,
+    clippy::missing_transmute_annotations
+)]
 #![warn(clippy::nonminimal_bool)]
 
 macro_rules! blocky {
@@ -109,6 +114,19 @@ mod issue_12016 {
             Some(2) => 3,
             _ => 0,
         }
+    }
+}
+
+fn in_closure() {
+    let v = vec![1, 2, 3];
+    if v.into_iter()
+        .filter(|x| {
+            let y = x + 1;
+            y > 3
+        })
+        .any(|x| x == 5)
+    {
+        println!("contains 4!");
     }
 }
 

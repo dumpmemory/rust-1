@@ -15,18 +15,13 @@ LL | |     }
    = help: you might have meant to write a function accessible through FFI, which can be done by writing `extern fn` outside of the `extern` block
    = note: for more information, visit https://doc.rust-lang.org/std/keyword.extern.html
 
-error: functions in `extern` blocks cannot have qualifiers
-  --> $DIR/issue-95829.rs:4:14
+error: functions in `extern` blocks cannot have `async` qualifier
+  --> $DIR/issue-95829.rs:4:5
    |
 LL | extern {
    | ------ in this `extern` block
 LL |     async fn L() {
-   |              ^
-   |
-help: remove the qualifiers
-   |
-LL |     fn L() {
-   |     ~~
+   |     ^^^^^ help: remove the `async` qualifier
 
 error: aborting due to 2 previous errors
 

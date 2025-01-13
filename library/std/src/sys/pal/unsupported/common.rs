@@ -13,10 +13,7 @@ pub fn unsupported<T>() -> std_io::Result<T> {
 }
 
 pub fn unsupported_err() -> std_io::Error {
-    std_io::const_io_error!(
-        std_io::ErrorKind::Unsupported,
-        "operation not supported on this platform",
-    )
+    std_io::Error::UNSUPPORTED_PLATFORM
 }
 
 pub fn is_interrupted(_code: i32) -> bool {
@@ -29,8 +26,4 @@ pub fn decode_error_kind(_code: i32) -> crate::io::ErrorKind {
 
 pub fn abort_internal() -> ! {
     core::intrinsics::abort();
-}
-
-pub fn hashmap_random_keys() -> (u64, u64) {
-    (1, 2)
 }

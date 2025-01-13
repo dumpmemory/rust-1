@@ -1,7 +1,8 @@
-use clippy_utils::consts::{constant_with_source, Constant, ConstantSource};
+use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::span_lint_and_help;
-use clippy_utils::macros::{find_assert_args, root_macro_call_first_node, PanicExpn};
-use rustc_hir::{Expr, Item, ItemKind, Node};
+use clippy_utils::is_inside_always_const_context;
+use clippy_utils::macros::{PanicExpn, find_assert_args, root_macro_call_first_node};
+use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
 use rustc_span::sym;
@@ -42,23 +43,22 @@ impl<'tcx> LateLintPass<'tcx> for AssertionsOnConstants {
         let Some((condition, panic_expn)) = find_assert_args(cx, e, macro_call.expn) else {
             return;
         };
-        let Some((Constant::Bool(val), source)) = constant_with_source(cx, cx.typeck_results(), condition) else {
+        let Some(Constant::Bool(val)) = ConstEvalCtxt::new(cx).eval(condition) else {
             return;
         };
-        if let ConstantSource::Constant = source
-            && let Node::Item(Item {
-                kind: ItemKind::Const(..),
-                ..
-            }) = cx.tcx.parent_hir_node(e.hir_id)
-        {
-            return;
+
+        match condition.kind {
+            ExprKind::Path(..) | ExprKind::Lit(_) => {},
+            _ if is_inside_always_const_context(cx.tcx, e.hir_id) => return,
+            _ => {},
         }
+
         if val {
             span_lint_and_help(
                 cx,
                 ASSERTIONS_ON_CONSTANTS,
                 macro_call.span,
-                &format!(
+                format!(
                     "`{}!(true)` will be optimized out by the compiler",
                     cx.tcx.item_name(macro_call.def_id)
                 ),
@@ -74,9 +74,9 @@ impl<'tcx> LateLintPass<'tcx> for AssertionsOnConstants {
                 cx,
                 ASSERTIONS_ON_CONSTANTS,
                 macro_call.span,
-                &format!("`assert!(false{assert_arg})` should probably be replaced"),
+                format!("`assert!(false{assert_arg})` should probably be replaced"),
                 None,
-                &format!("use `panic!({panic_arg})` or `unreachable!({panic_arg})`"),
+                format!("use `panic!({panic_arg})` or `unreachable!({panic_arg})`"),
             );
         }
     }

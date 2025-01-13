@@ -1,5 +1,5 @@
-use super::utils::make_iterator_snippet;
 use super::MANUAL_FLATTEN;
+use super::utils::make_iterator_snippet;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::visitors::is_local_used;
 use clippy_utils::{higher, path_to_local_id, peel_blocks_with_stmt};
@@ -62,7 +62,7 @@ pub(super) fn check<'tcx>(
             "...and remove the `if let` statement in the for loop"
         };
 
-        span_lint_and_then(cx, MANUAL_FLATTEN, span, &msg, |diag| {
+        span_lint_and_then(cx, MANUAL_FLATTEN, span, msg, |diag| {
             diag.span_suggestion(arg.span, "try", sugg, applicability);
             diag.span_help(inner_expr.span, help_msg);
         });

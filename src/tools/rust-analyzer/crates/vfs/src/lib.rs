@@ -38,15 +38,13 @@
 //! [`Handle`]: loader::Handle
 //! [`Entries`]: loader::Entry
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
-
 mod anchored_path;
 pub mod file_set;
 pub mod loader;
 mod path_interner;
 mod vfs_path;
 
-use std::{fmt, mem};
+use std::{fmt, hash::BuildHasherDefault, mem};
 
 use crate::path_interner::PathInterner;
 
@@ -54,7 +52,12 @@ pub use crate::{
     anchored_path::{AnchoredPath, AnchoredPathBuf},
     vfs_path::VfsPath,
 };
+use indexmap::{map::Entry, IndexMap};
 pub use paths::{AbsPath, AbsPathBuf};
+
+use rustc_hash::FxHasher;
+use stdx::hash_once;
+use tracing::{span, Level};
 
 /// Handle to a file in [`Vfs`]
 ///
@@ -64,19 +67,16 @@ pub struct FileId(u32);
 // pub struct FileId(NonMaxU32);
 
 impl FileId {
-    /// Think twice about using this outside of tests. If this ends up in a wrong place it will cause panics!
-    // FIXME: To be removed once we get rid of all `SpanData::DUMMY` usages.
-    pub const BOGUS: FileId = FileId(0xe4e4e);
-    pub const MAX_FILE_ID: u32 = 0x7fff_ffff;
+    const MAX: u32 = 0x7fff_ffff;
 
     #[inline]
     pub const fn from_raw(raw: u32) -> FileId {
-        assert!(raw <= Self::MAX_FILE_ID);
+        assert!(raw <= Self::MAX);
         FileId(raw)
     }
 
     #[inline]
-    pub fn index(self) -> u32 {
+    pub const fn index(self) -> u32 {
         self.0
     }
 }
@@ -91,12 +91,14 @@ impl nohash_hasher::IsEnabled for FileId {}
 pub struct Vfs {
     interner: PathInterner,
     data: Vec<FileState>,
-    changes: Vec<ChangedFile>,
+    changes: IndexMap<FileId, ChangedFile, BuildHasherDefault<FxHasher>>,
 }
 
-#[derive(Copy, PartialEq, PartialOrd, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
 pub enum FileState {
-    Exists,
+    /// The file exists with the given content hash.
+    Exists(u64),
+    /// The file is deleted.
     Deleted,
 }
 
@@ -118,13 +120,23 @@ impl ChangedFile {
     /// Returns `true` if the change is [`Create`](ChangeKind::Create) or
     /// [`Delete`](Change::Delete).
     pub fn is_created_or_deleted(&self) -> bool {
-        matches!(self.change, Change::Create(_) | Change::Delete)
+        matches!(self.change, Change::Create(_, _) | Change::Delete)
+    }
+
+    /// Returns `true` if the change is [`Create`](ChangeKind::Create).
+    pub fn is_created(&self) -> bool {
+        matches!(self.change, Change::Create(_, _))
+    }
+
+    /// Returns `true` if the change is [`Modify`](ChangeKind::Modify).
+    pub fn is_modified(&self) -> bool {
+        matches!(self.change, Change::Modify(_, _))
     }
 
     pub fn kind(&self) -> ChangeKind {
         match self.change {
-            Change::Create(_) => ChangeKind::Create,
-            Change::Modify(_) => ChangeKind::Modify,
+            Change::Create(_, _) => ChangeKind::Create,
+            Change::Modify(_, _) => ChangeKind::Modify,
             Change::Delete => ChangeKind::Delete,
         }
     }
@@ -134,9 +146,9 @@ impl ChangedFile {
 #[derive(Eq, PartialEq, Debug)]
 pub enum Change {
     /// The file was (re-)created
-    Create(Vec<u8>),
+    Create(Vec<u8>, u64),
     /// The file was modified
-    Modify(Vec<u8>),
+    Modify(Vec<u8>, u64),
     /// The file was deleted
     Delete,
 }
@@ -155,7 +167,7 @@ pub enum ChangeKind {
 impl Vfs {
     /// Id of the given path if it exists in the `Vfs` and is not deleted.
     pub fn file_id(&self, path: &VfsPath) -> Option<FileId> {
-        self.interner.get(path).filter(|&it| matches!(self.get(it), FileState::Exists))
+        self.interner.get(path).filter(|&it| matches!(self.get(it), FileState::Exists(_)))
     }
 
     /// File path corresponding to the given `file_id`.
@@ -173,7 +185,7 @@ impl Vfs {
     pub fn iter(&self) -> impl Iterator<Item = (FileId, &VfsPath)> + '_ {
         (0..self.data.len())
             .map(|it| FileId(it as u32))
-            .filter(move |&file_id| matches!(self.get(file_id), FileState::Exists))
+            .filter(move |&file_id| matches!(self.get(file_id), FileState::Exists(_)))
             .map(move |file_id| {
                 let path = self.interner.lookup(file_id);
                 (file_id, path)
@@ -187,34 +199,85 @@ impl Vfs {
     /// If the path does not currently exists in the `Vfs`, allocates a new
     /// [`FileId`] for it.
     pub fn set_file_contents(&mut self, path: VfsPath, contents: Option<Vec<u8>>) -> bool {
+        let _p = span!(Level::INFO, "Vfs::set_file_contents").entered();
         let file_id = self.alloc_file_id(path);
-        let change_kind = match (self.get(file_id), contents) {
+        let state: FileState = self.get(file_id);
+        let change = match (state, contents) {
             (FileState::Deleted, None) => return false,
-            (FileState::Deleted, Some(v)) => Change::Create(v),
-            (FileState::Exists, None) => Change::Delete,
-            (FileState::Exists, Some(v)) => Change::Modify(v),
+            (FileState::Deleted, Some(v)) => {
+                let hash = hash_once::<FxHasher>(&*v);
+                Change::Create(v, hash)
+            }
+            (FileState::Exists(_), None) => Change::Delete,
+            (FileState::Exists(hash), Some(v)) => {
+                let new_hash = hash_once::<FxHasher>(&*v);
+                if new_hash == hash {
+                    return false;
+                }
+                Change::Modify(v, new_hash)
+            }
         };
-        let changed_file = ChangedFile { file_id, change: change_kind };
-        self.data[file_id.0 as usize] =
-            if changed_file.exists() { FileState::Exists } else { FileState::Deleted };
-        self.changes.push(changed_file);
+
+        let mut set_data = |change_kind| {
+            self.data[file_id.0 as usize] = match change_kind {
+                &Change::Create(_, hash) | &Change::Modify(_, hash) => FileState::Exists(hash),
+                Change::Delete => FileState::Deleted,
+            };
+        };
+
+        let changed_file = ChangedFile { file_id, change };
+        match self.changes.entry(file_id) {
+            // two changes to the same file in one cycle, merge them appropriately
+            Entry::Occupied(mut o) => {
+                use Change::*;
+
+                match (&mut o.get_mut().change, changed_file.change) {
+                    // newer `Delete` wins
+                    (change, Delete) => *change = Delete,
+                    // merge `Create` with `Create` or `Modify`
+                    (Create(prev, old_hash), Create(new, new_hash) | Modify(new, new_hash)) => {
+                        *prev = new;
+                        *old_hash = new_hash;
+                    }
+                    // collapse identical `Modify`es
+                    (Modify(prev, old_hash), Modify(new, new_hash)) => {
+                        *prev = new;
+                        *old_hash = new_hash;
+                    }
+                    // equivalent to `Modify`
+                    (change @ Delete, Create(new, new_hash)) => {
+                        *change = Modify(new, new_hash);
+                    }
+                    // shouldn't occur, but collapse into `Create`
+                    (change @ Delete, Modify(new, new_hash)) => {
+                        stdx::never!();
+                        *change = Create(new, new_hash);
+                    }
+                    // shouldn't occur, but keep the Create
+                    (prev @ Modify(_, _), new @ Create(_, _)) => *prev = new,
+                }
+                set_data(&o.get().change);
+            }
+            Entry::Vacant(v) => set_data(&v.insert(changed_file).change),
+        };
+
         true
     }
 
     /// Drain and returns all the changes in the `Vfs`.
-    pub fn take_changes(&mut self) -> Vec<ChangedFile> {
+    pub fn take_changes(&mut self) -> IndexMap<FileId, ChangedFile, BuildHasherDefault<FxHasher>> {
         mem::take(&mut self.changes)
     }
 
     /// Provides a panic-less way to verify file_id validity.
     pub fn exists(&self, file_id: FileId) -> bool {
-        matches!(self.get(file_id), FileState::Exists)
+        matches!(self.get(file_id), FileState::Exists(_))
     }
 
     /// Returns the id associated with `path`
     ///
     /// - If `path` does not exists in the `Vfs`, allocate a new id for it, associated with a
-    /// deleted file;
+    ///   deleted file;
     /// - Else, returns `path`'s id.
     ///
     /// Does not record a change.

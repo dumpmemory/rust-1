@@ -1,7 +1,13 @@
-//! Analysis of patterns, notably match exhaustiveness checking.
+//! Analysis of patterns, notably match exhaustiveness checking. The main entrypoint for this crate
+//! is [`usefulness::compute_match_usefulness`]. For rustc-specific types and entrypoints, see the
+//! [`rustc`] module.
 
-#![allow(rustc::untranslatable_diagnostic)]
+// tidy-alphabetical-start
 #![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+#![cfg_attr(feature = "rustc", feature(let_chains))]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 pub mod constructor;
 #[cfg(feature = "rustc")]
@@ -14,64 +20,15 @@ pub mod pat_column;
 pub mod rustc;
 pub mod usefulness;
 
-#[macro_use]
-extern crate tracing;
-#[cfg(feature = "rustc")]
-#[macro_use]
-extern crate rustc_middle;
-
 #[cfg(feature = "rustc")]
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 use std::fmt;
 
-#[cfg(feature = "rustc")]
-pub mod index {
-    // Faster version when the indices of variants are `0..variants.len()`.
-    pub use rustc_index::bit_set::BitSet as IdxSet;
-    pub use rustc_index::Idx;
-    pub use rustc_index::IndexVec as IdxContainer;
-}
-#[cfg(not(feature = "rustc"))]
-pub mod index {
-    // Slower version when the indices of variants are something else.
-    pub trait Idx: Copy + PartialEq + Eq + std::hash::Hash {}
-    impl<T: Copy + PartialEq + Eq + std::hash::Hash> Idx for T {}
-
-    #[derive(Debug)]
-    pub struct IdxContainer<K, V>(pub rustc_hash::FxHashMap<K, V>);
-    impl<K: Idx, V> IdxContainer<K, V> {
-        pub fn len(&self) -> usize {
-            self.0.len()
-        }
-        pub fn iter_enumerated(&self) -> impl Iterator<Item = (K, &V)> {
-            self.0.iter().map(|(k, v)| (*k, v))
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct IdxSet<T>(pub rustc_hash::FxHashSet<T>);
-    impl<T: Idx> IdxSet<T> {
-        pub fn new_empty(_len: usize) -> Self {
-            Self(Default::default())
-        }
-        pub fn contains(&self, elem: T) -> bool {
-            self.0.contains(&elem)
-        }
-        pub fn insert(&mut self, elem: T) {
-            self.0.insert(elem);
-        }
-    }
-}
-
-#[cfg(feature = "rustc")]
-use rustc_middle::ty::Ty;
-#[cfg(feature = "rustc")]
-use rustc_span::ErrorGuaranteed;
+pub use rustc_index::{Idx, IndexVec}; // re-exported to avoid rustc_index version issues
 
 use crate::constructor::{Constructor, ConstructorSet, IntRange};
 use crate::pat::DeconstructedPat;
-use crate::pat_column::PatternColumn;
 
 pub trait Captures<'a> {}
 impl<'a, T: ?Sized> Captures<'a> for T {}
@@ -84,13 +41,13 @@ pub struct PrivateUninhabitedField(pub bool);
 /// Context that provides type information about constructors.
 ///
 /// Most of the crate is parameterized on a type that implements this trait.
-pub trait TypeCx: Sized + fmt::Debug {
+pub trait PatCx: Sized + fmt::Debug {
     /// The type of a pattern.
     type Ty: Clone + fmt::Debug;
     /// Errors that can abort analysis.
     type Error: fmt::Debug;
     /// The index of an enum variant.
-    type VariantIdx: Clone + index::Idx + fmt::Debug;
+    type VariantIdx: Clone + Idx + fmt::Debug;
     /// A string literal
     type StrLit: Clone + PartialEq + fmt::Debug;
     /// Extra data to store in a match arm.
@@ -99,7 +56,6 @@ pub trait TypeCx: Sized + fmt::Debug {
     type PatData: Clone;
 
     fn is_exhaustive_patterns_feature_on(&self) -> bool;
-    fn is_min_exhaustive_patterns_feature_on(&self) -> bool;
 
     /// The number of fields for this constructor.
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize;
@@ -120,7 +76,8 @@ pub trait TypeCx: Sized + fmt::Debug {
     /// `DeconstructedPat`. Only invoqued when `pat.ctor()` is `Struct | Variant(_) | UnionField`.
     fn write_variant_name(
         f: &mut fmt::Formatter<'_>,
-        pat: &crate::pat::DeconstructedPat<Self>,
+        ctor: &crate::constructor::Constructor<Self>,
+        ty: &Self::Ty,
     ) -> fmt::Result;
 
     /// Raise a bug.
@@ -155,43 +112,16 @@ pub trait TypeCx: Sized + fmt::Debug {
 
 /// The arm of a match expression.
 #[derive(Debug)]
-pub struct MatchArm<'p, Cx: TypeCx> {
+pub struct MatchArm<'p, Cx: PatCx> {
     pub pat: &'p DeconstructedPat<Cx>,
     pub has_guard: bool,
     pub arm_data: Cx::ArmData,
 }
 
-impl<'p, Cx: TypeCx> Clone for MatchArm<'p, Cx> {
+impl<'p, Cx: PatCx> Clone for MatchArm<'p, Cx> {
     fn clone(&self) -> Self {
         Self { pat: self.pat, has_guard: self.has_guard, arm_data: self.arm_data }
     }
 }
 
-impl<'p, Cx: TypeCx> Copy for MatchArm<'p, Cx> {}
-
-/// The entrypoint for this crate. Computes whether a match is exhaustive and which of its arms are
-/// useful, and runs some lints.
-#[cfg(feature = "rustc")]
-pub fn analyze_match<'p, 'tcx>(
-    tycx: &rustc::RustcMatchCheckCtxt<'p, 'tcx>,
-    arms: &[rustc::MatchArm<'p, 'tcx>],
-    scrut_ty: Ty<'tcx>,
-    pattern_complexity_limit: Option<usize>,
-) -> Result<rustc::UsefulnessReport<'p, 'tcx>, ErrorGuaranteed> {
-    use lints::lint_nonexhaustive_missing_variants;
-    use usefulness::{compute_match_usefulness, ValidityConstraint};
-
-    let scrut_ty = tycx.reveal_opaque_ty(scrut_ty);
-    let scrut_validity = ValidityConstraint::from_bool(tycx.known_valid_scrutinee);
-    let report =
-        compute_match_usefulness(tycx, arms, scrut_ty, scrut_validity, pattern_complexity_limit)?;
-
-    // Run the non_exhaustive_omitted_patterns lint. Only run on refutable patterns to avoid hitting
-    // `if let`s. Only run if the match is exhaustive otherwise the error is redundant.
-    if tycx.refutable && report.non_exhaustiveness_witnesses.is_empty() {
-        let pat_column = PatternColumn::new(arms);
-        lint_nonexhaustive_missing_variants(tycx, arms, &pat_column, scrut_ty)?;
-    }
-
-    Ok(report)
-}
+impl<'p, Cx: PatCx> Copy for MatchArm<'p, Cx> {}

@@ -1,7 +1,5 @@
 //! Missing batteries for standard libraries.
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
-
 use std::io as sio;
 use std::process::Command;
 use std::{cmp::Ordering, ops, time::Instant};
@@ -12,6 +10,7 @@ pub mod non_empty_vec;
 pub mod panic_context;
 pub mod process;
 pub mod rand;
+pub mod thin_vec;
 pub mod thread;
 
 pub use always_assert::{always, never};
@@ -20,6 +19,10 @@ pub use itertools;
 #[inline(always)]
 pub fn is_ci() -> bool {
     option_env!("CI").is_some()
+}
+
+pub fn hash_once<Hasher: std::hash::Hasher + Default>(thing: impl std::hash::Hash) -> u64 {
+    std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<Hasher>::default(), thing)
 }
 
 #[must_use]
@@ -300,22 +303,6 @@ where
 /// Returns all final segments of the argument, longest first.
 pub fn slice_tails<T>(this: &[T]) -> impl Iterator<Item = &[T]> {
     (0..this.len()).map(|i| &this[i..])
-}
-
-pub trait IsNoneOr {
-    type Type;
-    #[allow(clippy::wrong_self_convention)]
-    fn is_none_or(self, s: impl FnOnce(Self::Type) -> bool) -> bool;
-}
-#[allow(unstable_name_collisions)]
-impl<T> IsNoneOr for Option<T> {
-    type Type = T;
-    fn is_none_or(self, f: impl FnOnce(T) -> bool) -> bool {
-        match self {
-            Some(v) => f(v),
-            None => true,
-        }
-    }
 }
 
 #[cfg(test)]

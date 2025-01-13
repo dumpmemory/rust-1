@@ -15,11 +15,9 @@ mod tests;
 
 use crate::error::Error;
 use crate::ffi::{OsStr, OsString};
-use crate::fmt;
-use crate::io;
 use crate::path::{Path, PathBuf};
-use crate::sys;
 use crate::sys::os as os_imp;
+use crate::{fmt, io, sys};
 
 /// Returns the current working directory as a [`PathBuf`].
 ///
@@ -120,11 +118,8 @@ pub struct VarsOs {
 /// # Examples
 ///
 /// ```
-/// use std::env;
-///
-/// // We will iterate through the references to the element returned by
-/// // env::vars();
-/// for (key, value) in env::vars() {
+/// // Print all environment variables.
+/// for (key, value) in std::env::vars() {
 ///     println!("{key}: {value}");
 /// }
 /// ```
@@ -150,11 +145,8 @@ pub fn vars() -> Vars {
 /// # Examples
 ///
 /// ```
-/// use std::env;
-///
-/// // We will iterate through the references to the element returned by
-/// // env::vars_os();
-/// for (key, value) in env::vars_os() {
+/// // Print all environment variables.
+/// for (key, value) in std::env::vars_os() {
 ///     println!("{key:?}: {value:?}");
 /// }
 /// ```
@@ -206,13 +198,12 @@ impl fmt::Debug for VarsOs {
 ///
 /// # Errors
 ///
-/// This function will return an error if the environment variable isn't set.
+/// Returns [`VarError::NotPresent`] if:
+/// - The variable is not set.
+/// - The variable's name contains an equal sign or NUL (`'='` or `'\0'`).
 ///
-/// This function may return an error if the environment variable's name contains
-/// the equal sign character (`=`) or the NUL character.
-///
-/// This function will return an error if the environment variable's value is
-/// not valid Unicode. If this is not desired, consider using [`var_os`].
+/// Returns [`VarError::NotUnicode`] if the variable's value is not valid
+/// Unicode. If this is not desired, consider using [`var_os`].
 ///
 /// # Examples
 ///
@@ -318,22 +309,27 @@ impl Error for VarError {
 ///
 /// # Safety
 ///
-/// Even though this function is currently not marked as `unsafe`, it needs to
-/// be because invoking it can cause undefined behaviour. The function will be
-/// marked `unsafe` in a future version of Rust. This is tracked in
-/// [rust#27970](https://github.com/rust-lang/rust/issues/27970).
-///
 /// This function is safe to call in a single-threaded program.
 ///
-/// In multi-threaded programs, you must ensure that are no other threads
-/// concurrently writing or *reading*(!) from the environment through functions
-/// other than the ones in this module. You are responsible for figuring out
-/// how to achieve this, but we strongly suggest not using `set_var` or
-/// `remove_var` in multi-threaded programs at all.
+/// This function is also always safe to call on Windows, in single-threaded
+/// and multi-threaded programs.
 ///
-/// Most C libraries, including libc itself do not advertise which functions
-/// read from the environment. Even functions from the Rust standard library do
-/// that, e.g. for DNS lookups from [`std::net::ToSocketAddrs`].
+/// In multi-threaded programs on other operating systems, the only safe option is
+/// to not use `set_var` or `remove_var` at all.
+///
+/// The exact requirement is: you
+/// must ensure that there are no other threads concurrently writing or
+/// *reading*(!) the environment through functions or global variables other
+/// than the ones in this module. The problem is that these operating systems
+/// do not provide a thread-safe way to read the environment, and most C
+/// libraries, including libc itself, do not advertise which functions read
+/// from the environment. Even functions from the Rust standard library may
+/// read the environment without going through this module, e.g. for DNS
+/// lookups from [`std::net::ToSocketAddrs`]. No stable guarantee is made about
+/// which functions may read from the environment in future versions of a
+/// library. All this makes it not practically possible for you to guarantee
+/// that no other thread will read the environment, so the only safe option is
+/// to not use `set_var` or `remove_var` in multi-threaded programs at all.
 ///
 /// Discussion of this unsafety on Unix may be found in:
 ///
@@ -353,16 +349,18 @@ impl Error for VarError {
 /// use std::env;
 ///
 /// let key = "KEY";
-/// env::set_var(key, "VALUE");
+/// unsafe {
+///     env::set_var(key, "VALUE");
+/// }
 /// assert_eq!(env::var(key), Ok("VALUE".to_string()));
 /// ```
+#[rustc_deprecated_safe_2024(
+    audit_that = "the environment access only happens in single-threaded code"
+)]
 #[stable(feature = "env", since = "1.0.0")]
-pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
-    _set_var(key.as_ref(), value.as_ref())
-}
-
-fn _set_var(key: &OsStr, value: &OsStr) {
-    os_imp::setenv(key, value).unwrap_or_else(|e| {
+pub unsafe fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+    let (key, value) = (key.as_ref(), value.as_ref());
+    unsafe { os_imp::setenv(key, value) }.unwrap_or_else(|e| {
         panic!("failed to set environment variable `{key:?}` to `{value:?}`: {e}")
     })
 }
@@ -371,22 +369,27 @@ fn _set_var(key: &OsStr, value: &OsStr) {
 ///
 /// # Safety
 ///
-/// Even though this function is currently not marked as `unsafe`, it needs to
-/// be because invoking it can cause undefined behaviour. The function will be
-/// marked `unsafe` in a future version of Rust. This is tracked in
-/// [rust#27970](https://github.com/rust-lang/rust/issues/27970).
-///
 /// This function is safe to call in a single-threaded program.
 ///
-/// In multi-threaded programs, you must ensure that are no other threads
-/// concurrently writing or *reading*(!) from the environment through functions
-/// other than the ones in this module. You are responsible for figuring out
-/// how to achieve this, but we strongly suggest not using `set_var` or
-/// `remove_var` in multi-threaded programs at all.
+/// This function is also always safe to call on Windows, in single-threaded
+/// and multi-threaded programs.
 ///
-/// Most C libraries, including libc itself do not advertise which functions
-/// read from the environment. Even functions from the Rust standard library do
-/// that, e.g. for DNS lookups from [`std::net::ToSocketAddrs`].
+/// In multi-threaded programs on other operating systems, the only safe option is
+/// to not use `set_var` or `remove_var` at all.
+///
+/// The exact requirement is: you
+/// must ensure that there are no other threads concurrently writing or
+/// *reading*(!) the environment through functions or global variables other
+/// than the ones in this module. The problem is that these operating systems
+/// do not provide a thread-safe way to read the environment, and most C
+/// libraries, including libc itself, do not advertise which functions read
+/// from the environment. Even functions from the Rust standard library may
+/// read the environment without going through this module, e.g. for DNS
+/// lookups from [`std::net::ToSocketAddrs`]. No stable guarantee is made about
+/// which functions may read from the environment in future versions of a
+/// library. All this makes it not practically possible for you to guarantee
+/// that no other thread will read the environment, so the only safe option is
+/// to not use `set_var` or `remove_var` in multi-threaded programs at all.
 ///
 /// Discussion of this unsafety on Unix may be found in:
 ///
@@ -403,23 +406,27 @@ fn _set_var(key: &OsStr, value: &OsStr) {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::env;
 ///
 /// let key = "KEY";
-/// env::set_var(key, "VALUE");
+/// unsafe {
+///     env::set_var(key, "VALUE");
+/// }
 /// assert_eq!(env::var(key), Ok("VALUE".to_string()));
 ///
-/// env::remove_var(key);
+/// unsafe {
+///     env::remove_var(key);
+/// }
 /// assert!(env::var(key).is_err());
 /// ```
+#[rustc_deprecated_safe_2024(
+    audit_that = "the environment access only happens in single-threaded code"
+)]
 #[stable(feature = "env", since = "1.0.0")]
-pub fn remove_var<K: AsRef<OsStr>>(key: K) {
-    _remove_var(key.as_ref())
-}
-
-fn _remove_var(key: &OsStr) {
-    os_imp::unsetenv(key)
+pub unsafe fn remove_var<K: AsRef<OsStr>>(key: K) {
+    let key = key.as_ref();
+    unsafe { os_imp::unsetenv(key) }
         .unwrap_or_else(|e| panic!("failed to remove environment variable `{key:?}`: {e}"))
 }
 
@@ -590,6 +597,13 @@ impl Error for JoinPathsError {
 
 /// Returns the path of the current user's home directory if known.
 ///
+/// This may return `None` if getting the directory fails or if the platform does not have user home directories.
+///
+/// For storing user data and configuration it is often preferable to use more specific directories.
+/// For example, [XDG Base Directories] on Unix or the `LOCALAPPDATA` and `APPDATA` environment variables on Windows.
+///
+/// [XDG Base Directories]: https://specifications.freedesktop.org/basedir-spec/latest/
+///
 /// # Unix
 ///
 /// - Returns the value of the 'HOME' environment variable if it is set
@@ -601,20 +615,16 @@ impl Error for JoinPathsError {
 ///
 /// # Windows
 ///
-/// - Returns the value of the 'HOME' environment variable if it is set
-///   (including to an empty string).
-/// - Otherwise, returns the value of the 'USERPROFILE' environment variable if it is set
-///   (including to an empty string).
-/// - If both do not exist, [`GetUserProfileDirectory`][msdn] is used to return the path.
+/// - Returns the value of the 'USERPROFILE' environment variable if it is set, and is not an empty string.
+/// - Otherwise, [`GetUserProfileDirectory`][msdn] is used to return the path. This may change in the future.
 ///
 /// [msdn]: https://docs.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getuserprofiledirectorya
 ///
-/// # Deprecation
+/// In UWP (Universal Windows Platform) targets this function is unimplemented and always returns `None`.
 ///
-/// This function is deprecated because the behaviour on Windows is not correct.
-/// The 'HOME' environment variable is not standard on Windows, and may not produce
-/// desired results; for instance, under Cygwin or Mingw it will return `/home/you`
-/// when it should return `C:\Users\you`.
+/// Before Rust 1.85.0, this function used to return the value of the 'HOME' environment variable
+/// on Windows, which in Cygwin or Mingw environments could return non-standard paths like `/home/you`
+/// instead of `C:\Users\you`.
 ///
 /// # Examples
 ///
@@ -646,19 +656,28 @@ pub fn home_dir() -> Option<PathBuf> {
 /// may result in "insecure temporary file" security vulnerabilities. Consider
 /// using a crate that securely creates temporary files or directories.
 ///
+/// Note that the returned value may be a symbolic link, not a directory.
+///
 /// # Platform-specific behavior
 ///
 /// On Unix, returns the value of the `TMPDIR` environment variable if it is
-/// set, otherwise for non-Android it returns `/tmp`. On Android, since there
-/// is no global temporary folder (it is usually allocated per-app), it returns
-/// `/data/local/tmp`.
+/// set, otherwise the value is OS-specific:
+/// - On Android, there is no global temporary folder (it is usually allocated
+///   per-app), it returns `/data/local/tmp`.
+/// - On Darwin-based OSes (macOS, iOS, etc) it returns the directory provided
+///   by `confstr(_CS_DARWIN_USER_TEMP_DIR, ...)`, as recommended by [Apple's
+///   security guidelines][appledoc].
+/// - On all other unix-based OSes, it returns `/tmp`.
+///
 /// On Windows, the behavior is equivalent to that of [`GetTempPath2`][GetTempPath2] /
 /// [`GetTempPath`][GetTempPath], which this function uses internally.
+///
 /// Note that, this [may change in the future][changes].
 ///
 /// [changes]: io#platform-specific-behavior
 /// [GetTempPath2]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2a
 /// [GetTempPath]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppatha
+/// [appledoc]: https://developer.apple.com/library/archive/documentation/Security/Conceptual/SecureCodingGuide/Articles/RaceConditions.html#//apple_ref/doc/uid/TP40002585-SW10
 ///
 /// ```no_run
 /// use std::env;
@@ -928,106 +947,147 @@ impl fmt::Debug for ArgsOs {
 pub mod consts {
     use crate::sys::env::os;
 
-    /// A string describing the architecture of the CPU that is currently
-    /// in use.
+    /// A string describing the architecture of the CPU that is currently in use.
+    /// An example value may be: `"x86"`, `"arm"` or `"riscv64"`.
     ///
-    /// Some possible values:
+    /// <details><summary>Full list of possible values</summary>
     ///
-    /// - x86
-    /// - x86_64
-    /// - arm
-    /// - aarch64
-    /// - loongarch64
-    /// - m68k
-    /// - csky
-    /// - mips
-    /// - mips64
-    /// - powerpc
-    /// - powerpc64
-    /// - riscv64
-    /// - s390x
-    /// - sparc64
+    /// * `"x86"`
+    /// * `"x86_64"`
+    /// * `"arm"`
+    /// * `"aarch64"`
+    /// * `"m68k"`
+    /// * `"mips"`
+    /// * `"mips32r6"`
+    /// * `"mips64"`
+    /// * `"mips64r6"`
+    /// * `"csky"`
+    /// * `"powerpc"`
+    /// * `"powerpc64"`
+    /// * `"riscv32"`
+    /// * `"riscv64"`
+    /// * `"s390x"`
+    /// * `"sparc"`
+    /// * `"sparc64"`
+    /// * `"hexagon"`
+    /// * `"loongarch64"`
+    ///
+    /// </details>
     #[stable(feature = "env", since = "1.0.0")]
     pub const ARCH: &str = env!("STD_ENV_ARCH");
 
-    /// The family of the operating system. Example value is `unix`.
+    /// A string describing the family of the operating system.
+    /// An example value may be: `"unix"`, or `"windows"`.
     ///
-    /// Some possible values:
+    /// This value may be an empty string if the family is unknown.
     ///
-    /// - unix
-    /// - windows
+    /// <details><summary>Full list of possible values</summary>
+    ///
+    /// * `"unix"`
+    /// * `"windows"`
+    /// * `"itron"`
+    /// * `"wasm"`
+    /// * `""`
+    ///
+    /// </details>
     #[stable(feature = "env", since = "1.0.0")]
     pub const FAMILY: &str = os::FAMILY;
 
     /// A string describing the specific operating system in use.
-    /// Example value is `linux`.
+    /// An example value may be: `"linux"`, or `"freebsd"`.
     ///
-    /// Some possible values:
+    /// <details><summary>Full list of possible values</summary>
     ///
-    /// - linux
-    /// - macos
-    /// - ios
-    /// - freebsd
-    /// - dragonfly
-    /// - netbsd
-    /// - openbsd
-    /// - solaris
-    /// - android
-    /// - windows
+    /// * `"linux"`
+    /// * `"windows"`
+    /// * `"macos"`
+    /// * `"android"`
+    /// * `"ios"`
+    /// * `"openbsd"`
+    /// * `"freebsd"`
+    /// * `"netbsd"`
+    /// * `"wasi"`
+    /// * `"hermit"`
+    /// * `"aix"`
+    /// * `"apple"`
+    /// * `"dragonfly"`
+    /// * `"emscripten"`
+    /// * `"espidf"`
+    /// * `"fortanix"`
+    /// * `"uefi"`
+    /// * `"fuchsia"`
+    /// * `"haiku"`
+    /// * `"hermit"`
+    /// * `"watchos"`
+    /// * `"visionos"`
+    /// * `"tvos"`
+    /// * `"horizon"`
+    /// * `"hurd"`
+    /// * `"illumos"`
+    /// * `"l4re"`
+    /// * `"nto"`
+    /// * `"redox"`
+    /// * `"solaris"`
+    /// * `"solid_asp3`
+    /// * `"vita"`
+    /// * `"vxworks"`
+    /// * `"xous"`
+    ///
+    /// </details>
     #[stable(feature = "env", since = "1.0.0")]
     pub const OS: &str = os::OS;
 
-    /// Specifies the filename prefix used for shared libraries on this
-    /// platform. Example value is `lib`.
-    ///
-    /// Some possible values:
-    ///
-    /// - lib
-    /// - `""` (an empty string)
+    /// Specifies the filename prefix, if any, used for shared libraries on this platform.
+    /// This is either `"lib"` or an empty string. (`""`).
     #[stable(feature = "env", since = "1.0.0")]
     pub const DLL_PREFIX: &str = os::DLL_PREFIX;
 
-    /// Specifies the filename suffix used for shared libraries on this
-    /// platform. Example value is `.so`.
+    /// Specifies the filename suffix, if any, used for shared libraries on this platform.
+    /// An example value may be: `".so"`, `".elf"`, or `".dll"`.
     ///
-    /// Some possible values:
-    ///
-    /// - .so
-    /// - .dylib
-    /// - .dll
+    /// The possible values are identical to those of [`DLL_EXTENSION`], but with the leading period included.
     #[stable(feature = "env", since = "1.0.0")]
     pub const DLL_SUFFIX: &str = os::DLL_SUFFIX;
 
-    /// Specifies the file extension used for shared libraries on this
-    /// platform that goes after the dot. Example value is `so`.
+    /// Specifies the file extension, if any, used for shared libraries on this platform that goes after the dot.
+    /// An example value may be: `"so"`, `"elf"`, or `"dll"`.
     ///
-    /// Some possible values:
+    /// <details><summary>Full list of possible values</summary>
     ///
-    /// - so
-    /// - dylib
-    /// - dll
+    /// * `"so"`
+    /// * `"dylib"`
+    /// * `"dll"`
+    /// * `"sgxs"`
+    /// * `"a"`
+    /// * `"elf"`
+    /// * `"wasm"`
+    /// * `""` (an empty string)
+    ///
+    /// </details>
     #[stable(feature = "env", since = "1.0.0")]
     pub const DLL_EXTENSION: &str = os::DLL_EXTENSION;
 
-    /// Specifies the filename suffix used for executable binaries on this
-    /// platform. Example value is `.exe`.
+    /// Specifies the filename suffix, if any, used for executable binaries on this platform.
+    /// An example value may be: `".exe"`, or `".efi"`.
     ///
-    /// Some possible values:
-    ///
-    /// - .exe
-    /// - .nexe
-    /// - .pexe
-    /// - `""` (an empty string)
+    /// The possible values are identical to those of [`EXE_EXTENSION`], but with the leading period included.
     #[stable(feature = "env", since = "1.0.0")]
     pub const EXE_SUFFIX: &str = os::EXE_SUFFIX;
 
-    /// Specifies the file extension, if any, used for executable binaries
-    /// on this platform. Example value is `exe`.
+    /// Specifies the file extension, if any, used for executable binaries on this platform.
+    /// An example value may be: `"exe"`, or an empty string (`""`).
     ///
-    /// Some possible values:
+    /// <details><summary>Full list of possible values</summary>
     ///
-    /// - exe
-    /// - `""` (an empty string)
+    /// * `"exe"`
+    /// * `"efi"`
+    /// * `"js"`
+    /// * `"sgxs"`
+    /// * `"elf"`
+    /// * `"wasm"`
+    /// * `""` (an empty string)
+    ///
+    /// </details>
     #[stable(feature = "env", since = "1.0.0")]
     pub const EXE_EXTENSION: &str = os::EXE_EXTENSION;
 }

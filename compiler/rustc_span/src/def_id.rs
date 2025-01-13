@@ -1,15 +1,17 @@
-use crate::{HashStableContext, SpanDecoder, SpanEncoder, Symbol};
+use std::fmt;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+use rustc_data_structures::AtomicRef;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hasher::{
     Hash64, HashStable, StableHasher, StableOrd, ToStableHashKey,
 };
 use rustc_data_structures::unhash::Unhasher;
-use rustc_data_structures::AtomicRef;
 use rustc_index::Idx;
-use rustc_macros::HashStable_Generic;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::{Decodable, Encodable};
-use std::fmt;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+use crate::{HashStableContext, SpanDecoder, SpanEncoder, Symbol};
 
 pub type StableCrateIdMap =
     indexmap::IndexMap<StableCrateId, CrateNum, BuildHasherDefault<Unhasher>>;
@@ -22,7 +24,7 @@ rustc_index::newtype_index! {
 
 /// Item definitions in the currently-compiled crate would have the `CrateNum`
 /// `LOCAL_CRATE` in their `DefId`.
-pub const LOCAL_CRATE: CrateNum = CrateNum::from_u32(0);
+pub const LOCAL_CRATE: CrateNum = CrateNum::ZERO;
 
 impl CrateNum {
     #[inline]
@@ -120,9 +122,11 @@ impl Default for DefPathHash {
     }
 }
 
-// Safety: `DefPathHash` sort order is not affected (de)serialization.
-unsafe impl StableOrd for DefPathHash {
+impl StableOrd for DefPathHash {
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `DefPathHash` sort order is not affected by (de)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 /// A [`StableCrateId`] is a 64-bit hash of a crate name, together with all
@@ -218,8 +222,6 @@ rustc_index::newtype_index! {
 ///
 /// You can create a `DefId` from a `LocalDefId` using `local_def_id.to_def_id()`.
 #[derive(Clone, PartialEq, Eq, Copy)]
-// Don't derive order on 64-bit big-endian, so we can be consistent regardless of field order.
-#[cfg_attr(not(all(target_pointer_width = "64", target_endian = "big")), derive(PartialOrd, Ord))]
 // On below-64 bit systems we can simply use the derived `Hash` impl
 #[cfg_attr(not(target_pointer_width = "64"), derive(Hash))]
 #[repr(C)]
@@ -235,6 +237,12 @@ pub struct DefId {
     #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
     pub index: DefIndex,
 }
+
+// To ensure correctness of incremental compilation,
+// `DefId` must not implement `Ord` or `PartialOrd`.
+// See https://github.com/rust-lang/rust/issues/90317.
+impl !Ord for DefId {}
+impl !PartialOrd for DefId {}
 
 // On 64-bit systems, we can hash the whole `DefId` as one `u64` instead of two `u32`s. This
 // improves performance without impairing `FxHash` quality. So the below code gets compiled to a
@@ -258,22 +266,6 @@ pub struct DefId {
 impl Hash for DefId {
     fn hash<H: Hasher>(&self, h: &mut H) {
         (((self.krate.as_u32() as u64) << 32) | (self.index.as_u32() as u64)).hash(h)
-    }
-}
-
-// Implement the same comparison as derived with the other field order.
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-impl Ord for DefId {
-    #[inline]
-    fn cmp(&self, other: &DefId) -> std::cmp::Ordering {
-        Ord::cmp(&(self.index, self.krate), &(other.index, other.krate))
-    }
-}
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-impl PartialOrd for DefId {
-    #[inline]
-    fn partial_cmp(&self, other: &DefId) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 

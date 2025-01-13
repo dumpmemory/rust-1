@@ -1,16 +1,12 @@
 use super::Builder;
 use crate::any::Any;
-use crate::mem;
 use crate::panic::panic_any;
-use crate::result;
-use crate::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::{channel, Sender},
-    Arc, Barrier,
-};
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::mpsc::{Sender, channel};
+use crate::sync::{Arc, Barrier};
 use crate::thread::{self, Scope, ThreadId};
-use crate::time::Duration;
-use crate::time::Instant;
+use crate::time::{Duration, Instant};
+use crate::{mem, result};
 
 // !!! These tests are dangerous. If something is buggy, they will hang, !!!
 // !!! instead of exiting cleanly. This might wedge the buildbots.       !!!
@@ -40,10 +36,7 @@ fn test_named_thread() {
 #[cfg(any(
     // Note: musl didn't add pthread_getname_np until 1.2.3
     all(target_os = "linux", target_env = "gnu"),
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos"
+    target_vendor = "apple",
 ))]
 #[test]
 fn test_named_thread_truncation() {
@@ -67,26 +60,6 @@ fn test_named_thread_truncation() {
         assert!(long_name.as_bytes().starts_with(cstr.to_bytes()));
     });
     result.unwrap().join().unwrap();
-}
-
-#[cfg(any(
-    all(target_os = "windows", not(target_vendor = "win7")),
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos"
-))]
-#[test]
-fn test_get_os_named_thread() {
-    use crate::sys::thread::Thread;
-    // Spawn a new thread to avoid interfering with other tests running on this thread.
-    let handler = thread::spawn(|| {
-        let name = c"test me please";
-        Thread::set_name(name);
-        assert_eq!(name, Thread::get_name().unwrap().as_c_str());
-    });
-    handler.join().unwrap();
 }
 
 #[test]
